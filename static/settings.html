@@ -1,0 +1,206 @@
+<!--
+  JackLink - Portable Computing Gateway
+  Copyright (c) 2025 Konstantin Zaremski
+  Licensed under the MIT License
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Settings - JackLink</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body style="overflow: auto; height: auto;">
+    <div class="settings-window">
+        <div class="settings-section">
+            <h3>Account</h3>
+            <div class="settings-row">
+                <label>Username</label>
+                <input type="text" id="username" placeholder="jacklink">
+            </div>
+        </div>
+
+        <div class="settings-section">
+            <h3>Wallpaper</h3>
+            <div class="settings-row">
+                <label>Preview</label>
+                <div id="wallpaper-preview-container" class="wallpaper-preview" style="display: flex; align-items: center; justify-content: center;">
+                    <img id="wallpaper-preview" src="" alt="" style="max-width: 100%; max-height: 100%; display: none;">
+                    <span id="no-wallpaper" style="color: var(--jl-text-dim); font-size: 11px;">None</span>
+                </div>
+            </div>
+            <div class="settings-row">
+                <label>Image</label>
+                <input type="file" id="wallpaper-file" accept="image/*">
+            </div>
+            <div class="settings-row">
+                <label>Color</label>
+                <input type="color" id="wallpaper-color" value="#1a1a2e" style="width: 60px; height: 32px; padding: 2px; cursor: pointer;">
+                <button class="btn-secondary" id="apply-color">Apply Color</button>
+            </div>
+            <div class="settings-row">
+                <label></label>
+                <button class="btn-secondary" id="clear-wallpaper">Clear Wallpaper</button>
+            </div>
+        </div>
+
+        <div class="settings-section">
+            <button class="btn-primary" id="save-settings">Save Settings</button>
+            <div id="settings-status" class="settings-status" style="display: none;"></div>
+        </div>
+    </div>
+
+    <script>
+        let currentSettings = {};
+
+        async function loadSettings() {
+            try {
+                const resp = await fetch('/api/settings');
+                if (resp.ok) {
+                    currentSettings = await resp.json();
+                    document.getElementById('username').value = currentSettings.username || 'jacklink';
+
+                    const container = document.getElementById('wallpaper-preview-container');
+                    const preview = document.getElementById('wallpaper-preview');
+                    const noWallpaper = document.getElementById('no-wallpaper');
+
+                    if (currentSettings.wallpaper) {
+                        preview.src = '/api/wallpaper?' + Date.now();
+                        preview.style.display = 'block';
+                        noWallpaper.style.display = 'none';
+                        container.style.backgroundColor = '';
+                    } else if (currentSettings.wallpaper_color) {
+                        container.style.backgroundColor = currentSettings.wallpaper_color;
+                        document.getElementById('wallpaper-color').value = currentSettings.wallpaper_color;
+                        preview.style.display = 'none';
+                        noWallpaper.style.display = 'none';
+                    } else {
+                        preview.style.display = 'none';
+                        noWallpaper.style.display = 'inline';
+                        container.style.backgroundColor = '';
+                    }
+                }
+            } catch (e) {
+                console.error('Failed to load settings:', e);
+            }
+        }
+
+        function showStatus(message, isError) {
+            const status = document.getElementById('settings-status');
+            status.textContent = message;
+            status.className = 'settings-status ' + (isError ? 'error' : 'success');
+            status.style.display = 'block';
+            setTimeout(() => { status.style.display = 'none'; }, 3000);
+        }
+
+        function notifyParent() {
+            if (window.parent && window.parent.loadWallpaper) {
+                window.parent.loadWallpaper();
+            }
+        }
+
+        document.getElementById('save-settings').addEventListener('click', async () => {
+            const username = document.getElementById('username').value.trim();
+            try {
+                const resp = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username })
+                });
+                if (resp.ok) {
+                    showStatus('Settings saved!', false);
+                    notifyParent();
+                } else {
+                    showStatus('Failed to save settings', true);
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
+            }
+        });
+
+        document.getElementById('wallpaper-file').addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            try {
+                // Clear color when uploading image
+                await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ wallpaper_color: null })
+                });
+
+                const resp = await fetch('/api/settings/wallpaper', {
+                    method: 'POST',
+                    body: formData
+                });
+                if (resp.ok) {
+                    showStatus('Wallpaper uploaded!', false);
+                    const container = document.getElementById('wallpaper-preview-container');
+                    const preview = document.getElementById('wallpaper-preview');
+                    preview.src = '/api/wallpaper?' + Date.now();
+                    preview.style.display = 'block';
+                    document.getElementById('no-wallpaper').style.display = 'none';
+                    container.style.backgroundColor = '';
+                    notifyParent();
+                } else {
+                    showStatus('Failed to upload wallpaper', true);
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
+            }
+        });
+
+        document.getElementById('apply-color').addEventListener('click', async () => {
+            const color = document.getElementById('wallpaper-color').value;
+            try {
+                const resp = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ wallpaper: null, wallpaper_color: color })
+                });
+                if (resp.ok) {
+                    showStatus('Color applied!', false);
+                    const container = document.getElementById('wallpaper-preview-container');
+                    container.style.backgroundColor = color;
+                    document.getElementById('wallpaper-preview').style.display = 'none';
+                    document.getElementById('no-wallpaper').style.display = 'none';
+                    notifyParent();
+                } else {
+                    showStatus('Failed to apply color', true);
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
+            }
+        });
+
+        document.getElementById('clear-wallpaper').addEventListener('click', async () => {
+            try {
+                const resp = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ wallpaper: null, wallpaper_color: null })
+                });
+                if (resp.ok) {
+                    showStatus('Wallpaper cleared!', false);
+                    const container = document.getElementById('wallpaper-preview-container');
+                    container.style.backgroundColor = '';
+                    document.getElementById('wallpaper-preview').style.display = 'none';
+                    document.getElementById('no-wallpaper').style.display = 'inline';
+                    notifyParent();
+                } else {
+                    showStatus('Failed to clear wallpaper', true);
+                }
+            } catch (e) {
+                showStatus('Error: ' + e.message, true);
+            }
+        });
+
+        loadSettings();
+    </script>
+</body>
+</html>
