@@ -17,7 +17,6 @@ export function create(desktop) {
         x: 'center',
         y: 'center',
         url: '/settings',
-        class: ['no-full'],
         onclose: () => {
             desktop.removeWindow(id);
         }

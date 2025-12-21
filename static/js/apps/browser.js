@@ -45,7 +45,6 @@ export function create(desktop, initialUrl = '') {
         x: 30 + (browserCount * 30) % 150,
         y: 30 + (browserCount * 30) % 100,
         bottom: 28,
-        class: ['no-full'],
         onclose: () => {
             desktop.removeWindow(id);
             return false;

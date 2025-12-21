@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import asyncio
 import uvicorn
 from rich.console import Console
 from rich.layout import Layout
@@ -20,6 +21,7 @@ from rich.text import Text
 from .auth import auth
 from .config import config, get_network_interfaces, detect_vnc, NetworkInterface
 from .app import app, get_connection_count
+from .socks import start_socks_server, get_socks_connection_count
 
 
 def get_battery_percent() -> Optional[int]:
@@ -59,6 +61,7 @@ class JackLinkTUI:
         self.console = Console()
         self.running = False
         self.server_thread: Optional[threading.Thread] = None
+        self.socks_thread: Optional[threading.Thread] = None
         self.interfaces = get_network_interfaces()
         self.selected_index = -1  # -1 = all interfaces (0.0.0.0)
         self.server_started = False
@@ -143,14 +146,14 @@ class JackLinkTUI:
 
         status.add_row("Server URL:", f"[bold green]http://{display_ip}:{config.port}[/]")
         status.add_row("WebDAV URL:", f"[bold cyan]http://{display_ip}:{config.port}/webdav[/]")
+        status.add_row("SOCKS Proxy:", f"[bold magenta]socks5://{display_ip}:{config.socks_port}[/]")
         status.add_row("", "")
         status.add_row("Username:", f"[bold yellow]{auth.username}[/]")
         status.add_row("Token:", f"[bold white on #e94560]{auth.token}[/]")
         status.add_row("", "")
+        socks_conns = get_socks_connection_count()
         status.add_row("VNC Status:", "[bold green]Detected[/]" if vnc_port else "[dim]Not detected[/]")
-        if vnc_port:
-            status.add_row("VNC Port:", f"[cyan]{vnc_port}[/]")
-        status.add_row("Connections:", f"[cyan]{connections}[/]")
+        status.add_row("Connections:", f"[cyan]{connections} web, {socks_conns} proxy[/]")
 
         return Panel(status, title="Server Status", border_style="#e94560")
 
@@ -196,8 +199,18 @@ class JackLinkTUI:
                 access_log=False,
             )
 
+        def run_socks():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(start_socks_server("0.0.0.0", config.socks_port))
+            loop.run_forever()
+
         self.server_thread = threading.Thread(target=run_server, daemon=True)
         self.server_thread.start()
+
+        self.socks_thread = threading.Thread(target=run_socks, daemon=True)
+        self.socks_thread.start()
+
         self.server_started = True
 
     def handle_key(self, key: str) -> bool:
@@ -247,6 +260,16 @@ def run_headless():
     config.selected_interface = iface
     vnc_port = detect_vnc()
 
+    # Start SOCKS proxy in background thread
+    def run_socks():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(start_socks_server("0.0.0.0", config.socks_port))
+        loop.run_forever()
+
+    socks_thread = threading.Thread(target=run_socks, daemon=True)
+    socks_thread.start()
+
     console.print()
     console.print("[bold #e94560]╔═══════════════════════════════════════╗[/]")
     console.print("[bold #e94560]║           [/][bold white]J A C K L I N K[/][bold #e94560]           ║[/]")
@@ -255,6 +278,7 @@ def run_headless():
     console.print()
     console.print(f"[bold #e94560]Server URL:[/]  [bold green]http://{iface.ip}:{config.port}[/]")
     console.print(f"[bold #e94560]WebDAV URL:[/]  [bold cyan]http://{iface.ip}:{config.port}/webdav[/]")
+    console.print(f"[bold #e94560]SOCKS Proxy:[/] [bold magenta]socks5://{iface.ip}:{config.socks_port}[/]")
     console.print()
     console.print(f"[bold #e94560]Username:[/]    [bold yellow]{auth.username}[/]")
     console.print(f"[bold #e94560]Token:[/]       [bold white on #e94560] {auth.token} [/]")

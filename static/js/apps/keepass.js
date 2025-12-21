@@ -308,7 +308,6 @@ export function create(desktop, filePath = '') {
         x: 80 + (keepassCounter * 30) % 200,
         y: 60 + (keepassCounter * 30) % 150,
         bottom: 28,
-        class: ['no-full'],
         onclose: () => {
             // Clear sensitive data
             if (db) {

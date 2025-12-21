@@ -19,6 +19,7 @@ class NetworkInterface:
 class JackLinkConfig:
     host: str = "0.0.0.0"
     port: int = 8080
+    socks_port: int = 1080
     root_path: Path = field(default_factory=lambda: Path.home())
     selected_interface: Optional[NetworkInterface] = None
 
