@@ -61,7 +61,7 @@
 //! let result = surface.call_tool(&agent, &session_grant, &name, args).await;
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -368,6 +368,18 @@ pub enum SkipReason {
          give the command a parameters struct, or no parameters at all"
     )]
     NotAnObjectSchema,
+
+    #[error(
+        "its result schema is not an object schema, and MCP requires one for a tool's \
+         output schema; give the command a result struct, or no result at all"
+    )]
+    ResultNotAnObjectSchema,
+
+    #[error(
+        "it is registered twice, so there is no telling which registration a call would \
+         reach; unregister the duplicate"
+    )]
+    RegisteredTwice,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -431,22 +443,48 @@ where
     /// from only the granted subset, which of two colliding commands a
     /// session reached would depend on what some other session was allowed to
     /// see. Sorting by command id first makes the choice stable across
-    /// restarts and registration order.
+    /// restarts and registration order; two registrations of the *same* id
+    /// cannot be ordered that way, so neither is offered at all.
     ///
     /// This is the only function in the program that constructs an
     /// [`McpTool`].
     fn emit(&self) -> (BTreeMap<String, McpTool>, Vec<Skipped>) {
         let mut specs = self.catalog.commands();
         specs.sort_by(|a, b| a.id.cmp(&b.id));
+        // A disabled command is neither a defect nor a permission decision,
+        // so it is reported as neither: it is simply not applicable right now
+        // and will reappear in a later list. Dropped before anything else so
+        // it neither claims a name nor counts as a duplicate.
+        specs.retain(|spec| spec.enabled);
+
+        // The bus dispatches by command id, so if one id is registered twice
+        // there is no way to tell from here which registration a call would
+        // reach — and the tool would advertise one registration's risk level,
+        // node and schema for behavior that might come from the other. Risk
+        // routing is the Inbox gate, so guessing is not an option: neither is
+        // offered, and both are reported. Picking a winner here would also
+        // make the surface depend on registration order, which is whatever
+        // apps happened to start first.
+        let registered_twice: BTreeSet<String> = {
+            let mut once = BTreeSet::new();
+            let mut twice = BTreeSet::new();
+            for spec in &specs {
+                if !once.insert(spec.id.as_str()) {
+                    twice.insert(spec.id.clone());
+                }
+            }
+            twice
+        };
 
         let mut tools: BTreeMap<String, McpTool> = BTreeMap::new();
         let mut skipped = Vec::new();
 
         for spec in specs {
-            if !spec.enabled {
-                // Not a defect and not a permission decision, so it is
-                // reported as neither: the command is simply not applicable
-                // right now and will reappear in a later list.
+            if registered_twice.contains(&spec.id) {
+                skipped.push(Skipped {
+                    command_id: spec.id,
+                    why: SkipReason::RegisteredTwice,
+                });
                 continue;
             }
 
@@ -482,6 +520,17 @@ where
                 }
             };
 
+            let output_schema = match result_schema(spec.result.as_ref()) {
+                Ok(schema) => schema,
+                Err(why) => {
+                    skipped.push(Skipped {
+                        command_id: spec.id,
+                        why,
+                    });
+                    continue;
+                }
+            };
+
             tools.insert(
                 name.clone(),
                 McpTool {
@@ -489,7 +538,7 @@ where
                     title: spec.title.clone(),
                     description: agent_description(&spec),
                     input_schema,
-                    output_schema: spec.result,
+                    output_schema,
                     command_id: spec.id,
                     risk: spec.risk,
                     node: spec.node,
@@ -663,6 +712,34 @@ fn object_schema(parameters: &JsonObject) -> Option<JsonObject> {
     }
 }
 
+/// Accept a result schema MCP can carry, or say no.
+///
+/// MCP requires the root of `outputSchema` to be an object schema, exactly as
+/// it does for the input, and a client that cannot validate `structuredContent`
+/// against it may reject the tool or the whole `tools/list` response — so one
+/// command registered with an array result would take the entire surface down
+/// with it. Checking here turns that into one reported registration bug.
+///
+/// There is nothing to synthesize, unlike [`object_schema`]: a command with no
+/// result simply has no output schema. `null` and an empty schema are the same
+/// statement in a different dialect and are translated to that rather than
+/// refused.
+fn result_schema(result: Option<&JsonObject>) -> Result<Option<JsonObject>, SkipReason> {
+    let Some(schema) = result else {
+        return Ok(None);
+    };
+    match schema.get("type") {
+        None if schema.is_empty() => Ok(None),
+        Some(Value::String(t)) if t == "null" => Ok(None),
+        Some(Value::String(t)) if t == "object" => Ok(Some(schema.clone())),
+        // A `$ref` into `$defs`, as schemars emits for a named struct. Carried
+        // through for the same reason the input path carries it: resolving
+        // someone else's schema here would be a second schema compiler.
+        None if schema.contains_key("$ref") => Ok(Some(schema.clone())),
+        _ => Err(SkipReason::ResultNotAnObjectSchema),
+    }
+}
+
 /// The description the agent reads.
 ///
 /// Title, then the command's own summary, then the risk sentence. The risk
@@ -769,7 +846,16 @@ impl Dispatched {
                 let text =
                     serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string());
                 let mut out = CallToolResult::success(vec![Content::text(text)]);
-                out.structured_content = Some(result.clone());
+                // `structuredContent` is an object in the protocol, not any
+                // JSON value, so a command that returns an array or a bare
+                // string gets the text form only. Sending the value there
+                // anyway would make the whole result off-spec, and a client
+                // that validates it would throw away a result the command
+                // actually produced. Nothing is lost: the text above is that
+                // same value, pretty-printed.
+                if result.is_object() {
+                    out.structured_content = Some(result.clone());
+                }
                 out
             }
             Dispatched::Queued { approval_id } => {

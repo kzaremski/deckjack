@@ -809,8 +809,10 @@ pub struct PersistedNode {
     pub capabilities: String,
     pub backends: String,
     pub first_seen: u64,
-    /// The last beat seen before the server stopped. Shown as "last seen",
-    /// never treated as liveness.
+    /// When this node last completed a registration handshake. Heartbeats are
+    /// deliberately not written (see the module notes), so this is the newest
+    /// durable evidence of the machine, not the last beat: shown as "last
+    /// registered", and never treated as liveness.
     pub last_seen: u64,
 }
 
@@ -857,7 +859,7 @@ impl PersistedNode {
 /// The durable half of the registry, injected rather than reached for, so the
 /// placement rules are testable without SQLite and so the single [`
 /// crate::store::Store`] the server owns can be lent in under its own lock.
-pub trait NodeStore {
+pub trait NodeStore: Send + Sync {
     fn upsert_node(&self, node: &PersistedNode) -> Result<(), StoreError>;
     fn load_nodes(&self) -> Result<Vec<PersistedNode>, StoreError>;
     fn delete_node(&self, node_id: &str) -> Result<(), StoreError>;
@@ -1319,15 +1321,20 @@ impl Registry {
             score += 80;
         }
 
-        // Tiebreakers only, all bounded so none of them can outrank a real
-        // capability match above.
-        score += i64::from(caps.cpu.cores.min(64));
+        // Tiebreakers only. Bounded as a *group*: the whole block spans
+        // -20..=+32, which is narrower than the smallest preference above
+        // (+60 for a hardware codec), so no amount of spare capacity can
+        // outrank a node that actually has the hardware. Bounding them one by
+        // one is not enough — a full-width core count and a full-width memory
+        // figure used to sum to +128 against a loaded GPU node's 150-100=50,
+        // which sent GPU-preferred work to the machine with no GPU.
+        score += i64::from(caps.cpu.cores.min(64)) / 4;
         if let Some(health) = node.health {
             if let Some(load) = health.cpu_load_permille {
-                score -= i64::from(load.min(1_000)) / 10;
+                score -= i64::from(load.min(1_000)) / 50;
             }
             if let Some(free) = health.free_memory_bytes {
-                score += ((free >> 30) as i64).min(64);
+                score += ((free >> 30) as i64).min(64) / 4;
             }
         }
 

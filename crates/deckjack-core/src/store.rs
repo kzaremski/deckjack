@@ -342,6 +342,12 @@ pub enum StoreError {
         supported: u32,
     },
 
+    #[error(
+        "{path}: the write-ahead log could not be folded back into the main file, because \
+         another connection still holds a read lock; this directory is not safe to copy yet"
+    )]
+    WalNotFolded { path: PathBuf },
+
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
 }
@@ -361,6 +367,10 @@ impl Store {
                 source: rusqlite::Error::ToSqlConversionFailure(Box::new(e)),
             })?;
         }
+        // Before the connection, not after: sqlite would create the file 0644
+        // under the usual umask, and it takes the mode of `-wal` and `-shm`
+        // from whatever the main file's mode is when they are created.
+        owner_only(&path);
         let conn = Connection::open(&path).map_err(|source| StoreError::Open {
             path: path.clone(),
             source,
@@ -374,14 +384,24 @@ impl Store {
     }
 
     fn from_connection(conn: Connection, path: PathBuf) -> Result<Store, StoreError> {
-        // WAL survives in the file, but setting it is cheap and makes a
-        // database created elsewhere behave the same way.
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        // Without this, a crash between the write and the flush can lose the
-        // last transaction. FULL is the honest setting for state we intend to
-        // carry between machines.
-        conn.pragma_update(None, "synchronous", "FULL")?;
-        conn.pragma_update(None, "foreign_keys", true)?;
+        // `Connection::open` only records the filename; the first pragma is
+        // where a file that is not a database says so. Those failures are
+        // about this file, so they carry its name rather than surfacing as a
+        // bare "file is not a database" with nothing to act on.
+        let prepare = || -> Result<(), rusqlite::Error> {
+            // WAL survives in the file, but setting it is cheap and makes a
+            // database created elsewhere behave the same way.
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            // Without this, a crash between the write and the flush can lose
+            // the last transaction. FULL is the honest setting for state we
+            // intend to carry between machines.
+            conn.pragma_update(None, "synchronous", "FULL")?;
+            conn.pragma_update(None, "foreign_keys", true)
+        };
+        prepare().map_err(|source| StoreError::Open {
+            path: path.clone(),
+            source,
+        })?;
 
         let mut store = Store { conn, path };
         store.migrate()?;
@@ -389,10 +409,18 @@ impl Store {
     }
 
     fn migrate(&mut self) -> Result<(), StoreError> {
+        // Not `unwrap_or(0)`: a new or empty file genuinely reports 0, so
+        // defaulting buys nothing, and it turned "this file is not a database"
+        // and "the file is locked" into "version 0" — which then ran migration
+        // 1 against a populated file and blamed the collision on the schema
+        // instead of saying which file is wrong.
         let found: u32 = self
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap_or(0);
+            .map_err(|source| StoreError::Open {
+                path: self.path.clone(),
+                source,
+            })?;
 
         if found > SCHEMA_VERSION {
             return Err(StoreError::FromTheFuture {
@@ -499,10 +527,62 @@ impl Store {
     /// Fold the WAL back into the main file so the directory can be copied.
     /// Called on graceful shutdown, before the lock is released.
     pub fn checkpoint(&self) -> Result<(), StoreError> {
-        self.conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
-            .optional()?;
+        // The pragma answers (busy, log, checkpointed). SQLite does not call
+        // a blocked checkpoint an error — busy = 1 means "a reader was still
+        // in the file, so some committed rows live only in the `-wal`". That
+        // is precisely the case the caller must not mistake for success:
+        // shutdown would release the lock and declare the directory copyable
+        // while a third of the state sat in a file nobody copies.
+        let busy: i64 = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
+        if busy != 0 {
+            return Err(StoreError::WalNotFolded {
+                path: self.path.clone(),
+            });
+        }
         Ok(())
+    }
+}
+
+/// Make the state file readable only by the user running the server,
+/// creating it empty if it is not there yet (sqlite reads an empty file as an
+/// empty database, so creating it costs nothing).
+///
+/// This file holds the session table, and a session id in it is the cookie a
+/// browser presents — so another local account that can read the file can
+/// present those cookies too. The terminal is the documented escape hatch for
+/// *this* user; nothing says the next user on the host gets one.
+///
+/// A failure is warned about rather than returned: some hosts the design
+/// targets (a working directory on Android shared storage) have no unix modes
+/// at all, and refusing to start there would be the wrong trade.
+fn owner_only(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::fs::{OpenOptions, Permissions, set_permissions};
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let result = if path.exists() {
+            set_permissions(path, Permissions::from_mode(0o600))
+        } else {
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .mode(0o600)
+                .open(path)
+                .map(|_| ())
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "cannot restrict the state database to this user; it may be readable by others on this host"
+            );
+        }
     }
 }
 
@@ -655,5 +735,125 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the command log
+// ---------------------------------------------------------------------------
+
+impl Store {
+    /// Append one decision about a dispatch.
+    ///
+    /// INSERT only. There is no update and no delete here, and that is the
+    /// guarantee the type is making — SQLite cannot enforce it, which is why
+    /// the design ships this log offsite as it is written rather than
+    /// trusting the host to keep it honest.
+    pub fn append_command_log(&self, entry: &crate::command::LogEntry) -> Result<(), StoreError> {
+        let issuer_name = entry.issuer.name().map(str::to_string);
+        // The TAG, never the cookie: this file is readable from the terminal
+        // by design, and a tag is enough to tell two browsers apart.
+        let issuer_session = entry
+            .issuer
+            .browser_session()
+            .map(|b| b.tag().as_str().to_string());
+        let params = entry
+            .params
+            .as_ref()
+            .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "\"<unserializable>\"".into()));
+
+        self.conn.execute(
+            "INSERT INTO command_log
+               (dispatch, at, node, command, risk, issuer, issuer_name,
+                issuer_session, decision, params, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                entry.dispatch.to_string(),
+                to_unix(entry.at),
+                entry.node.as_str(),
+                entry.command.to_string(),
+                entry.risk.map(|r| r.as_str()),
+                entry.issuer.kind(),
+                issuer_name,
+                issuer_session,
+                decision_name(entry.decision),
+                params,
+                entry.detail.as_deref(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The timeline, newest first.
+    pub fn command_log(&self, limit: usize) -> Result<Vec<LoggedCommand>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT at, command, risk, issuer, issuer_name, issuer_session, decision, detail
+               FROM command_log ORDER BY row DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(LoggedCommand {
+                at: from_unix(r.get(0)?),
+                command: r.get(1)?,
+                risk: r.get(2)?,
+                issuer: r.get(3)?,
+                issuer_name: r.get(4)?,
+                issuer_session: r.get(5)?,
+                decision: r.get(6)?,
+                detail: r.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+}
+
+/// One row of the timeline panel.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LoggedCommand {
+    pub at: SystemTime,
+    pub command: String,
+    pub risk: Option<String>,
+    pub issuer: String,
+    pub issuer_name: Option<String>,
+    pub issuer_session: Option<String>,
+    pub decision: String,
+    pub detail: Option<String>,
+}
+
+fn decision_name(d: crate::command::Decision) -> &'static str {
+    use crate::command::Decision as D;
+    match d {
+        D::Ran => "ran",
+        D::Queued => "queued",
+        D::AwaitingConfirmation => "awaiting_confirmation",
+        D::Refused => "refused",
+        D::Completed => "completed",
+        D::Failed => "failed",
+    }
+}
+
+/// The command log, written to the state database.
+///
+/// A failure to write is reported and swallowed by the bus, which is correct:
+/// losing an audit row is bad, but refusing to run a command because the disk
+/// is full is worse, and the bus already treats the journal as advisory to
+/// routing.
+pub struct StoreJournal {
+    store: std::sync::Arc<std::sync::Mutex<Store>>,
+}
+
+impl StoreJournal {
+    pub fn new(store: std::sync::Arc<std::sync::Mutex<Store>>) -> StoreJournal {
+        StoreJournal { store }
+    }
+}
+
+impl crate::command::Journal for StoreJournal {
+    fn record(&self, entry: crate::command::LogEntry) -> Result<(), crate::command::JournalError> {
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .append_command_log(&entry)
+            .map_err(|e| crate::command::JournalError(e.to_string()))
     }
 }

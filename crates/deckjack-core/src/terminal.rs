@@ -773,6 +773,8 @@ impl TerminalSession {
     /// nothing it ever had. What fell out of the ring before it attached is
     /// simply not part of this terminal's history any more.
     pub fn snapshot(&self) -> Output {
+        // Sampled before the bytes, for the reason given in `read_from`.
+        let exit = self.exit();
         let held = lock(&self.out);
         let (bytes, _) = held.from(0);
         let cursor = held.total();
@@ -781,12 +783,20 @@ impl TerminalSession {
             bytes,
             cursor,
             skipped: 0,
-            exit: self.exit(),
+            exit,
         }
     }
 
     /// Output from `cursor` onward, without waiting.
     pub fn read_from(&self, cursor: u64) -> Output {
+        // The exit is sampled *before* the scrollback, because the pump
+        // pushes every byte it read and only then records the exit. In this
+        // order, an exit seen here means the read below already holds the
+        // shell's last line. The other order loses it: the scrollback can be
+        // read, then the final chunk pushed and the exit recorded, and the
+        // result would report the exit with the last line missing — which a
+        // client that stops following on `exit` would never come back for.
+        let exit = self.exit();
         let held = lock(&self.out);
         let (bytes, skipped) = held.from(cursor);
         let cursor = held.total();
@@ -795,7 +805,7 @@ impl TerminalSession {
             bytes,
             cursor,
             skipped,
-            exit: self.exit(),
+            exit,
         }
     }
 
@@ -985,6 +995,14 @@ impl Registry {
 
     /// Start a shell. The caller has already decided this is allowed.
     pub fn open(&self, spec: SessionSpec) -> Result<Arc<TerminalSession>, TerminalError> {
+        // Clamped here rather than inside each backend. The size is
+        // untrusted input, and a backend that is not the host's own ptys — a
+        // pty forwarded from another node, say — would otherwise be handed a
+        // zero-row or 65535-row window while this registry recorded the
+        // clamped one, leaving the server and the terminal disagreeing about
+        // a size with nothing to resync them. Clamping twice is harmless.
+        let mut spec = spec;
+        spec.size = spec.size.clamped();
         let mut live = lock(&self.live);
 
         // Exited sessions are kept so their last output can still be read,
@@ -1007,7 +1025,7 @@ impl Registry {
             ));
         }
 
-        let size = spec.size.clamped();
+        let size = spec.size;
         let pty = self.backend.open(&spec, &id)?;
 
         let reader = pty.reader().map_err(|source| TerminalError::Pty {

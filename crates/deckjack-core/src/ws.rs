@@ -391,7 +391,13 @@ impl Progress {
             fraction: Some(if total == 0 {
                 1.0
             } else {
-                (done as f64 / total as f64) as f32
+                // Clamped because the shell renders this as a bar width and
+                // the field is documented as 0.0 to 1.0. A count that
+                // overshoots its total — a resumed transfer, a directory
+                // that grew during the walk — is a plausible mistake for a
+                // command to make, and "more than everything" is not
+                // something the client has any way to draw.
+                ((done as f64 / total as f64) as f32).clamp(0.0, 1.0)
             }),
             ..Progress::default()
         }
@@ -1518,7 +1524,24 @@ fn handle(
             let out = out.clone();
             let clock = Arc::clone(&ctx.clock);
             tokio::spawn(async move {
-                let outcome = dispatched.await;
+                // The command runs in a task of its own so that a panic
+                // inside it comes back as a `JoinError` instead of taking
+                // this task with it. A panic that killed this task would
+                // leave the call in the registry forever: no response for
+                // the client to stop waiting on, and one in-flight slot
+                // gone for the life of the connection, so a command that
+                // panics reliably would wedge the socket.
+                let outcome = match tokio::spawn(dispatched).await {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        tracing::error!(%conn, %id, error = %e, "command panicked");
+                        Outcome::error(CommandError::new(
+                            "ws.command_panicked",
+                            "the command failed with an internal error; \
+                             the node's log has the details",
+                        ))
+                    }
+                };
                 // The registry is the authority on elapsed time; a call the
                 // registry has already forgotten belongs to a connection
                 // that is gone, so there is nobody to answer.

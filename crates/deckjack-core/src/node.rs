@@ -11,9 +11,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
 // The one place in the crate that touches the OS random source. It lives in
 // `auth::code` because that is where it was first needed; if a third caller
 // appears it should move somewhere neutral rather than be duplicated.
@@ -67,7 +64,16 @@ pub fn id(install_dir: &Path) -> io::Result<String> {
 
     let mut bytes = [0u8; ID_BYTES];
     os_random(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
-    let generated = URL_SAFE_NO_PAD.encode(bytes);
+    // Hex, not base64.
+    //
+    // URL-safe base64 can begin with '-', which `files::NodeName::parse`
+    // refuses because a leading dash reads as a flag wherever the name is
+    // interpolated. That is 4 first-bytes in 256, so roughly one fresh
+    // install in 64 generated an id that made its own file namespace
+    // unreachable and the server unable to start, recoverable only by
+    // deleting this file. Hex cannot produce one. The id is eight bytes
+    // longer written out, which costs nothing.
+    let generated: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
 
     match fs::OpenOptions::new()
         .write(true)

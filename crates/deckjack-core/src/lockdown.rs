@@ -728,8 +728,8 @@ pub enum Surface {
 }
 
 /// The persisted shape of a trigger: a tag, nothing more. [`Trigger`] itself
-/// carries addresses and counts that have no business in a file that
-/// outlives the incident.
+/// carries addresses and remote source names that have no business in a file
+/// that outlives the incident; see [`Trigger::reason_for_journal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerKind {
@@ -809,9 +809,9 @@ impl Trigger {
         }
     }
 
-    /// A sentence for the journal and the log. Addresses and source names are
-    /// summarized rather than copied verbatim where they would identify a
-    /// person or a device beyond what the incident needs.
+    /// A sentence for the log, with the full detail: the audit log ships to
+    /// the VPS as written, and that is where incident evidence belongs. What
+    /// the journal keeps is [`Self::reason_for_journal`].
     pub fn describe(&self) -> String {
         match self {
             Trigger::Operator { surface } => {
@@ -833,6 +833,25 @@ impl Trigger {
                 "{count} refused agent commands within {}s",
                 within.as_secs()
             ),
+        }
+    }
+
+    /// The sentence the journal keeps, which is not the same sentence the log
+    /// gets.
+    ///
+    /// Counts stay: "5 failed passkey attempts within 300s" is what makes an
+    /// entry worth reading afterwards, and a count identifies nobody.
+    /// Addresses and remote source names do not stay, because
+    /// [`Engagement::reason`] is written during an incident into a file that
+    /// outlives it and is read by whoever is then holding the machine — and
+    /// the most common cause of a `NewDevice` trigger is the operator's own
+    /// new laptop. The address is in the log line and in the audit trail; it
+    /// does not also need to be on disk here.
+    pub fn reason_for_journal(&self) -> String {
+        match self {
+            Trigger::NewDevice { .. } => TriggerKind::NewDevice.label().to_string(),
+            Trigger::RemoteCommand { .. } => TriggerKind::RemoteCommand.label().to_string(),
+            other => other.describe(),
         }
     }
 }
@@ -977,8 +996,9 @@ pub struct Status {
 #[derive(Debug, Error)]
 pub enum StartupError {
     #[error(
-        "the lockdown journal cannot be read, so this node starts locked down; \
-         unlock with a recovery code, or move {path} aside by hand on the host: {source}"
+        "the lockdown journal cannot be read, so this node serves nothing but the locked \
+         page; the recovery digests were in that file, so a code cannot unlock it from here: \
+         restore {path}, or move it aside by hand on the host: {source}"
     )]
     JournalUnreadable {
         path: PathBuf,
@@ -1119,12 +1139,13 @@ pub struct Lockdown {
 impl Lockdown {
     /// Read the journal and come back in whatever state it describes.
     ///
-    /// An unreadable or future journal starts the node **locked**. A
-    /// corrupt file is the one case where failing open would be a security
-    /// hole worth having: an attacker who can scribble over one small file
-    /// should not thereby unlock the machine. The error says what to do, and
-    /// a recovery code still works because the digests are gone with the
-    /// file — see the note on [`StartupError`].
+    /// An unreadable or future journal refuses the start, and the caller
+    /// serves [`Self::sealed`] rather than coming up open: an attacker who
+    /// can scribble over one small file must not thereby unlock the machine.
+    /// Failing closed has a cost worth stating plainly, though, because the
+    /// recovery digests lived in that same file: no recovery code can unlock
+    /// a sealed node. The way out is on the host — restore the file, or move
+    /// it aside by hand. See [`StartupError`].
     pub fn restore(deps: Deps, policy: Policy, node_id: String) -> Result<Lockdown, StartupError> {
         match deps.journal.load() {
             Ok(Some(record)) => {
@@ -1155,6 +1176,39 @@ impl Lockdown {
                 path: PathBuf::from(JOURNAL_PATH),
                 source,
             }),
+        }
+    }
+
+    /// The state [`Self::restore`] describes but cannot return: locked, with
+    /// no engagement to show.
+    ///
+    /// A caller holding a [`StartupError`] has two other options and both are
+    /// worse. Aborting serves nothing, so a phone on the far side of the
+    /// tailnet learns only that the connection failed. Coming up open is the
+    /// hole the journal exists to close. A sealed node serves the locked
+    /// page, says on it that the journal could not be read, and cannot be
+    /// unlocked by a recovery code, because there are no digests left to
+    /// match — [`Self::unlock`] refuses with
+    /// [`UnlockError::NoRecoveryCodes`]. A passkey plus the host command
+    /// still unlocks it, and that unlock replaces the unreadable file.
+    ///
+    /// It is a separate constructor so that nothing reaches this state by
+    /// accident: every other path into `Lockdown` goes through the journal.
+    pub fn sealed(deps: Deps, policy: Policy, node_id: String) -> Lockdown {
+        tracing::error!(
+            node = %node_id,
+            "sealed: the lockdown journal could not be read, so this node serves only the \
+             locked page"
+        );
+        Lockdown {
+            deps,
+            policy,
+            node_id,
+            locked: AtomicBool::new(true),
+            // Deliberately no `Engagement`: inventing one would put a cause
+            // in the journal that no trigger ever produced. `locked_page`
+            // has a branch for exactly this state.
+            record: Mutex::new(Record::default()),
         }
     }
 
@@ -1199,10 +1253,13 @@ impl Lockdown {
         let was_locked = self.locked.swap(true, Ordering::SeqCst);
 
         let kind = trigger.kind();
-        let reason = trigger.describe();
+        // Two sentences on purpose: the log line carries the address, the
+        // journal does not. See [`Trigger::reason_for_journal`].
+        let detail = trigger.describe();
+        let reason = trigger.reason_for_journal();
         tracing::warn!(
             trigger = ?kind,
-            reason = %reason,
+            reason = %detail,
             already_locked = was_locked,
             "LOCKDOWN"
         );
@@ -1222,7 +1279,7 @@ impl Lockdown {
                     r.engaged = Some(Engagement {
                         at: unix(self.deps.clock.now()),
                         trigger: kind,
-                        reason: reason.clone(),
+                        reason,
                         node_id: self.node_id.clone(),
                         reengaged: 0,
                         report: None,

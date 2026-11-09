@@ -118,7 +118,7 @@ impl ws::Dispatch for BusDispatch {
                 Admitted::Queued { pending, risk, .. } => ws::Outcome::ok(serde_json::json!({
                     "status": "queued",
                     "pending": pending.to_string(),
-                    "risk": format!("{risk:?}"),
+                    "risk": risk.as_str(),
                 })),
                 // Not a failure: the operator has not been asked yet. The
                 // prompt is the bus's, so the client shows that text rather
@@ -273,10 +273,16 @@ impl Command for Read {
     async fn run(&self, params: ReadParams, _cx: Context) -> Result<Chunk, CommandError> {
         let session = self.session(&params.id)?;
         let out = session.output_after(params.cursor).await;
+        // Sample the exit status BEFORE reading it off the session again. A
+        // shell that exits between `output_after` returning and a re-sample
+        // would otherwise be reported as exited on a chunk that does not
+        // carry its final bytes, and the panel stops polling on `exited` —
+        // so the last line a shell ever printed would never be shown.
+        let exited = session.exit().is_some() && out.bytes.is_empty();
         Ok(Chunk {
             data: String::from_utf8_lossy(&out.bytes).into_owned(),
             cursor: out.cursor,
-            exited: session.exit().is_some(),
+            exited,
         })
     }
 }

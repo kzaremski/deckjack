@@ -259,8 +259,18 @@ impl VirtualPath {
     /// wherever it sits rather than about one position in the tree. The cost
     /// is that a directory the owner happened to name `.deckjack` is
     /// unreachable through this layer; the terminal still reaches it.
+    ///
+    /// The comparison ignores ASCII case, because the rule has to hold on a
+    /// case-insensitive filesystem too: APFS is case-insensitive by default,
+    /// and a mounted exFAT or NTFS volume is on Linux as well. `realpath`
+    /// resolves symlinks without correcting case, so on such a host
+    /// `.DeckJack/state.db` canonicalizes to itself, passes a case-sensitive
+    /// component test, and opens the real database. Extending the cost above
+    /// to `.DeckJack` is the cheaper side of that trade.
     pub fn is_hidden_state(&self) -> bool {
-        self.parts.iter().any(|p| p == HIDDEN_DIR)
+        self.parts
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(HIDDEN_DIR))
     }
 }
 
@@ -778,6 +788,24 @@ impl Fs for OsFs {
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         tmp.as_file_mut().write_all(bytes)?;
         tmp.as_file().sync_all()?;
+        // A temporary file is created 0600 and `persist` is a rename, which
+        // keeps the temporary file's own mode rather than the destination's.
+        // Without this, saving a shell script through the file API would strip
+        // its executable bit, and saving anything shared would lock out group
+        // and other — a silent permission change on every single write.
+        //
+        // Set-user-id, set-group-id and the sticky bit are deliberately not
+        // carried across: the contents are new, and re-applying set-user-id to
+        // bytes that just arrived over the wire is not something a file panel
+        // should be able to do. A file that did not exist keeps the temporary
+        // file's 0600, which is the conservative default for new data.
+        #[cfg(unix)]
+        if let Ok(existing) = std::fs::metadata(path) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = existing.permissions().mode() & 0o777;
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
         tmp.persist(path).map_err(|e| e.error)?;
         Ok(())
     }

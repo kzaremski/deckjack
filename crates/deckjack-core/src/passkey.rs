@@ -158,6 +158,13 @@ pub struct Settings {
     /// Whether an ordinary sign-in must include user verification (a PIN,
     /// a fingerprint, a face) and not merely a tap. Step-up always requires
     /// it, whatever this says.
+    ///
+    /// Setting this to `false` does **not** relax anything today, and the
+    /// field says so here rather than lying by omission: webauthn-rs asks for
+    /// `UserVerificationPolicy::Required` on every passkey assertion and
+    /// refuses an unverified one itself, before this module sees it. The
+    /// check in `accept` stays as a second line in case that ever changes, so
+    /// read this as "required, and checked again".
     pub require_user_verification: bool,
 }
 
@@ -696,7 +703,10 @@ pub enum PasskeyError {
     )]
     TicketBurned,
 
-    #[error("nickname must be 1 to {MAX_NICKNAME} characters so the device list stays readable")]
+    #[error(
+        "nickname must be 1 to {MAX_NICKNAME} characters and must not contain control \
+         characters, so the device list and the audit log stay readable"
+    )]
     BadNickname,
 
     #[error(
@@ -901,6 +911,17 @@ impl Passkeys {
         // Any step-up a stolen device bought dies with the credential, not
         // when its window happens to run out.
         self.grants.clear();
+        // So does any assertion ceremony already in flight. Each one holds a
+        // snapshot of the credentials it was started with, taken before this
+        // removal, so a ceremony begun seconds ago would still accept an
+        // assertion from the credential being removed here. `accept` catches
+        // that afterwards when its own lookup fails, but that check is the
+        // second line, and a removal that only takes effect at the far end of
+        // the next ceremony is not what "remove a lost device" means. A
+        // registration in flight is for a credential that is not this one, so
+        // it is left alone.
+        self.pending
+            .retain(|_, p| p.purpose() == Purpose::Registration);
         Ok(self.credentials.remove(at))
     }
 
@@ -967,6 +988,18 @@ impl Passkeys {
             &self.settings.user_name,
             exclude,
         )?;
+
+        // One approval buys one credential. The approval is checked here and
+        // only spent in `finish_registration`, so without this a code seen
+        // once could start several registrations and finish every one of
+        // them, enrolling a credential apiece from a single approval; the
+        // same holds for `Enrollment::First`, whose `is_enrolled` check is
+        // likewise only made at the start. The newest ceremony is the one the
+        // operator is looking at, so it replaces any earlier one rather than
+        // being refused, which keeps a cancelled authenticator prompt from
+        // costing an approval.
+        self.pending
+            .retain(|_, p| p.purpose() != Purpose::Registration);
 
         let ceremony = self.insert_pending(
             Pending::Registration {
@@ -1122,8 +1155,9 @@ impl Passkeys {
         let result = match self.webauthn.finish_passkey_authentication(reply, &state) {
             Ok(result) => result,
             Err(e) => {
+                let refusal = self.diagnose(e, reply, events);
                 self.fail(Purpose::SignIn, events);
-                return Err(e.into());
+                return Err(refusal);
             }
         };
 
@@ -1207,8 +1241,9 @@ impl Passkeys {
         let result = match self.webauthn.finish_passkey_authentication(reply, &state) {
             Ok(result) => result,
             Err(e) => {
+                let refusal = self.diagnose(e, reply, events);
                 self.fail(Purpose::StepUp, events);
-                return Err(e.into());
+                return Err(refusal);
             }
         };
 
@@ -1264,6 +1299,14 @@ impl Passkeys {
             Pending::StepUp { session: s, .. } => s != session,
             _ => true,
         });
+        // An approval is nothing but the authority of a live, signed-in
+        // device, lent for a few minutes. When that session goes — logged
+        // out, kicked, expired, or revoked because something looked wrong —
+        // the authority goes with it, and a code still showing on that screen
+        // must not still enroll a new passkey.
+        if self.ticket.as_ref().is_some_and(|t| t.approver == *session) {
+            self.ticket = None;
+        }
     }
 
     /// Drop every grant and every ceremony in flight. The kill switch calls
@@ -1284,6 +1327,53 @@ impl Passkeys {
             return Err(PasskeyError::NoCredentials);
         }
         Ok(self.credentials.iter().map(|c| c.key.clone()).collect())
+    }
+
+    /// Give the WebAuthn layer's refusal the meaning this module attaches to
+    /// it, and raise the clone alarm when that is what it means.
+    ///
+    /// webauthn-rs makes two of the checks below itself — user verification
+    /// before it verifies the signature, the sign count after — and both come
+    /// back as an opaque [`WebauthnError`]. Passing those straight through is
+    /// how the one signal that matters most gets lost: a cloned authenticator
+    /// would be reported as "the authenticator's answer was refused", and
+    /// [`Event::CloneSuspected`], which the design makes a lockdown trigger
+    /// rather than a warning, would never be emitted at all. So the two
+    /// errors that carry a meaning of their own are translated back into it.
+    /// The equivalent checks in [`Passkeys::accept`] stay where they are: if
+    /// a later webauthn-rs stops making one, the check that replaces it is
+    /// already there rather than being noticed after an incident.
+    fn diagnose(
+        &self,
+        e: WebauthnError,
+        reply: &PublicKeyCredential,
+        events: &mut Vec<Event>,
+    ) -> PasskeyError {
+        match e {
+            WebauthnError::UserNotVerified => PasskeyError::UserVerificationRequired,
+            WebauthnError::CredentialPossibleCompromise => {
+                let id = CredentialId::from_bytes(reply.raw_id.clone());
+                let Some(cred) = self.credential(&id) else {
+                    // webauthn-rs matches the credential id before it looks at
+                    // any counter, so this is unreachable from there. Claiming
+                    // a clone for a credential we cannot name would be worse
+                    // than reporting what we were actually told.
+                    return PasskeyError::Ceremony(WebauthnError::CredentialPossibleCompromise);
+                };
+                let presented = presented_sign_count(&reply.response.authenticator_data);
+                events.push(Event::CloneSuspected {
+                    credential: id,
+                    stored: cred.sign_count,
+                    presented,
+                });
+                PasskeyError::SignCountRegression {
+                    nickname: cred.nickname.clone(),
+                    stored: cred.sign_count,
+                    presented,
+                }
+            }
+            other => PasskeyError::Ceremony(other),
+        }
     }
 
     /// The checks that are the same for a sign-in and a step-up: the
@@ -1410,9 +1500,28 @@ pub fn sign_count_ok(stored: u32, presented: u32) -> bool {
     }
 }
 
+/// The sign count out of raw authenticator data: 32 bytes of relying party
+/// id hash, one flags byte, then a big-endian u32. Short data cannot hold one,
+/// and webauthn-rs has already refused anything that short by the time this is
+/// reached, so zero is the honest answer rather than a panic.
+pub fn presented_sign_count(authenticator_data: &[u8]) -> u32 {
+    match authenticator_data.get(33..37) {
+        Some([a, b, c, d]) => u32::from_be_bytes([*a, *b, *c, *d]),
+        _ => 0,
+    }
+}
+
 fn check_nickname(nickname: &str) -> Result<String, PasskeyError> {
     let trimmed = nickname.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAX_NICKNAME {
+        return Err(PasskeyError::BadNickname);
+    }
+    // The nickname is the one attacker-reachable string in this module that
+    // ends up quoted into an audit line (`Event::Registered`) and into an
+    // error message (`SignCountRegression`). A newline in it would forge a
+    // line in a log the design insists must survive an incident, so the rule
+    // that caps the length rejects control characters for the same reason.
+    if trimmed.chars().any(char::is_control) {
         return Err(PasskeyError::BadNickname);
     }
     Ok(trimmed.to_string())
@@ -1430,4 +1539,158 @@ fn to_unix(t: SystemTime) -> i64 {
 
 fn from_unix(secs: i64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Only what the suite in `tests/passkey.rs` cannot reach from outside.
+    //!
+    //! Everything else about this module is tested there, against the public
+    //! API. These two are here because [`Passkeys::diagnose`] is private and
+    //! because the error it translates is raised by webauthn-rs only *after*
+    //! it has verified a signature — and nothing in this workspace can
+    //! produce one of those, so no test can walk in through
+    //! [`Passkeys::finish_sign_in`] and arrive here. The alarm these cover is
+    //! the one an incident is read from, so it is worth reaching sideways.
+
+    use super::*;
+
+    /// A credential as the store would hold it: public key material only.
+    /// The key is never used to verify anything here, so a well-formed
+    /// fixture is enough.
+    fn stored(cred_id: &[u8], nickname: &str, sign_count: u32) -> CredentialRow {
+        let key = format!(
+            r#"{{"cred":{{"cred_id":"{}","cred":{{"type_":"ES256","key":{{"EC_EC2":{{
+               "curve":"SECP256R1","x":[194,126,127,109,252,23,131,21,252,6,223,99,44,254,140,27,
+               230,17,94,5,133,28,104,41,144,69,171,149,161,26,200,243],
+               "y":[143,123,183,156,24,178,21,248,117,159,162,69,171,52,188,252,26,59,6,47,103,92,
+               19,58,117,103,249,0,219,8,95,196]}}}}}},"counter":{sign_count},"transports":null,
+               "user_verified":true,"backup_eligible":false,"backup_state":false,
+               "registration_policy":"required","extensions":{{"cred_protect":"NotRequested",
+               "hmac_create_secret":"NotRequested"}},
+               "attestation":{{"data":"None","metadata":"None"}},"attestation_format":"None"}}}}"#,
+            URL_SAFE_NO_PAD.encode(cred_id),
+        );
+        CredentialRow {
+            cred_id: URL_SAFE_NO_PAD.encode(cred_id),
+            nickname: nickname.to_string(),
+            key_json: key,
+            sign_count: i64::from(sign_count),
+            backup_eligible: false,
+            backup_state: false,
+            created: 1_700_000_000,
+            last_used: None,
+        }
+    }
+
+    fn registry(rows: &[CredentialRow]) -> Passkeys {
+        let user = UserHandle::from_uuid(Uuid::from_bytes([7u8; 16]));
+        let mut keys =
+            Passkeys::new(Settings::default(), user).expect("the default settings are valid");
+        keys.restore(rows).expect("the fixture rows restore");
+        keys
+    }
+
+    /// What the browser hands back. Only `raw_id` and the sign count inside
+    /// the authenticator data are read on this path.
+    fn reply(cred_id: &[u8], presented: u32) -> PublicKeyCredential {
+        let mut authenticator_data = vec![0u8; 33];
+        authenticator_data.extend_from_slice(&presented.to_be_bytes());
+        let json = format!(
+            r#"{{"id":"{id}","rawId":"{id}","type":"public-key","response":{{
+               "authenticatorData":"{ad}","clientDataJSON":"{ad}","signature":"{ad}",
+               "userHandle":null}},"clientExtensionResults":{{}}}}"#,
+            id = URL_SAFE_NO_PAD.encode(cred_id),
+            ad = URL_SAFE_NO_PAD.encode(&authenticator_data),
+        );
+        serde_json::from_str(&json).expect("the fixture reply is the shape a browser sends")
+    }
+
+    #[test]
+    fn a_cloned_authenticator_is_named_in_the_alarm_rather_than_refused_generically() {
+        // webauthn-rs makes the sign count check itself and reports it as an
+        // opaque `CredentialPossibleCompromise`. Passing that through is how
+        // the clone alarm gets lost: the operator would be told only that
+        // "the authenticator's answer was refused", and the event the design
+        // makes a lockdown trigger would never be emitted at all.
+        let keys = registry(&[stored(b"pocket-4", "Pocket 4", 7)]);
+        let mut events = Vec::new();
+
+        let err = keys.diagnose(
+            WebauthnError::CredentialPossibleCompromise,
+            &reply(b"pocket-4", 3),
+            &mut events,
+        );
+
+        match err {
+            PasskeyError::SignCountRegression {
+                nickname,
+                stored,
+                presented,
+            } => {
+                assert_eq!(
+                    nickname, "Pocket 4",
+                    "the operator has to know which device"
+                );
+                assert_eq!(stored, 7);
+                assert_eq!(presented, 3);
+            }
+            other => panic!("a clone must be reported as one, got {other}"),
+        }
+        assert_eq!(
+            events,
+            vec![Event::CloneSuspected {
+                credential: CredentialId::from_bytes(b"pocket-4".to_vec()),
+                stored: 7,
+                presented: 3,
+            }],
+            "the lockdown trigger reads this event, so it has to be emitted exactly once"
+        );
+    }
+
+    #[test]
+    fn a_refusal_this_module_has_no_name_for_is_passed_through_unchanged() {
+        let keys = registry(&[stored(b"pocket-4", "Pocket 4", 7)]);
+        let mut events = Vec::new();
+
+        // Not verified: the one other refusal worth renaming.
+        let err = keys.diagnose(
+            WebauthnError::UserNotVerified,
+            &reply(b"pocket-4", 8),
+            &mut events,
+        );
+        assert!(
+            matches!(err, PasskeyError::UserVerificationRequired),
+            "got {err}"
+        );
+
+        // A signature that does not verify means what it says, and must not
+        // be dressed up as something this module understands.
+        let err = keys.diagnose(
+            WebauthnError::AuthenticationFailure,
+            &reply(b"pocket-4", 8),
+            &mut events,
+        );
+        assert!(matches!(
+            err,
+            PasskeyError::Ceremony(WebauthnError::AuthenticationFailure)
+        ));
+
+        // A clone cannot be claimed for a credential we cannot name: that
+        // would put a device in the audit log that was never enrolled.
+        let err = keys.diagnose(
+            WebauthnError::CredentialPossibleCompromise,
+            &reply(b"not-enrolled", 1),
+            &mut events,
+        );
+        assert!(matches!(
+            err,
+            PasskeyError::Ceremony(WebauthnError::CredentialPossibleCompromise)
+        ));
+
+        assert!(
+            events.is_empty(),
+            "nothing here is a clone, so nothing may raise the alarm: {events:?}"
+        );
+    }
 }

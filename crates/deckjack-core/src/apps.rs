@@ -2244,11 +2244,6 @@ impl<E: Env> Host<E> {
         }
 
         let now = self.env.now();
-        if let Some(runtime) = self.runtimes.get_mut(app) {
-            runtime.windows = runtime.windows.saturating_add(1);
-            runtime.last_active = now;
-        }
-
         let needs_launch = match self.runtimes.get(app).map(|r| &r.phase) {
             Some(Phase::Ready { .. }) => false,
             Some(Phase::Starting { .. }) | Some(Phase::Reconnecting { .. }) => false,
@@ -2262,6 +2257,16 @@ impl<E: Env> Host<E> {
         };
         if needs_launch {
             self.launch(app)?;
+        }
+        // Counted only once the window is certain to exist. Every path above
+        // that returns an error leaves the caller with no window, so a
+        // window counted there would never be closed: `windows` would sit
+        // above zero for the rest of the session, the idle sweep only touches
+        // apps at zero, and one refused open would keep the next successful
+        // launch holding a GPU context and a phone's battery all afternoon.
+        if let Some(runtime) = self.runtimes.get_mut(app) {
+            runtime.windows = runtime.windows.saturating_add(1);
+            runtime.last_active = now;
         }
         Ok(self.window_status(app))
     }
@@ -2332,6 +2337,25 @@ impl<E: Env> Host<E> {
         let Some(runtime) = self.runtimes.get_mut(app) else {
             return Vec::new();
         };
+        // Only an app the host believes is running can be lost — the mirror
+        // of the rule in [`Host::on_registered`]. A stop the host asked for
+        // closes the socket too, and the transport reports that exactly like
+        // a crash: believing it would move an idle-stopped app to
+        // `Reconnecting` with no restart scheduled, so a window opened on it
+        // would show "reconnecting" for something nobody is bringing back.
+        // The same report also arrives twice for a single crash — once from
+        // the reader, once from [`Host::poll`] noticing the dead child — and
+        // counting it twice spends the crash budget before `GaveUp` at
+        // double speed.
+        if !matches!(runtime.phase, Phase::Starting { .. } | Phase::Ready { .. }) {
+            tracing::debug!(
+                app,
+                phase = ?runtime.phase,
+                reason,
+                "ignoring a lost connection for an app the host was not running"
+            );
+            return Vec::new();
+        }
         if let Some(pid) = runtime.pid.take() {
             // The process may still be alive but unreachable; a stuck app
             // holding the socket would stop the restart from ever handshaking.

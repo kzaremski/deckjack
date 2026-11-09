@@ -589,9 +589,20 @@ pub struct Query {
     pub until: Option<SystemTime>,
     pub issuer: Option<IssuerFilter>,
     pub command: Option<CommandFilter>,
-    /// Only entries after this one. Paging for the panel, watermark for the
-    /// shipper.
+    /// Only entries with a higher sequence than this one: the shipper's
+    /// watermark, read oldest first.
     pub after: Option<EntryId>,
+    /// Only entries with a lower sequence than this one: the timeline
+    /// panel's cursor, read newest first.
+    ///
+    /// Both ends exist because a cursor has to be a sequence number rather
+    /// than a time. A panel scrolling back cannot page on [`Query::until`]:
+    /// several commands land in the same millisecond, so a timestamp cursor
+    /// either shows the same entries again or steps over the ones that
+    /// shared the instant. And it cannot page on [`Query::after`] either,
+    /// which moves toward the newest entry while the panel is moving away
+    /// from it.
+    pub before: Option<EntryId>,
     pub limit: usize,
     pub order: Order,
 }
@@ -604,6 +615,7 @@ impl Default for Query {
             issuer: None,
             command: None,
             after: None,
+            before: None,
             limit: DEFAULT_LIMIT,
             order: Order::NewestFirst,
         }
@@ -637,6 +649,13 @@ impl Query {
 
     pub fn after(mut self, seq: EntryId) -> Query {
         self.after = Some(seq);
+        self
+    }
+
+    /// The page of entries older than `seq`. What the panel passes to scroll
+    /// back: the sequence of the oldest entry it is already showing.
+    pub fn before(mut self, seq: EntryId) -> Query {
+        self.before = Some(seq);
         self
     }
 
@@ -728,7 +747,7 @@ const SELECT_COLUMNS: &str = "seq, at_ms, issuer_kind, issuer_name, issuer_windo
 /// The cost is that SQLite cannot always pick the narrowest index; at the size
 /// of one person's command log that is not worth a query builder.
 const WHERE_SQL: &str = "WHERE at_ms >= :since AND at_ms <= :until \
-    AND seq > :after \
+    AND seq > :after AND seq < :before \
     AND (:issuer_kind IS NULL OR issuer_kind = :issuer_kind) \
     AND (:issuer_name IS NULL OR issuer_name = :issuer_name) \
     AND (:cmd_exact IS NULL \
@@ -842,6 +861,7 @@ impl Sink for SqliteSink {
         let since = query.since.map(to_unix_ms).unwrap_or(i64::MIN);
         let until = query.until.map(to_unix_ms).unwrap_or(i64::MAX);
         let after = query.after.map(EntryId::inner).unwrap_or(0);
+        let before = query.before.map(EntryId::inner).unwrap_or(i64::MAX);
         let issuer_kind = query.issuer.as_ref().map(IssuerFilter::kind_str);
         let issuer_name = query.issuer.as_ref().and_then(IssuerFilter::name);
         let (cmd_exact, cmd_prefix) = match &query.command {
@@ -872,6 +892,7 @@ impl Sink for SqliteSink {
                         ":since": since,
                         ":until": until,
                         ":after": after,
+                        ":before": before,
                         ":issuer_kind": issuer_kind,
                         ":issuer_name": issuer_name,
                         ":cmd_exact": cmd_exact,

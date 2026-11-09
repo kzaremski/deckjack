@@ -30,7 +30,12 @@ struct Assets;
 pub const INDEX: &str = "index.html";
 
 /// A year. Only ever applied to content-hashed filenames.
-const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+// `private`, not `public`: these bytes are served only behind the session
+// cookie, and `public` explicitly authorizes a shared cache to store them and
+// hand them to a client that has no session. Latent behind Caddy, which does
+// not cache by default — but the contract this module states is that the
+// build is not readable without a session, and `public` contradicts it.
+const IMMUTABLE: &str = "private, max-age=31536000, immutable";
 
 /// Whether the shell was built into this binary at all.
 ///

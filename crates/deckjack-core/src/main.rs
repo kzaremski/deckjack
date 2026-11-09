@@ -88,7 +88,10 @@ fn main() -> anyhow::Result<()> {
     let config = Config::load_or_init(&working_dir)?;
     let listen = listen.unwrap_or(config.server.listen);
 
-    let store = Store::open(&working_dir)?;
+    // One connection, shared: the auth context persists sessions through it
+    // and the bus writes the command log through it. A second connection to
+    // the same file would be two writers racing on one WAL.
+    let store = Arc::new(std::sync::Mutex::new(Store::open(&working_dir)?));
 
     let sign_in = Code::generate().context("cannot generate a sign-in code")?;
     // `reveal` is the only way to get the text; `Code` has no Display and a
@@ -100,7 +103,10 @@ fn main() -> anyhow::Result<()> {
     // Sessions outlive the process, so a restart does not sign everyone out.
     // The code is still fresh and still single-use: restoring a session is
     // not a sign-in, and anyone without one still needs the new code.
-    let restored = store.live_sessions(std::time::SystemTime::now())?;
+    let restored = store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .live_sessions(std::time::SystemTime::now())?;
     let restored_count = restored.len();
     for (id, session) in restored {
         state.restore_session(id, session);
@@ -134,11 +140,19 @@ fn main() -> anyhow::Result<()> {
     // them is exactly how the predecessor's configured root became decorative.
     let _files = deckjack_core::files::register_commands(&registry, &working_dir, &node_id)
         .context("cannot register the file commands")?;
-    let bus = Arc::new(Bus::new(
-        Arc::clone(&registry),
-        NodeId::new(node_id.clone()),
-        Arc::new(BusEnv),
-    ));
+    // Without a journal the bus records attribution to stdout and nowhere
+    // else, which makes "every command records who issued it" true only for
+    // as long as the terminal scrollback lasts.
+    let bus = Arc::new(
+        Bus::new(
+            Arc::clone(&registry),
+            NodeId::new(node_id.clone()),
+            Arc::new(BusEnv),
+        )
+        .with_journal(Arc::new(deckjack_core::store::StoreJournal::new(
+            Arc::clone(&store),
+        ))),
+    );
     tracing::info!(
         commands = registry.list(None).len(),
         terminals = terminals.limits().max_sessions,
@@ -152,7 +166,7 @@ fn main() -> anyhow::Result<()> {
     let ctx = Arc::new(
         Ctx::new(
             state,
-            store,
+            Arc::clone(&store),
             config.auth.failure_delay(),
             config.server.trusted_proxies.clone(),
         )
@@ -174,8 +188,16 @@ fn main() -> anyhow::Result<()> {
         .build()
         .context("cannot start the async runtime")?;
 
-    let result = rt.block_on(serve(listen, ctx, ws_ctx, &env, &mut held));
+    let result = rt.block_on(serve(listen, Arc::clone(&ctx), ws_ctx, &env, &mut held));
 
+    // Fold the WAL back into the main file BEFORE the lock goes. The lock is
+    // what tells the next start — or whatever carries this directory to
+    // another machine — that the files are safe to copy, so releasing it
+    // over a database whose recent rows live only in state.db-wal makes that
+    // promise false.
+    if let Err(e) = ctx.checkpoint() {
+        tracing::warn!(error = %e, "could not checkpoint the state database");
+    }
     held.release().ok();
     result
 }
@@ -213,10 +235,41 @@ async fn serve(
                 }
             }
         } => Ok(()),
-        _ = tokio::signal::ctrl_c() => {
+        _ = shutdown_signal() => {
             tracing::info!("shutting down");
             Ok(())
         }
+    }
+}
+
+/// Ctrl-C or SIGTERM.
+///
+/// SIGTERM is the one that matters in practice: it is what `kill` sends and
+/// what systemd sends to stop a service, so a shutdown path that waits only
+/// on SIGINT is a shutdown path that almost never runs. Everything after it
+/// — folding the WAL back into the state file, releasing the lock — would be
+/// skipped on every ordinary stop, and the next start would read a directory
+/// the lock said was clean.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM; Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

@@ -241,6 +241,17 @@ impl Rect {
     }
 }
 
+/// Offset a signed origin by an unsigned pixel count.
+///
+/// The work area is an argument, which means it is input: the client reports
+/// it with the command, and a corrupt or hostile one must come out as a bad
+/// layout rather than as an arithmetic overflow. Every place this module adds
+/// a size to a coordinate goes through here or through `saturating_*`, so an
+/// absurd work area is clamped instead of panicking the server.
+fn offset(origin: i32, delta: u32) -> i32 {
+    origin.saturating_add(delta.min(i32::MAX as u32) as i32)
+}
+
 /// Clamp a frame into a work area, honoring an app's minimum width.
 ///
 /// A work area narrower than the app's minimum wins: the window gets the
@@ -264,10 +275,10 @@ fn fit(frame: Rect, work: Rect, min_width: u32) -> Rect {
     // the grab area goes with it, and never above the work area's top, where
     // the title bar would be under the shell's own bar.
     let keep_x = KEEP_VISIBLE.min(width) as i32;
-    let min_x = work.x - (width as i32 - keep_x);
-    let max_x = (work.right() - keep_x).max(min_x);
+    let min_x = work.x.saturating_sub(width as i32 - keep_x);
+    let max_x = work.right().saturating_sub(keep_x).max(min_x);
     let keep_y = KEEP_VISIBLE.min(height) as i32;
-    let max_y = (work.bottom() - keep_y).max(work.y);
+    let max_y = work.bottom().saturating_sub(keep_y).max(work.y);
 
     Rect {
         x: frame.x.clamp(min_x, max_x),
@@ -344,20 +355,24 @@ impl Snap {
     /// The frame this zone means inside `work`, or `None` for the two states
     /// that carry their own frame.
     pub fn frame(self, work: Rect) -> Option<Rect> {
-        let half_w = work.width / 2;
-        let half_h = work.height / 2;
-        let right_w = work.width - half_w;
-        let bottom_h = work.height - half_h;
-        let mid_x = work.x + half_w as i32;
-        let mid_y = work.y + half_h as i32;
+        // Clamped first: `MAX_EXTENT` is what lets the halves below be i32
+        // offsets, and `work` is reported by the client, not built here.
+        let full_w = work.width.min(MAX_EXTENT);
+        let full_h = work.height.min(MAX_EXTENT);
+        let half_w = full_w / 2;
+        let half_h = full_h / 2;
+        let right_w = full_w - half_w;
+        let bottom_h = full_h - half_h;
+        let mid_x = offset(work.x, half_w);
+        let mid_y = offset(work.y, half_h);
 
         Some(match self {
             Snap::Floating | Snap::Tiled => return None,
             Snap::Maximized => work,
-            Snap::Left => Rect::new(work.x, work.y, half_w, work.height),
-            Snap::Right => Rect::new(mid_x, work.y, right_w, work.height),
-            Snap::Top => Rect::new(work.x, work.y, work.width, half_h),
-            Snap::Bottom => Rect::new(work.x, mid_y, work.width, bottom_h),
+            Snap::Left => Rect::new(work.x, work.y, half_w, full_h),
+            Snap::Right => Rect::new(mid_x, work.y, right_w, full_h),
+            Snap::Top => Rect::new(work.x, work.y, full_w, half_h),
+            Snap::Bottom => Rect::new(work.x, mid_y, full_w, bottom_h),
             Snap::TopLeft => Rect::new(work.x, work.y, half_w, half_h),
             Snap::TopRight => Rect::new(mid_x, work.y, right_w, half_h),
             Snap::BottomLeft => Rect::new(work.x, mid_y, half_w, bottom_h),
@@ -787,8 +802,8 @@ impl WindowSet {
         // exactly on top of each other.
         let step = (self.windows.len() as u32 % CASCADE_WRAP) as i32 * CASCADE_STEP;
         let wanted = Rect {
-            x: work_area.x + step,
-            y: work_area.y + step,
+            x: work_area.x.saturating_add(step),
+            y: work_area.y.saturating_add(step),
             width: spec.size.width,
             height: spec.size.height,
         };
@@ -1057,8 +1072,8 @@ impl WindowSet {
                 cell_h
             };
             let frame = Rect::new(
-                work_area.x + (cell_w * col) as i32,
-                work_area.y + (cell_h * row) as i32,
+                offset(work_area.x, cell_w * col),
+                offset(work_area.y, cell_h * row),
                 width,
                 height,
             );
@@ -1381,9 +1396,16 @@ impl WindowSet {
         }
 
         set.desktop.focus = match snapshot.shell.desktop_focus.map(WindowId) {
-            // Focus pointing at a window that is gone is not worth refusing
-            // a start over; the topmost window takes it.
-            Some(id) if set.windows.contains_key(&id) => Some(id),
+            // Present, and actually on the desktop. `minimize` hands focus on
+            // and `focus` unminimizes, so at run time the focused window is
+            // never minimized; a stored row must not be able to contradict
+            // that, or the shell comes up focused on a window it is not
+            // showing. Every window has a placement by this point, so this is
+            // also the existence check.
+            Some(id) if set.desktop.places.get(&id).is_some_and(|p| !p.minimized) => Some(id),
+            // Focus pointing at a window that is gone, or at one that is
+            // minimized, is not worth refusing a start over; the topmost
+            // window on the desktop takes it.
             Some(_) | None => set.desktop.topmost_visible(),
         };
 

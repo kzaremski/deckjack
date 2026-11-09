@@ -386,11 +386,18 @@ impl Pattern {
         i == parts.len()
     }
 
-    /// Whether this pattern grants the entire bus (`*`). Not forbidden — the
-    /// operator's own tooling needs it — but the UI flags a grant holding it,
-    /// because an agent with `*` is an agent with no grant at all.
+    /// Whether this pattern grants the entire bus: `*`, and equally `*.*` or
+    /// any other pattern with no literal segment in it.
+    ///
+    /// Every command id the bus declares is dotted (`terminal.write`,
+    /// `git.status`), so `*.*` is the whole bus written a second way. Reading
+    /// only a bare `*` as unrestricted hid such a grant from both the UI flag
+    /// and [`Grants::issue`], which is the one place that can refuse it.
     pub fn is_everything(&self) -> bool {
-        matches!(self.segments.as_slice(), [Segment::Rest])
+        !self
+            .segments
+            .iter()
+            .any(|s| matches!(s, Segment::Literal(_)))
     }
 }
 
@@ -621,6 +628,15 @@ pub struct Policy {
     /// needs one; agent sessions should not have one, so callers that issue
     /// session grants pass a policy with this off.
     pub allow_standing_grants: bool,
+    /// Whether a grant may name a pattern covering the whole bus (`*`, `*.*`).
+    ///
+    /// Default no. "Anything outside the grant is refused" is the rule this
+    /// module exists for, and a grant of everything puts nothing outside it,
+    /// so the rule stops meaning anything. The operator's own actions do not
+    /// route through this module at all (see [`Issuer`]), so the tooling that
+    /// genuinely wants the whole bus opts in here, deliberately, instead of
+    /// every caller getting it by typing one character.
+    pub allow_unrestricted_grants: bool,
 }
 
 impl Default for Policy {
@@ -634,6 +650,7 @@ impl Default for Policy {
             pending_ttl_secs: Some(24 * 3600),
             max_grant_ttl_secs: 12 * 3600,
             allow_standing_grants: true,
+            allow_unrestricted_grants: false,
         }
     }
 }
@@ -1170,15 +1187,29 @@ impl<S: InboxStore, E: Env> Inbox<S, E> {
     /// never be tapped from a page that was left open.
     pub fn pending(&self) -> Result<Vec<PendingItem>, InboxError> {
         let now = self.env.now();
-        if let Some(ttl) = self.policy.pending_ttl_secs {
-            let swept = self
-                .store
-                .expire_pending_before(now.saturating_sub(ttl), now)?;
-            if swept > 0 {
-                tracing::info!(count = swept, "expired stale Inbox items");
+        let mut live = Vec::new();
+        let mut swept = 0usize;
+
+        // The expiry recorded on the item is the only authority here, because
+        // it is the one [`Inbox::approve`] reads and the one the operator was
+        // shown. Sweeping by a cutoff derived from the policy in force now
+        // disagreed with it at exactly `created + ttl`: the item was still
+        // listed as pending and then refused as expired when it was tapped.
+        for mut item in self.store.items_with_status(ItemStatus::Pending)? {
+            if item.is_expired(now) {
+                item.status = ItemStatus::Expired;
+                item.decided_at = Some(now);
+                self.store.put_item(&item)?;
+                swept += 1;
+                continue;
             }
+            live.push(item);
         }
-        Ok(self.store.items_with_status(ItemStatus::Pending)?)
+
+        if swept > 0 {
+            tracing::info!(count = swept, "expired stale Inbox items");
+        }
+        Ok(live)
     }
 
     pub fn item(&self, id: &ItemId) -> Result<Option<PendingItem>, InboxError> {
@@ -1271,9 +1302,20 @@ impl<S: InboxStore, E: Env> Inbox<S, E> {
     pub fn withdraw_for_session(&self, session: &str) -> Result<usize, InboxError> {
         let mut n = 0;
         for item in self.store.items_with_status(ItemStatus::Pending)? {
-            if item.issuer.session() == Some(session) {
-                self.withdraw(&item.id)?;
-                n += 1;
+            if item.issuer.session() != Some(session) {
+                continue;
+            }
+            match self.withdraw(&item.id) {
+                Ok(_) => n += 1,
+                // Ending a session is cleanup, not a transaction. An item
+                // that lapsed or was decided between the listing and this
+                // call is already not waiting, and failing the whole sweep
+                // over it used to leave the session's remaining items
+                // pending forever, with nobody left to answer them.
+                Err(InboxError::Expired { .. })
+                | Err(InboxError::NotPending { .. })
+                | Err(InboxError::NotFound { .. }) => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(n)
@@ -1333,6 +1375,13 @@ pub enum IssueError {
     )]
     StandingNotAllowed { label: String },
 
+    #[error(
+        "grant \"{label}\" asks for \"{pattern}\", which covers the whole command bus, \
+         so nothing would be outside it; list the namespaces the session needs, or \
+         set Policy::allow_unrestricted_grants for the operator's own tooling"
+    )]
+    Unrestricted { label: String, pattern: String },
+
     #[error(transparent)]
     Random(#[from] RandomError),
 
@@ -1359,6 +1408,19 @@ impl<S: GrantStore, E: Env> Grants<S, E> {
         let mut namespaces = Vec::with_capacity(spec.namespaces.len());
         for p in &spec.namespaces {
             namespaces.push(Pattern::parse(p)?);
+        }
+
+        // Refused at issuance, not flagged after the fact: a grant that is
+        // already in the store is already being routed against.
+        if let Some(everything) = namespaces
+            .iter()
+            .find(|p| p.is_everything())
+            .filter(|_| !self.policy.allow_unrestricted_grants)
+        {
+            return Err(IssueError::Unrestricted {
+                label: spec.label,
+                pattern: everything.to_string(),
+            });
         }
 
         let nodes = match spec.nodes {
@@ -1516,6 +1578,11 @@ pub trait InboxStore: Send + Sync {
     /// Most recent decisions first, for the history pane.
     fn recent_items(&self, limit: u32) -> Result<Vec<PendingItem>, StorageError>;
     /// Mark pending items created before `cutoff` as expired, decided at `at`.
+    ///
+    /// Maintenance only — a vacuum for rows nobody will ever look at again.
+    /// [`Inbox::pending`] does not route through it: an item's approvability
+    /// is decided by the `expires` recorded on the item, so that listing and
+    /// [`Inbox::approve`] can never disagree about whether it has lapsed.
     fn expire_pending_before(&self, cutoff: u64, at: u64) -> Result<usize, StorageError>;
 }
 

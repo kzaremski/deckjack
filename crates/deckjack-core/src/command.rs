@@ -1715,6 +1715,25 @@ pub enum Refused {
         this: NodeId,
     },
 
+    /// A caller asked for a node the command's own target does not leave open.
+    ///
+    /// Separate from [`Refused::NotLocal`] because the two say opposite
+    /// things: there the command is somewhere else, here the command is right
+    /// where it belongs and the *request* named the wrong machine. Reported
+    /// with one variant, the message came out backwards — "runs on node
+    /// node-b" about a command that runs here — and a refusal that names the
+    /// wrong machine is worse than no message.
+    #[error(
+        "{command} runs on node {runs_on}, so it cannot be asked for on node \
+         {asked}; a caller may only choose a node for a command its backend \
+         left open"
+    )]
+    WrongNodeAsked {
+        command: CommandId,
+        asked: NodeId,
+        runs_on: NodeId,
+    },
+
     #[error(
         "agent session {session} has no grant, so it can run nothing; grant it \
          the namespaces it needs from the Assistant"
@@ -1817,8 +1836,9 @@ pub struct LogEntry {
     pub risk: Option<RiskLevel>,
     pub issuer: Issuer,
     pub decision: Decision,
-    /// The parameters, on admission only, and never for a command whose spec
-    /// sets `redact_params`.
+    /// The parameters, on admission and on a refusal, and never for a command
+    /// whose spec sets `redact_params` — nor for one with no spec at all,
+    /// where there is nothing left to ask about redaction.
     pub params: Option<Value>,
     /// Why it was refused, or how it failed.
     pub detail: Option<String>,
@@ -2166,6 +2186,13 @@ impl Bus {
         let at = self.env.now();
 
         let checked = (|| {
+            // Lockdown freezes pending Inbox items, and an approval is how one
+            // leaves the Inbox. Without this check, pausing agents stops new
+            // dispatches while everything already waiting stays releasable,
+            // which is the opposite of what the lever is for.
+            if request.issuer.is_agent() && self.agents_paused() {
+                return Err(Refused::AgentsPaused);
+            }
             let entry = self.entry(&request)?;
             let spec = entry.spec().clone();
             let node = self.resolve_node(&spec, request.target.as_ref())?;
@@ -2305,10 +2332,10 @@ impl Bus {
         if let (Target::ThisNode | Target::Node(_), Some(asked)) = (spec.target(), requested)
             && asked != &wanted
         {
-            return Err(Refused::NotLocal {
+            return Err(Refused::WrongNodeAsked {
                 command: spec.id().clone(),
-                wanted: asked.clone(),
-                this: wanted,
+                asked: asked.clone(),
+                runs_on: wanted,
             });
         }
         if wanted != self.node {
@@ -2426,10 +2453,16 @@ impl Bus {
         refusal: &Refused,
     ) {
         let spec = self.registry.spec(&request.command);
-        let params = spec.as_ref().map_or_else(
-            || Some(request.params.clone()),
-            |s| logged_params(s, &request.params),
-        );
+        // No spec means no redaction flag, so there is nothing that says these
+        // parameters are safe to write down. The registry is mutable by
+        // design — an on-demand app's commands go away when it stops — so the
+        // keystrokes of a `terminal.write` that arrived just after the
+        // terminal app was unregistered would otherwise be logged in full,
+        // which is exactly what that command's `REDACT_PARAMS` exists to
+        // prevent. The command id and the reason are enough to act on.
+        let params = spec
+            .as_ref()
+            .and_then(|s| logged_params(s, &request.params));
         if let Err(e) = self.journal.record(LogEntry {
             dispatch: dispatch.clone(),
             at,

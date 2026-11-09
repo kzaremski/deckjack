@@ -38,7 +38,7 @@ pub struct Ctx {
     /// `rusqlite::Connection` is `Send` but not `Sync`, so the store is
     /// behind its own lock. Held only across a single statement, never an
     /// await, so it never blocks the runtime.
-    store: Mutex<Store>,
+    store: Arc<Mutex<Store>>,
     failure_delay: Duration,
     trusted_proxies: Vec<IpAddr>,
     /// Run when a browser session genuinely ends — signed out, expired,
@@ -61,13 +61,13 @@ type Reaper = Box<dyn Fn(&SessionId) -> usize + Send + Sync>;
 impl Ctx {
     pub fn new(
         state: AuthState,
-        store: Store,
+        store: Arc<Mutex<Store>>,
         failure_delay: Duration,
         trusted_proxies: Vec<IpAddr>,
     ) -> Ctx {
         Ctx {
             state: Mutex::new(state),
-            store: Mutex::new(store),
+            store,
             failure_delay,
             trusted_proxies,
             reapers: Vec::new(),
@@ -81,6 +81,15 @@ impl Ctx {
     ) -> Ctx {
         self.reapers.push(Box::new(reap));
         self
+    }
+
+    /// Fold the WAL back into the main file. Called on graceful shutdown,
+    /// before the lock is released.
+    pub fn checkpoint(&self) -> Result<(), crate::store::StoreError> {
+        self.store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .checkpoint()
     }
 
     fn session_ended(&self, id: &SessionId) {
@@ -413,7 +422,7 @@ mod tests {
         };
         Ctx::new(
             AuthState::new(limits, Code::generate().unwrap(), Now::current()),
-            Store::in_memory().unwrap(),
+            Arc::new(std::sync::Mutex::new(Store::in_memory().unwrap())),
             Duration::from_millis(0),
             trusted.iter().map(|s| s.parse().unwrap()).collect(),
         )
