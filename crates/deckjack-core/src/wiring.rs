@@ -72,7 +72,11 @@ impl ws::Dispatch for BusDispatch {
             // their own browser. An agent reaches the bus through the MCP
             // path with its own session identity, never through here, so
             // there is no way for a browser to claim to be one.
-            let mut request = Request::new(id, call.params, Issuer::Operator);
+            let mut request = Request::new(
+                id,
+                call.params,
+                Issuer::browser(call.issuer.session().clone()),
+            );
             if call.confirmed {
                 request = request.confirmed();
             }
@@ -203,20 +207,17 @@ impl Command for Open {
     type Params = OpenParams;
     type Output = Opened;
 
-    async fn run(&self, params: OpenParams, _cx: Context) -> Result<Opened, CommandError> {
+    async fn run(&self, params: OpenParams, cx: Context) -> Result<Opened, CommandError> {
+        // A pty belongs to the browser session that asked for it, so that
+        // ending that session can reap it. `Opener::Host` is for terminals
+        // the server opened on its own behalf, which nothing revokes.
+        let opened_by = match cx.browser_session() {
+            Some(browser) => Opener::Client(browser.reveal().clone()),
+            None => Opener::Host,
+        };
         let spec = SessionSpec::login_shell(self.cwd.clone())
             .with_size(WinSize::new(params.rows, params.cols))
-            // TODO: should be `Opener::Client(session)` so the pty dies with
-            // the browser session that opened it, and so lockdown's "kill all
-            // child processes" and `close_for_session` have something to act
-            // on. It cannot be today: `ws::Issuer` carries the session id but
-            // `command::Issuer::Operator` has no field for it, so the identity
-            // is dropped at the bus boundary. Fixing it means adding the
-            // session to `command::Issuer`, which is a change to the bus's
-            // core type and wants its own pass. Until then a terminal
-            // outlives its session, which is a real gap and not a cosmetic
-            // one.
-            .opened_by(Opener::Host);
+            .opened_by(opened_by);
 
         let session = self
             .terminals

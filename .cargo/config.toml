@@ -1,0 +1,5 @@
+[alias]
+# `cargo xtask web` builds the browser bundle, `cargo xtask check` reports
+# whether it is stale, `cargo xtask build` does both in order. --quiet keeps
+# cargo's own "Compiling xtask" line out of the task's output.
+xtask = "run --quiet --package xtask --"

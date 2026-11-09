@@ -32,6 +32,15 @@
 //! else. [`Dispatch`] is the whole contract; `crate::command::Registry`
 //! implements it and neither side sees the other's internals.
 //!
+//! **Who asked crosses the boundary.** Every [`Call`] carries an [`Issuer`]
+//! built from the peer the upgrade authenticated: the connection, the IP and
+//! the session. The session is the part the bus cannot do without — a command
+//! that opens a pty has to tag it with the session so the pty dies with the
+//! browser that asked for it, and lockdown needs the same tag to kill what one
+//! revoked session started. It is also a bearer credential, so it leaves this
+//! module through exactly one accessor ([`Issuer::session`]) and never through
+//! a frame.
+//!
 //! ```no_run
 //! # use std::sync::Arc;
 //! # use deckjack_core::ws;
@@ -495,16 +504,57 @@ pub struct Call {
     pub confirmed: bool,
 }
 
-/// Who issued a call, for the attribution log.
+/// Who issued a call, for the attribution log and for ownership.
 ///
-/// Facts this module actually knows, nothing inferred. No `Display`, and the
-/// session id's own `Debug` redacts, so an attribution line cannot leak a
-/// bearer token.
+/// Facts this module actually knows, nothing inferred. No `Display` and no
+/// `Serialize`, and the session id's own `Debug` redacts, so an attribution
+/// line cannot leak a bearer token.
+///
+/// Fields are private with one constructor, which is called in exactly one
+/// place — the `invoke` arm, from the peer the upgrade authenticated. Same
+/// reasoning as `command::CommandSpec`: a type whose only value is being
+/// trustworthy should not be assemblable from parts a caller chose.
 #[derive(Debug, Clone)]
 pub struct Issuer {
-    pub connection: ConnectionId,
-    pub session: SessionId,
-    pub ip: IpAddr,
+    connection: ConnectionId,
+    session: SessionId,
+    ip: IpAddr,
+}
+
+impl Issuer {
+    pub fn new(connection: ConnectionId, session: SessionId, ip: IpAddr) -> Issuer {
+        Issuer {
+            connection,
+            session,
+            ip,
+        }
+    }
+
+    /// Which socket. Server-assigned, not a secret, and the right thing to put
+    /// in a log line about one tab.
+    pub fn connection(&self) -> ConnectionId {
+        self.connection
+    }
+
+    pub fn ip(&self) -> IpAddr {
+        self.ip
+    }
+
+    /// The signed-in session behind the socket.
+    ///
+    /// This is the one part of a call that is a bearer credential, and it is
+    /// carried because the bus needs it: a command that opens a pty has to tag
+    /// it with the session so the pty dies when that browser session does. The
+    /// adapter hands it to `command::Issuer::browser`, which wraps it in a type
+    /// that reveals it only on request and serializes as a digest.
+    ///
+    /// It must not go anywhere else. Not into a frame — every client already
+    /// holds its own cookie and none should learn another's — and not into a
+    /// log line or an error string, where it would outlive the session in
+    /// whatever backs the logs up.
+    pub fn session(&self) -> &SessionId {
+        &self.session
+    }
 }
 
 /// The cancel side of a running call, held by the command.
@@ -1450,11 +1500,10 @@ fn handle(
                 command: command.clone(),
                 params,
                 correlation: id.clone(),
-                issuer: Issuer {
-                    connection: conn,
-                    session: peer.session.clone(),
-                    ip: peer.ip,
-                },
+                // The session comes from `peer`, which the upgrade verified
+                // before the socket existed, and is never re-read from a
+                // frame: a client cannot name the session it is acting as.
+                issuer: Issuer::new(conn, peer.session.clone(), peer.ip),
                 cancel,
                 confirmed,
             };

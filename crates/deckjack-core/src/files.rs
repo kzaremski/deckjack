@@ -34,8 +34,18 @@
 //! design, so panels and commands carry a parsed address rather than a raw
 //! host path. [`Namespace`] says whether an address is this node's work or
 //! another node's; actually fetching another node's bytes needs the node
-//! registry and the command bus, which do not exist yet (see the TODO on
+//! registry, which does not exist yet (see the TODO on
 //! [`Target::Remote`]).
+//!
+//! **The commands.** [`register_commands`] puts the `files.*` namespace on the
+//! command bus and hands back the [`Namespace`] it built, so the HTTP file
+//! routes, WebDAV and previews share one boundary with the bus rather than
+//! each opening a [`Root`] of their own. The commands take a [`NodePath`] and
+//! return [`FileInfo`], which is flat and directly renderable by a file
+//! browser. Their risk levels are argued where they are declared; the short
+//! version is that everything reachable through them is inside the working
+//! directory by construction, which is the condition the design attaches
+//! confirmation to.
 //!
 //! ```no_run
 //! use deckjack_core::files::{ListOptions, NodePath, Namespace, Root};
@@ -59,8 +69,13 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::command::{
+    Command, CommandError, CommandId, Context, Registry, RegistryError, RiskLevel,
+};
 
 /// The hidden directory inside the working directory. Named here rather than
 /// derived from [`crate::store::DB_PATH`], because the rule is about the whole
@@ -1370,9 +1385,10 @@ pub enum Target {
     /// Another node's workspace.
     ///
     /// TODO: on-demand fetch and local caching, per the design's file layer.
-    /// That needs the node registry (which node is reachable, and how) and the
-    /// command bus (to send a `files.*` command to it), neither of which
-    /// exists in this build. Writing a fetch against an invented registry
+    /// That needs the node registry: which node is reachable, and how. The
+    /// `files.*` commands to ask another node with are registered below, so
+    /// what is missing is only the registry that says where to send them.
+    /// Writing a fetch against an invented registry
     /// would be a stub that compiles and lies, so callers get this variant and
     /// [`FileError::NotLocal`] from [`Namespace::resolve`] instead. The cache
     /// will want a table of its own in `store.rs`; see integration notes.
@@ -1511,4 +1527,636 @@ impl Namespace {
 /// something other than [`Fs`].
 pub fn to_unix(t: SystemTime) -> Option<u64> {
     t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
+// ---------------------------------------------------------------------------
+// The command bus
+// ---------------------------------------------------------------------------
+
+/// Cap on a whole-file write through the bus.
+///
+/// The same number as [`DEFAULT_MAX_READ`], for a related reason: a command's
+/// parameters arrive as one buffered JSON value, so the bytes exist in memory
+/// twice — once base64 or escaped, once decoded — before any of them reach the
+/// disk. Anything larger belongs in a streaming upload.
+pub const MAX_WRITE: u64 = DEFAULT_MAX_READ;
+
+/// `NodePath` is one string on the wire, so that is what its schema says.
+///
+/// Hand-written because the derive would describe the `String` the serde
+/// attribute converts from and say nothing about the shape, and this schema is
+/// what the palette, the MCP tool definition and the Files app all read.
+impl schemars::JsonSchema for NodePath {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "NodePath".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "title": "File address",
+            "description": "A file address: `node:/path`, or `/path` for this node. Paths are \
+                            relative to the working directory, which is the root; `..`, host \
+                            paths and anything inside `.deckjack/` are refused.",
+            "examples": ["/", "/notes/today.md", "r620:/photos/2026"]
+        })
+    }
+}
+
+/// What the file commands hand back for one file or directory.
+///
+/// Flat on purpose: a file browser renders a row straight from this. `is_dir`
+/// is spelled out beside `kind` because sorting folders first is the one thing
+/// every listing does, and no client should have to know that `"dir"` is the
+/// string that means it.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileInfo {
+    pub name: String,
+    /// The complete `node:/path` address, so what the operator clicked can be
+    /// sent back as the next command's parameter without being reassembled.
+    pub path: NodePath,
+    pub is_dir: bool,
+    /// `file`, `dir`, `symlink` or `other`.
+    pub kind: &'static str,
+    pub size: u64,
+    /// Unix seconds, or null when the filesystem has no usable timestamp.
+    /// Never a fabricated zero, which a client would render as 1970.
+    pub modified: Option<u64>,
+    pub readonly: bool,
+    /// A symlink whose target is outside the workspace or inside
+    /// `.deckjack/`. Shown so it can be seen and deleted; opening it fails.
+    pub escapes: bool,
+}
+
+impl FileInfo {
+    /// Qualified with the node it came from, so a listing merged from two
+    /// nodes in one panel still addresses each row correctly.
+    fn new(entry: Entry, files: &Namespace) -> FileInfo {
+        FileInfo {
+            path: files.qualify(&entry.path),
+            is_dir: entry.kind.is_dir(),
+            kind: entry.kind.as_str(),
+            size: entry.len,
+            modified: entry.modified,
+            readonly: entry.readonly,
+            escapes: entry.escapes,
+            name: entry.name,
+        }
+    }
+}
+
+/// One directory, as `files.list` returns it.
+#[derive(Debug, Clone, Serialize)]
+pub struct DirListing {
+    /// Where the listing actually landed, which is not always what was asked
+    /// for: a symlinked directory resolves to its target's address.
+    pub path: NodePath,
+    pub entries: Vec<FileInfo>,
+    /// Set when the entry cap cut the listing short, so the UI says so rather
+    /// than showing part of a directory as if it were all of it.
+    pub truncated: bool,
+}
+
+/// How bytes travel through JSON, in both directions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentEncoding {
+    /// The file's bytes as text. The default, because most of what a file
+    /// panel opens is text and base64 would make every diff and log line
+    /// unreadable for no gain.
+    #[default]
+    Utf8,
+    /// Standard base64 with padding, which is what the browser's `atob` and
+    /// `btoa` speak.
+    Base64,
+}
+
+impl schemars::JsonSchema for ContentEncoding {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ContentEncoding".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "enum": ["utf8", "base64"],
+            "default": "utf8",
+            "description": "How `content` is encoded. `base64` is standard base64 with padding."
+        })
+    }
+}
+
+/// A file's contents, as `files.read` returns them.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileContents {
+    pub path: NodePath,
+    pub name: String,
+    pub size: u64,
+    /// Which of the two `content` is. A flag rather than a guess from the
+    /// extension: a `.txt` holding invalid UTF-8 would otherwise be decoded
+    /// as text and arrive corrupted.
+    pub encoding: ContentEncoding,
+    pub content: String,
+    /// Guessed from the name, for picking a viewer. A guess is all it is;
+    /// nothing here is executed on the strength of it.
+    pub mime: String,
+    pub modified: Option<u64>,
+    pub readonly: bool,
+}
+
+/// What `files.delete` returns. There is nothing left to stat, so the answer
+/// is which address is now empty.
+#[derive(Debug, Clone, Serialize)]
+pub struct Deleted {
+    pub path: NodePath,
+    pub recursive: bool,
+}
+
+// -- parameters -------------------------------------------------------------
+
+/// The workspace root, for a panel that opens without a path yet.
+fn workspace_root() -> NodePath {
+    NodePath::local(VirtualPath::root())
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListParams {
+    /// The directory to list. The workspace root when left out.
+    #[serde(default = "workspace_root")]
+    pub path: NodePath,
+    /// Shown by default; see [`ListOptions::show_dotfiles`].
+    #[serde(default)]
+    pub show_dotfiles: Option<bool>,
+    /// Ask for a smaller page than the server's cap. See [`ListParams::options`].
+    #[serde(default)]
+    pub max_entries: Option<usize>,
+}
+
+impl ListParams {
+    /// A client may ask for fewer entries, never more. The cap is the
+    /// server's memory bound, not a pagination preference: raising it would
+    /// let one panel opening one directory decide how much the server holds.
+    fn options(&self) -> ListOptions {
+        let mut options = ListOptions::default();
+        if let Some(show) = self.show_dotfiles {
+            options.show_dotfiles = show;
+        }
+        if let Some(max) = self.max_entries {
+            options.max_entries = max.clamp(1, options.max_entries);
+        }
+        options
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadParams {
+    pub path: NodePath,
+    /// Refuse the read above this many bytes, if lower than the server's own
+    /// limit. A preview pane asks for little and fails fast on a huge file
+    /// instead of pulling it across the network to throw most of it away.
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
+impl ReadParams {
+    fn limit(&self) -> u64 {
+        match self.max_bytes {
+            Some(max) => max.clamp(1, DEFAULT_MAX_READ),
+            None => DEFAULT_MAX_READ,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WriteParams {
+    pub path: NodePath,
+    /// The whole new contents. There is no append and no offset: the write is
+    /// atomic underneath, and a partial write through a lossy connection is
+    /// how a half-saved file happens.
+    pub content: String,
+    #[serde(default)]
+    pub encoding: ContentEncoding,
+}
+
+impl WriteParams {
+    /// Decoded before anything touches the disk, so bad base64 is a parameter
+    /// error rather than a temporary file nobody cleans up.
+    fn decode(&self, command: &CommandId) -> Result<Vec<u8>, CommandError> {
+        let bytes = match self.encoding {
+            ContentEncoding::Utf8 => self.content.as_bytes().to_vec(),
+            ContentEncoding::Base64 => base64::engine::general_purpose::STANDARD
+                .decode(self.content.as_bytes())
+                .map_err(|e| CommandError::BadParams {
+                    command: command.clone(),
+                    message: format!(
+                        "content is not valid base64: {e}; send text with encoding \"utf8\" \
+                         or standard padded base64 with encoding \"base64\""
+                    ),
+                })?,
+        };
+        if bytes.len() as u64 > MAX_WRITE {
+            return Err(CommandError::BadParams {
+                command: command.clone(),
+                message: format!(
+                    "{} bytes is over the {MAX_WRITE} byte limit for a write through the bus; \
+                     copy a file this large from the terminal instead",
+                    bytes.len()
+                ),
+            });
+        }
+        Ok(bytes)
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PathParams {
+    pub path: NodePath,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RenameParams {
+    pub from: NodePath,
+    /// The complete new address, not a new name: a rename and a move are the
+    /// same operation, and spelling it this way means the Files app does not
+    /// need two commands to drag a file into a folder.
+    pub to: NodePath,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteParams {
+    pub path: NodePath,
+    /// Required to delete a directory that has anything in it. Off by
+    /// default, so a mistyped path cannot take a tree with it.
+    #[serde(default)]
+    pub recursive: bool,
+}
+
+// -- plumbing ---------------------------------------------------------------
+
+/// Run one filesystem operation off the runtime's worker threads.
+///
+/// [`Fs`] is synchronous, and the working directory may sit on a spinning or
+/// network-backed disk. Doing this work on a worker thread would park that
+/// thread inside a syscall, and the terminal's long poll shares those
+/// threads: one slow `stat` on a stalled mount would hold up output the
+/// operator is watching come out of a shell.
+async fn off_thread<T, F>(command: CommandId, work: F) -> Result<T, CommandError>
+where
+    F: FnOnce() -> Result<T, FileError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(result) => result.map_err(|e| to_command_error(command, e)),
+        // Nothing but a panic in the work above reaches this arm, and a panic
+        // in this module is a bug rather than a condition of the filesystem.
+        // It is reported instead of resumed so one bad path cannot take the
+        // whole server down with it.
+        Err(joined) => Err(CommandError::Failed(anyhow::anyhow!(
+            "the file operation did not finish: {joined}"
+        ))),
+    }
+}
+
+/// Keep the distinctions the bus already makes.
+///
+/// [`FileError`]'s messages are written for the operator, so they are passed
+/// through as they are; what this chooses is the *kind* of failure, because
+/// the shell and the Inbox render the kinds differently.
+fn to_command_error(command: CommandId, error: FileError) -> CommandError {
+    let message = error.to_string();
+    match error {
+        // A path the namespace cannot even hold is a malformed request, and
+        // saying so puts the message beside the field that was typed instead
+        // of in a failure banner.
+        FileError::Path(_) => CommandError::BadParams { command, message },
+        // Another node's file is not this node's command to run. The bus has
+        // a word for that, and using it keeps "ask the other node" from
+        // reading as "the filesystem broke".
+        FileError::NotLocal { .. } | FileError::UnknownNode { .. } => CommandError::Unsupported {
+            command,
+            reason: message,
+        },
+        other => CommandError::Failed(anyhow::Error::new(other)),
+    }
+}
+
+// -- reads ------------------------------------------------------------------
+
+pub struct ListDir {
+    files: Arc<Namespace>,
+}
+
+impl Command for ListDir {
+    const ID: &'static str = "files.list";
+    const TITLE: &'static str = "List files";
+    const RISK: RiskLevel = RiskLevel::ReadOnly;
+
+    type Params = ListParams;
+    type Output = DirListing;
+
+    async fn run(&self, params: ListParams, cx: Context) -> Result<DirListing, CommandError> {
+        let files = Arc::clone(&self.files);
+        let options = params.options();
+        off_thread(cx.command.clone(), move || {
+            let listing = files.list(&params.path, &options)?;
+            Ok(DirListing {
+                path: files.qualify(&listing.path),
+                entries: listing
+                    .entries
+                    .into_iter()
+                    .map(|entry| FileInfo::new(entry, &files))
+                    .collect(),
+                truncated: listing.truncated,
+            })
+        })
+        .await
+    }
+}
+
+pub struct ReadFile {
+    files: Arc<Namespace>,
+}
+
+impl Command for ReadFile {
+    const ID: &'static str = "files.read";
+    const TITLE: &'static str = "Read file";
+    const RISK: RiskLevel = RiskLevel::ReadOnly;
+
+    type Params = ReadParams;
+    type Output = FileContents;
+
+    async fn run(&self, params: ReadParams, cx: Context) -> Result<FileContents, CommandError> {
+        let files = Arc::clone(&self.files);
+        off_thread(cx.command.clone(), move || {
+            let limit = params.limit();
+            // Stat first, so the response carries the address the read landed
+            // on and the timestamp an editor needs to detect a change under
+            // it. `size` comes from the bytes themselves rather than from
+            // this metadata, so the two cannot disagree if the file is
+            // rewritten between the two calls.
+            let entry = files.stat(&params.path)?;
+            let bytes = files.read(&params.path, limit)?;
+            let path = files.qualify(&entry.path);
+            let mime = mime_guess::from_path(&entry.name)
+                .first_or_octet_stream()
+                .to_string();
+
+            // Text is returned as text. A browser decoding base64 to show a
+            // README is work that buys nothing, and the one flag below tells
+            // it when there is no choice. The size is measured before
+            // encoding, so it is the file's own length rather than the length
+            // of its transport form.
+            let (encoding, content, size) = match String::from_utf8(bytes) {
+                Ok(text) => {
+                    let size = text.len() as u64;
+                    (ContentEncoding::Utf8, text, size)
+                }
+                Err(e) => {
+                    let raw = e.into_bytes();
+                    let size = raw.len() as u64;
+                    let engine = base64::engine::general_purpose::STANDARD;
+                    (ContentEncoding::Base64, engine.encode(&raw), size)
+                }
+            };
+
+            Ok(FileContents {
+                size,
+                path,
+                name: entry.name,
+                encoding,
+                content,
+                mime,
+                modified: entry.modified,
+                readonly: entry.readonly,
+            })
+        })
+        .await
+    }
+}
+
+pub struct StatEntry {
+    files: Arc<Namespace>,
+}
+
+impl Command for StatEntry {
+    const ID: &'static str = "files.stat";
+    const TITLE: &'static str = "File details";
+    const RISK: RiskLevel = RiskLevel::ReadOnly;
+
+    type Params = PathParams;
+    type Output = FileInfo;
+
+    async fn run(&self, params: PathParams, cx: Context) -> Result<FileInfo, CommandError> {
+        let files = Arc::clone(&self.files);
+        off_thread(cx.command.clone(), move || {
+            let entry = files.stat(&params.path)?;
+            Ok(FileInfo::new(entry, &files))
+        })
+        .await
+    }
+}
+
+// -- writes -----------------------------------------------------------------
+//
+// Everything below is `RiskLevel::Write`, including the delete, and that is
+// the considered answer rather than an oversight.
+//
+// Risk level decides whether *the operator* is asked "are you sure". The
+// design says my own actions run directly, with ordinary confirmations for
+// destructive ones, and the confirmation it asks for specifically is for
+// "destructive file actions outside the working directory". Nothing reachable
+// through these commands is outside it: every path goes through
+// `Root::resolve` or `Root::resolve_link`, which prove containment on the
+// canonical path, so the case the design gates cannot arrive here at all.
+//
+// The tempting mistake — already made once in this project — is to mark the
+// delete `Destructive` because it would be dangerous for an *agent*. That
+// conflates two instruments. What keeps an agent out of these commands is the
+// grant: an agent is simply never given `files.write`, `files.delete` or
+// `files.rename`, and anything outside a grant is refused rather than queued.
+// Remote sessions are gated again by step-up sign-in. Risk level is neither of
+// those, and setting it high would only mean the operator confirms every file
+// they save in a text editor, which is a prompt nobody reads by the tenth one.
+
+pub struct WriteFile {
+    files: Arc<Namespace>,
+}
+
+impl Command for WriteFile {
+    const ID: &'static str = "files.write";
+    const TITLE: &'static str = "Save file";
+    const RISK: RiskLevel = RiskLevel::Write;
+    /// The parameters are the file's contents, and the audit log is readable
+    /// from the terminal by design. A saved password file or private key must
+    /// not end up in it.
+    ///
+    /// The cost is real: redaction is per command, not per field, so the path
+    /// is lost from the log row along with the bytes. The decision is a
+    /// deliberate trade and the fix is per-field redaction in `CommandSpec`,
+    /// which is the bus's business rather than this module's.
+    const REDACT_PARAMS: bool = true;
+
+    type Params = WriteParams;
+    type Output = FileInfo;
+
+    async fn run(&self, params: WriteParams, cx: Context) -> Result<FileInfo, CommandError> {
+        let files = Arc::clone(&self.files);
+        let bytes = params.decode(&cx.command)?;
+        off_thread(cx.command.clone(), move || {
+            let written = files.write(&params.path, &bytes)?;
+            // Stat afterwards so the caller gets the new size and timestamp
+            // and can update its row without asking again.
+            let entry = files.stat(&written)?;
+            Ok(FileInfo::new(entry, &files))
+        })
+        .await
+    }
+}
+
+pub struct MakeDir {
+    files: Arc<Namespace>,
+}
+
+impl Command for MakeDir {
+    const ID: &'static str = "files.mkdir";
+    const TITLE: &'static str = "New folder";
+    const RISK: RiskLevel = RiskLevel::Write;
+
+    type Params = PathParams;
+    type Output = FileInfo;
+
+    async fn run(&self, params: PathParams, cx: Context) -> Result<FileInfo, CommandError> {
+        let files = Arc::clone(&self.files);
+        off_thread(cx.command.clone(), move || {
+            let created = files.create_dir(&params.path)?;
+            let entry = files.stat(&created)?;
+            Ok(FileInfo::new(entry, &files))
+        })
+        .await
+    }
+}
+
+pub struct RenameEntry {
+    files: Arc<Namespace>,
+}
+
+impl Command for RenameEntry {
+    const ID: &'static str = "files.rename";
+    const TITLE: &'static str = "Rename or move";
+    const RISK: RiskLevel = RiskLevel::Write;
+
+    type Params = RenameParams;
+    type Output = FileInfo;
+
+    async fn run(&self, params: RenameParams, cx: Context) -> Result<FileInfo, CommandError> {
+        let files = Arc::clone(&self.files);
+        off_thread(cx.command.clone(), move || {
+            // An existing destination is refused underneath rather than
+            // overwritten, so this cannot quietly consume a file the operator
+            // forgot was there.
+            let moved = files.rename(&params.from, &params.to)?;
+            let entry = files.stat(&moved)?;
+            Ok(FileInfo::new(entry, &files))
+        })
+        .await
+    }
+}
+
+pub struct DeleteEntry {
+    files: Arc<Namespace>,
+}
+
+impl Command for DeleteEntry {
+    const ID: &'static str = "files.delete";
+    const TITLE: &'static str = "Delete";
+    /// Inside the working directory, deleting a file is ordinary work; see the
+    /// section note above for why this is not `Destructive`. A recursive
+    /// delete is the one case where "acts in bulk" could argue the other way,
+    /// and the honest place for that is a separate command with its own id and
+    /// a count in its prompt — not a risk level on this one, which would
+    /// charge every single-file delete for it.
+    const RISK: RiskLevel = RiskLevel::Write;
+
+    type Params = DeleteParams;
+    type Output = Deleted;
+
+    async fn run(&self, params: DeleteParams, cx: Context) -> Result<Deleted, CommandError> {
+        let files = Arc::clone(&self.files);
+        off_thread(cx.command.clone(), move || {
+            // A symlink is unlinked and never followed, so deleting a
+            // shortcut cannot delete what it points at.
+            let removed = files.remove(&params.path, params.recursive)?;
+            Ok(Deleted {
+                path: removed,
+                recursive: params.recursive,
+            })
+        })
+        .await
+    }
+}
+
+// -- registration -----------------------------------------------------------
+
+/// What can go wrong while putting the file commands on the bus. Each message
+/// names the one thing to change.
+#[derive(Debug, Error)]
+pub enum SetupError {
+    #[error(transparent)]
+    Root(#[from] FileError),
+
+    #[error(
+        "node id {node:?} cannot be used in file addresses: {source}. File addresses are \
+         `node:/path`, so the node's id has to be a name that can appear there; regenerate \
+         the node id in the install directory"
+    )]
+    Node {
+        node: String,
+        #[source]
+        source: PathError,
+    },
+
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
+}
+
+/// Put the file commands on the bus.
+///
+/// Returns the [`Namespace`] it built so the caller keeps a handle. The HTTP
+/// file routes, WebDAV, previews and downloads all have to cross the same
+/// boundary, and building a second [`Root`] for them would be a second place
+/// for the containment rules to drift — which is exactly how the predecessor
+/// project ended up with a decorative root.
+pub fn register_commands(
+    registry: &Registry,
+    working_dir: &Path,
+    node_id: &str,
+) -> Result<Arc<Namespace>, SetupError> {
+    let local = NodeName::parse(node_id).map_err(|source| SetupError::Node {
+        node: node_id.to_string(),
+        source,
+    })?;
+    let files = Arc::new(Namespace::new(local, Root::open(working_dir)?));
+
+    macro_rules! reg {
+        ($command:ident) => {
+            registry.register($command {
+                files: Arc::clone(&files),
+            })?;
+        };
+    }
+    reg!(ListDir);
+    reg!(ReadFile);
+    reg!(StatEntry);
+    reg!(WriteFile);
+    reg!(MakeDir);
+    reg!(RenameEntry);
+    reg!(DeleteEntry);
+
+    Ok(files)
 }

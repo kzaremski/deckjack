@@ -1,0 +1,21 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Deckjack build tasks: the parts of a build that are not Rust"
+publish = false
+
+[dependencies]
+# Deliberately almost nothing. This crate is the first thing a build compiles
+# and the thing that explains a broken build, so it must not need a dependency
+# tree, a registry or a network to say "your bundle is stale". `thiserror` is
+# already in the workspace lock for the core, so inheriting it costs no new
+# crate; everything else here is std.
+thiserror.workspace = true
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"

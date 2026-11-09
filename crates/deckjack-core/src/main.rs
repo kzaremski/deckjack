@@ -118,13 +118,6 @@ fn main() -> anyhow::Result<()> {
         restored_count,
     );
 
-    let ctx = Arc::new(Ctx::new(
-        state,
-        store,
-        config.auth.failure_delay(),
-        config.server.trusted_proxies.clone(),
-    ));
-
     // The bus, and the first commands on it. The working directory is the
     // terminal's cwd because that is what the design means by apps seeing the
     // working directory as their filesystem root — the shell opens where the
@@ -136,6 +129,11 @@ fn main() -> anyhow::Result<()> {
     // like any other rather than something the browser does to itself.
     wiring::register_windows(&registry, node_id.clone())
         .context("cannot register the window commands")?;
+    // Named rather than discarded: the HTTP file routes, WebDAV, previews and
+    // downloads must all cross this same boundary. Opening a second Root for
+    // them is exactly how the predecessor's configured root became decorative.
+    let _files = deckjack_core::files::register_commands(&registry, &working_dir, &node_id)
+        .context("cannot register the file commands")?;
     let bus = Arc::new(Bus::new(
         Arc::clone(&registry),
         NodeId::new(node_id.clone()),
@@ -145,6 +143,20 @@ fn main() -> anyhow::Result<()> {
         commands = registry.list(None).len(),
         terminals = terminals.limits().max_sessions,
         "command bus ready"
+    );
+
+    // Signing out kills the shells that session opened. A pty is a process
+    // running as the host user; leaving one behind after the browser that
+    // asked for it has gone is a shell nobody is watching.
+    let reaper = Arc::clone(&terminals);
+    let ctx = Arc::new(
+        Ctx::new(
+            state,
+            store,
+            config.auth.failure_delay(),
+            config.server.trusted_proxies.clone(),
+        )
+        .on_session_end(move |id| reaper.close_for_session(id)),
     );
 
     let ws_ctx = ws::WsCtx::new(

@@ -30,7 +30,12 @@
 //! The same reasoning applies to attribution: a [`Submission`] cannot say who
 //! it is from. The caller pairs it with an [`Issuer`] it derived from the
 //! authenticated connection, which is why a client cannot claim to be the
-//! operator.
+//! operator. For the operator that issuer also names *which* browser session
+//! asked ([`BrowserSession`]), so a handler can tie what it creates to the
+//! session that asked for it — a pty that dies with the browser rather than
+//! outliving it — and so a timeline can tell two signed-in browsers apart.
+//! The session id is a bearer credential, so it is revealed only on request
+//! and serializes as a digest; see [`BrowserSession`].
 //!
 //! Routing, which is the design's "Agents ask, I act" rule in code:
 //!
@@ -79,7 +84,8 @@
 //! let bus = Bus::new(registry, NodeId::new("node-a"), Arc::new(OsEnv));
 //! let request = Request::from_submission(
 //!     Submission { command: "git.status".to_string(), ..Default::default() },
-//!     Issuer::Operator,
+//!     // Or `Issuer::browser(session)` where a signed-in browser asked.
+//!     Issuer::operator(),
 //! )?;
 //!
 //! match bus.dispatch(request)? {
@@ -95,6 +101,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -108,10 +115,12 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::auth::code::os_random;
+use crate::auth::session::SessionId;
 
 /// A boxed future. The bus erases every handler behind `dyn`, so handler
 /// futures cannot be `impl Future`; they are boxed once per dispatch, which
@@ -1131,21 +1140,129 @@ impl Grants for NoGrants {
 // Attribution
 // ---------------------------------------------------------------------------
 
+/// A short, non-reversible label for one browser session.
+///
+/// The log needs to tell two signed-in browsers apart; it does not need the
+/// credential that proved either of them. This is SHA-256 over the session
+/// id, truncated and hex-encoded: stable for as long as the session lives, so
+/// a timeline can be grouped by browser, and useless to anyone who reads the
+/// log afterwards.
+///
+/// Derived rather than a prefix of the id, because a prefix of a credential
+/// is a piece of the credential, and shortening a secret does not stop it
+/// being one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct SessionTag(String);
+
+/// Bytes of digest kept. Eight leaves a one-in-2^64 chance that two sessions
+/// share a tag, which is far more than a log holding a handful of browsers
+/// needs, and short enough to read in a terminal.
+const SESSION_TAG_BYTES: usize = 8;
+
+impl SessionTag {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SessionTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The signed-in browser a command came from.
+///
+/// Wraps [`SessionId`] rather than exposing it, because that id is a bearer
+/// credential: holding it is being signed in. Two uses want it, and they are
+/// not the same use.
+///
+/// Owning a resource *by* session needs the id itself — a pty has to be
+/// tagged with it so [`crate::terminal::Registry::close_for_session`] can
+/// match on it when the browser session ends — and asks with
+/// [`BrowserSession::reveal`], named so the call site reads as the handover
+/// of a secret that it is.
+///
+/// Writing down *which* browser acted needs only [`BrowserSession::tag`], and
+/// that is what `Serialize` emits. So no serialized attribution — not a log
+/// row, not an Inbox item, not a frame on its way to a client — can carry the
+/// credential, even by accident. There is deliberately no `Deserialize` and no
+/// `Display`: a browser session is established by the layer that
+/// authenticated the connection, never parsed back out of something.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BrowserSession(SessionId);
+
+impl BrowserSession {
+    pub fn new(session: SessionId) -> BrowserSession {
+        BrowserSession(session)
+    }
+
+    /// The session id itself, for the one legitimate use: tying a resource's
+    /// lifetime to this browser session.
+    pub fn reveal(&self) -> &SessionId {
+        &self.0
+    }
+
+    /// The label for the log and the timeline.
+    ///
+    /// Computed on demand rather than stored, because it is wanted once per
+    /// log row and a dispatch happens on every terminal keystroke; hashing
+    /// there would be work nobody asked for.
+    pub fn tag(&self) -> SessionTag {
+        // `SessionId` keeps its bytes private and exposes only `encode`, so
+        // the digest is over that encoding. It is a bijection of the bytes,
+        // which is all the hash needs.
+        let digest = Sha256::digest(self.0.encode().as_bytes());
+        let mut out = String::with_capacity(SESSION_TAG_BYTES * 2);
+        for byte in &digest[..SESSION_TAG_BYTES] {
+            // Infallible for a `String`; discarded rather than unwrapped so a
+            // formatting bug cannot panic a dispatch, as in `lockdown::hex`.
+            let _ = write!(out, "{byte:02x}");
+        }
+        SessionTag(out)
+    }
+}
+
+impl fmt::Debug for BrowserSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The tag, not `<redacted>`: this type appears in the `Debug` of
+        // `Context` and `Running`, and a debug line that names the browser is
+        // useful in a way a placeholder is not.
+        write!(f, "BrowserSession({})", self.tag())
+    }
+}
+
+impl Serialize for BrowserSession {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.tag().serialize(serializer)
+    }
+}
+
 /// Who issued a command.
 ///
 /// Serialize only, and not part of [`Submission`]: the issuer is derived from
 /// the authenticated connection by the layer that accepted it. If it were a
 /// field a client could set, every rule in this module would be advisory.
 ///
-/// No session id or cookie appears here. The audit log is readable from the
-/// terminal by design, and a bearer credential in a log line is a credential
-/// in a backup; attribution needs the role and the session's name, not the
-/// secret that proved it.
+/// The operator's variant carries which browser session asked, because
+/// without it nothing downstream can tie a pty to the browser that opened it,
+/// lockdown has no way to pick out what one revoked session started, and a
+/// timeline cannot tell two browsers signed in at once apart. It carries it
+/// as a [`BrowserSession`], whose serialized form is a digest, so the old
+/// guarantee holds unchanged: the audit log is readable from the terminal by
+/// design, and no credential reaches it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "issuer", rename_all = "snake_case")]
 pub enum Issuer {
     /// Me, from a signed-in browser.
-    Operator,
+    Operator {
+        /// Which browser. `None` where the operator's authority is right but
+        /// no browser is behind the action: the CLI's in-process dispatches,
+        /// a reminder firing, a command the server issues at startup.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session: Option<BrowserSession>,
+    },
     /// A named agent session, as it appears in the Assistant.
     Agent { session: AgentSessionId },
     /// `deckjack <command>` on the host. Treated as the operator for routing,
@@ -1154,6 +1271,21 @@ pub enum Issuer {
 }
 
 impl Issuer {
+    /// The operator at a signed-in browser. The only way a browser session
+    /// gets onto the bus, and it takes a [`SessionId`] the caller must already
+    /// have authenticated — there is no path from a frame to here.
+    pub fn browser(session: SessionId) -> Issuer {
+        Issuer::Operator {
+            session: Some(BrowserSession::new(session)),
+        }
+    }
+
+    /// The operator with no browser behind the action. Named rather than
+    /// written as a literal so the absence is a decision at the call site.
+    pub fn operator() -> Issuer {
+        Issuer::Operator { session: None }
+    }
+
     pub fn agent(session: impl Into<String>) -> Issuer {
         Issuer::Agent {
             session: AgentSessionId::new(session),
@@ -1162,7 +1294,7 @@ impl Issuer {
 
     pub fn kind(&self) -> &'static str {
         match self {
-            Issuer::Operator => "operator",
+            Issuer::Operator { .. } => "operator",
             Issuer::Agent { .. } => "agent",
             Issuer::Cli => "cli",
         }
@@ -1172,7 +1304,19 @@ impl Issuer {
     pub fn name(&self) -> Option<&str> {
         match self {
             Issuer::Agent { session } => Some(session.as_str()),
-            Issuer::Operator | Issuer::Cli => None,
+            Issuer::Operator { .. } | Issuer::Cli => None,
+        }
+    }
+
+    /// Which signed-in browser this came from, if any.
+    ///
+    /// `None` for an agent, for the CLI, and for an operator action the server
+    /// issued itself — all three are "no browser to tie anything to", which is
+    /// what a caller deciding a resource's owner needs to know.
+    pub fn browser_session(&self) -> Option<&BrowserSession> {
+        match self {
+            Issuer::Operator { session } => session.as_ref(),
+            Issuer::Agent { .. } | Issuer::Cli => None,
         }
     }
 
@@ -1184,7 +1328,12 @@ impl Issuer {
 impl fmt::Display for Issuer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Issuer::Operator => f.write_str("operator"),
+            Issuer::Operator { session: None } => f.write_str("operator"),
+            // The tag is what makes two browsers distinguishable in the one
+            // place this `Display` is used: the journal line.
+            Issuer::Operator {
+                session: Some(browser),
+            } => write!(f, "operator {}", browser.tag()),
             Issuer::Agent { session } => write!(f, "agent {session}"),
             Issuer::Cli => f.write_str("cli"),
         }
@@ -1351,6 +1500,19 @@ pub struct Context {
     pub node: NodeId,
     pub started: SystemTime,
     pub progress: ProgressSink,
+}
+
+impl Context {
+    /// Which signed-in browser session this dispatch came from, or `None` for
+    /// the CLI, for an agent, and for commands the server issues itself.
+    ///
+    /// A handler that creates something outliving the call — a pty, a watcher,
+    /// a long-running export — asks this and gives what it created an owner.
+    /// `None` means there is no browser to outlive, not "unknown": the only
+    /// honest owner then is the host.
+    pub fn browser_session(&self) -> Option<&BrowserSession> {
+        self.issuer.browser_session()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -2054,7 +2216,7 @@ impl Bus {
         let risk = spec.risk();
 
         let route = match &request.issuer {
-            Issuer::Operator | Issuer::Cli => {
+            Issuer::Operator { .. } | Issuer::Cli => {
                 if risk.needs_confirmation_from_operator() && !request.confirmed {
                     Route::Confirm
                 } else {

@@ -30,7 +30,7 @@ pub const DB_PATH: &str = ".deckjack/state.db";
 /// Bumped whenever [`MIGRATIONS`] grows. Checked at startup against what the
 /// file says, so a database written by a newer Deckjack is refused rather
 /// than quietly half-understood.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Applied in order; index + 1 is the version each one produces. Never edit a
 /// migration that has shipped — add another.
@@ -312,6 +312,15 @@ CREATE TABLE app_grants (
     granted     INTEGER NOT NULL
 ) STRICT;
 "#,
+    // 3 — which browser session issued a command. A `command::SessionTag`:
+    // 16 hex characters of SHA-256 over the session id, never the cookie,
+    // because this file is readable from the terminal. NULL for agents, the
+    // CLI, and commands the server issued itself.
+    r#"
+    ALTER TABLE command_log ADD COLUMN issuer_session TEXT;
+    CREATE INDEX command_log_session ON command_log (issuer_session, at)
+        WHERE issuer_session IS NOT NULL;
+    "#,
 ];
 
 #[derive(Debug, Error)]

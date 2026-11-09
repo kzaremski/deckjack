@@ -41,7 +41,22 @@ pub struct Ctx {
     store: Mutex<Store>,
     failure_delay: Duration,
     trusted_proxies: Vec<IpAddr>,
+    /// Run when a browser session genuinely ends — signed out, expired,
+    /// revoked — so whatever it owns is reaped with it.
+    ///
+    /// Closures rather than a trait object over a concrete type: a pty is
+    /// the first thing that outlives its session, it will not be the last,
+    /// and `http` should not learn about `terminal` to say so. Each returns
+    /// how many things it closed, for the log.
+    ///
+    /// NOT run when a socket closes. A reload drops every connection and
+    /// must not kill the shell — that is the whole point of reattach.
+    reapers: Vec<Reaper>,
 }
+
+/// Cleans up after a session that has ended; returns how many things it
+/// closed, for the log.
+type Reaper = Box<dyn Fn(&SessionId) -> usize + Send + Sync>;
 
 impl Ctx {
     pub fn new(
@@ -55,6 +70,23 @@ impl Ctx {
             store: Mutex::new(store),
             failure_delay,
             trusted_proxies,
+            reapers: Vec::new(),
+        }
+    }
+
+    /// Register something to clean up after a session that has ended.
+    pub fn on_session_end(
+        mut self,
+        reap: impl Fn(&SessionId) -> usize + Send + Sync + 'static,
+    ) -> Ctx {
+        self.reapers.push(Box::new(reap));
+        self
+    }
+
+    fn session_ended(&self, id: &SessionId) {
+        let closed: usize = self.reapers.iter().map(|reap| reap(id)).sum();
+        if closed > 0 {
+            tracing::info!(closed, "reaped what the session owned");
         }
     }
 
@@ -350,6 +382,7 @@ async fn logout(
         && ctx.state().logout(&id)
     {
         ctx.forget(&id);
+        ctx.session_ended(&id);
     }
     (
         StatusCode::SEE_OTHER,
