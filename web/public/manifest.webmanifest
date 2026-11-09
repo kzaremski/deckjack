@@ -1,0 +1,72 @@
+{
+  "id": "/",
+  "name": "Deckjack",
+  "short_name": "Deckjack",
+  "description": "One browser-based workspace, served by machines I own, that presents as a desktop.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": [
+    "window-controls-overlay",
+    "standalone",
+    "minimal-ui"
+  ],
+  "launch_handler": {
+    "client_mode": "navigate-existing"
+  },
+  "orientation": "any",
+  "background_color": "#0a0d11",
+  "theme_color": "#0a0d11",
+  "categories": [
+    "productivity",
+    "developer",
+    "utilities"
+  ],
+  "prefer_related_applications": false,
+  "icons": [
+    {
+      "src": "/icons/deckjack.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/deckjack-maskable.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icons/deckjack-192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/deckjack-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/deckjack-maskable-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Terminal",
+      "url": "/?open=terminal"
+    },
+    {
+      "name": "Files",
+      "url": "/?open=files"
+    },
+    {
+      "name": "Assistant",
+      "url": "/?open=assistant"
+    }
+  ]
+}
