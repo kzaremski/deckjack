@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/deckjack-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+authors = ["Konstantin Zaremski"]
+repository = "https://github.com/kzaremski/deckjack"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.9", features = ["ws"] }
+base64 = "0.23.1"
+cookie = "0.18.2"
+nix = { version = "0.31.3", features = ["signal", "hostname"] }
+landlock = "0.4.7"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+rand = { version = "0.10.3", default-features = false, features = ["sys_rng", "std"] }
+subtle = "2.6.1"
+thiserror = "2.0.21"
+libc = "0.2.191"
+mime_guess = "2.0.5"
+portable-pty = "0.9.0"
+rmcp = { version = "1.8.0", features = ["server", "transport-io"] }
+rust-embed = { version = "8.5.0", features = ["compression"] }
+schemars = "1.2.2"
+seccompiler = "0.5.0"
+sha2 = "0.10.9"
+toml = "1.1.8"
+webauthn-rs = "0.6.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "signal", "time", "macros", "sync", "io-util", "process"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
