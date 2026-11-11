@@ -1,0 +1,49 @@
+# The Tasks app.
+#
+# A task is a VTODO in its own `.ics` file under `Tasks/`, which is what the
+# design says and not an implementation detail: "Reminders are data in
+# iCalendar and the Deckjack server is the one thing that fires them." The
+# same files sync over CalDAV, so a task made here shows up on a phone through
+# DAVx5 without Deckjack being involved, and outlives Deckjack if it goes.
+#
+# No network. Syncing is the PIM service's job, not this app's — one app that
+# holds credentials and talks to a provider, not every app that touches a
+# calendar file.
+
+[app]
+name = "tasks"
+version = "0.1.0"
+protocol = 1
+title = "Tasks"
+lifecycle = "on-demand"
+min_width = 320
+
+[needs]
+working_dir = [{ path = "Tasks", write = true }]
+
+[[commands]]
+id = "tasks.list"
+summary = "List tasks"
+risk = "read"
+
+[[commands]]
+id = "tasks.add"
+summary = "Add a task"
+risk = "write"
+
+[[commands]]
+id = "tasks.complete"
+summary = "Mark a task done or not done"
+risk = "write"
+
+[[commands]]
+id = "tasks.edit"
+summary = "Change a task"
+risk = "write"
+
+# Destructive for the same reason as a note: the file is the task, and nothing
+# inside Deckjack can bring one back.
+[[commands]]
+id = "tasks.delete"
+summary = "Delete a task"
+risk = "destructive"

@@ -1,0 +1,26 @@
+# The Files app.
+#
+# It declares no commands and asks for nothing, which is unusual enough to say
+# why: the file API is the core's. `files.list`, `files.read`, `files.write`,
+# `files.rename` and `files.delete` are registered by the core at startup,
+# rooted at the working directory, and they are what enforce that an address
+# never escapes it. A Files app that registered its own would be a second
+# implementation of the one boundary that matters most.
+#
+# So this app is its UI and nothing else. Its web UI runs on the core's origin
+# and calls the core's commands over the bus, exactly as the shell's own
+# panels do.
+#
+# The consequence worth knowing: an empty [needs] means there is nothing for
+# the operator to approve, so this app launches without an approval dialog —
+# and it is also the least privileged process in the suite. It cannot read a
+# single file itself. Everything it shows came through a command that was
+# logged and attributed.
+
+[app]
+name = "files"
+version = "0.1.0"
+protocol = 1
+title = "Files"
+lifecycle = "on-demand"
+min_width = 360

@@ -1,0 +1,55 @@
+# The Notes app.
+#
+# This file is the single source of truth about what Notes is: the binary
+# embeds it with include_str! and registers exactly what it declares, and the
+# core compares that registration against its own copy of this file. A risk
+# level stated here and contradicted in code would stop the app starting.
+
+[app]
+name = "notes"
+version = "0.1.0"
+protocol = 1
+title = "Notes"
+lifecycle = "on-demand"
+# Two panes below this and neither is usable.
+min_width = 360
+
+# Notes are Markdown files under `Notes/` in the working directory, and that
+# is the only thing this app can see. Not the rest of the working directory,
+# not the network, not the GPU. The format is the point: if Deckjack vanished
+# the notes would still open in any editor.
+[needs]
+working_dir = [{ path = "Notes", write = true }]
+
+[[commands]]
+id = "notes.list"
+summary = "List notes"
+risk = "read"
+
+[[commands]]
+id = "notes.read"
+summary = "Read a note"
+risk = "read"
+
+[[commands]]
+id = "notes.write"
+summary = "Save a note"
+risk = "write"
+
+[[commands]]
+id = "notes.create"
+summary = "Create a note"
+risk = "write"
+
+[[commands]]
+id = "notes.rename"
+summary = "Rename a note"
+risk = "write"
+
+# Destructive, so an agent's call waits in the Inbox and the operator's own
+# gets a confirmation. A note is a file the operator wrote by hand; losing one
+# to a mistyped command is not recoverable from inside Deckjack.
+[[commands]]
+id = "notes.delete"
+summary = "Delete a note"
+risk = "destructive"

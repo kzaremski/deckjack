@@ -32,7 +32,7 @@
 //!
 //! ```text
 //! let grants = Grants::new(store.clone(), SystemEnv, Policy::default());
-//! let grant = grants.issue(GrantSpec {
+//! let grant = grants.issue(Some("Assistant"), GrantSpec {
 //!     label: "Assistant".into(),
 //!     session: Some(session_id.encode()),
 //!     namespaces: vec!["git.*".into(), "files.read.*".into()],
@@ -508,6 +508,21 @@ pub struct Grant {
     /// dies with one. `None` is a standing grant, such as the always-on
     /// assistant's.
     pub session: Option<String>,
+    /// Who holds this grant, for a standing grant that dies with no session:
+    /// the agent session's name exactly as the bus knows it. Distinct from
+    /// [`Grant::label`], which is operator-facing text and not an identifier.
+    ///
+    /// `None` is a row written before migration 6, whose holder is unknown.
+    /// [`Grants::active_standing`] treats that as matching nobody, which is
+    /// the safe reading: inventing an owner would be claiming the operator
+    /// approved something they did not.
+    ///
+    /// `#[serde(skip)]` because `approvals::OwnedGrant` and
+    /// `approvals::GrantListing` flatten this struct and serialize `owner`
+    /// themselves; without it the operator's listing would carry the key
+    /// twice.
+    #[serde(skip)]
+    pub owner: Option<String>,
     /// The project root the grant is scoped to, for display and for the
     /// operator's own audit. Cross-project detection happens in the backend
     /// that declares the command, which is the only place that knows what a
@@ -880,6 +895,19 @@ impl Issuer {
     pub fn session(&self) -> Option<&str> {
         match self {
             Issuer::Session { session, .. } => session.as_deref(),
+            Issuer::Operator | Issuer::Cli => None,
+        }
+    }
+
+    /// The name a standing grant would be held under, for an issuer that has
+    /// no session to hang one off.
+    ///
+    /// `None` for the operator and the CLI: neither routes through this
+    /// module (see [`Issuer`]), so neither holds a standing grant, and
+    /// answering with a name here would hand them one.
+    pub fn owner(&self) -> Option<&str> {
+        match self {
+            Issuer::Session { label, .. } => Some(label),
             Issuer::Operator | Issuer::Cli => None,
         }
     }
@@ -1401,7 +1429,19 @@ impl<S: GrantStore, E: Env> Grants<S, E> {
         Grants { store, env, policy }
     }
 
-    pub fn issue(&self, spec: GrantSpec) -> Result<Grant, IssueError> {
+    /// Issue a grant, held by the name in `owner`.
+    ///
+    /// The holder is an argument and not a [`GrantSpec`] field, so there is
+    /// exactly one place it can be stated. A spec travels through
+    /// `..GrantSpec::default()` tails all over this codebase, and a holder
+    /// that can be left off a struct literal is a standing grant that
+    /// authorizes nobody — while a holder stated in both places would be two
+    /// sources for one fact, resolved silently by whichever won.
+    ///
+    /// `None` is a grant held by no name: right for a session-scoped grant,
+    /// which routing finds by `session`, and useless for a standing one. See
+    /// [`Grant::owner`].
+    pub fn issue(&self, owner: Option<&str>, spec: GrantSpec) -> Result<Grant, IssueError> {
         if spec.namespaces.is_empty() {
             return Err(IssueError::NoNamespaces { label: spec.label });
         }
@@ -1453,6 +1493,7 @@ impl<S: GrantStore, E: Env> Grants<S, E> {
             id: GrantId(self.env.new_id()?),
             label: spec.label,
             session: spec.session,
+            owner: owner.map(str::to_string),
             project: spec.project,
             namespaces,
             nodes,
@@ -1490,14 +1531,25 @@ impl<S: GrantStore, E: Env> Grants<S, E> {
             .collect())
     }
 
-    /// Standing grants, which belong to no session (the always-on assistant).
-    pub fn active_standing(&self) -> Result<Vec<Grant>, StorageError> {
+    /// Standing grants held by one owner, which belong to no session (the
+    /// always-on assistant).
+    ///
+    /// Filtered on the owner, not only on `session.is_none()`. Without the
+    /// owner arm every sessionless issuer got the union of all of them, so
+    /// the operator's own `*` tooling grant authorized any agent that arrived
+    /// without a session. The comparison is against `Some`, so a grant with
+    /// no owner — a row written before migration 6 — is returned for nobody.
+    /// That mirrors `approvals::GrantRows::held_by`, where SQL's `NULL = x`
+    /// is never true.
+    pub fn active_standing(&self, owner: &str) -> Result<Vec<Grant>, StorageError> {
         let now = self.env.now();
         Ok(self
             .store
             .grants()?
             .into_iter()
-            .filter(|g| g.session.is_none() && g.is_active(now))
+            .filter(|g| {
+                g.session.is_none() && g.owner.as_deref() == Some(owner) && g.is_active(now)
+            })
             .collect())
     }
 
@@ -1522,9 +1574,14 @@ impl<S: GrantStore, E: Env> Grants<S, E> {
         issuer: &Issuer,
         cmd: &dyn CommandFacts,
     ) -> Result<Decision, StorageError> {
-        let grants = match issuer.session() {
-            Some(session) => self.active_for_session(session)?,
-            None => self.active_standing()?,
+        // Session first, then owner. The operator and the CLI have neither,
+        // and get an empty slice rather than every standing grant: they do
+        // not route through this module at all, and `decide_any` refuses an
+        // empty slice by name.
+        let grants = match (issuer.session(), issuer.owner()) {
+            (Some(session), _) => self.active_for_session(session)?,
+            (None, Some(owner)) => self.active_standing(owner)?,
+            (None, None) => Vec::new(),
         };
         Ok(decide_any(
             &grants,

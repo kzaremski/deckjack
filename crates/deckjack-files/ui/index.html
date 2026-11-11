@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Files</title>
+    <link rel="stylesheet" href="/kit/kit.css" />
+    <style>
+      /* A path bar made of buttons, so every ancestor is one click away. */
+      .crumbs {
+        display: flex;
+        overflow-x: auto;
+        gap: 0.125rem;
+        align-items: center;
+        min-width: 0;
+      }
+      .crumb {
+        padding: 0 0.25rem;
+        border: 0;
+        background: none;
+        color: var(--dj-color-text-muted, #9aa0ad);
+        font: inherit;
+        white-space: nowrap;
+        cursor: pointer;
+      }
+      .crumb:last-child {
+        color: var(--dj-color-text, #e7e9ee);
+      }
+      .crumb:hover {
+        color: var(--dj-color-accent, #7aa2f7);
+      }
+      .kind {
+        flex: none;
+        width: 1rem;
+        color: var(--dj-color-text-muted, #9aa0ad);
+        text-align: center;
+      }
+      .preview {
+        overflow: auto;
+        flex: 1;
+        margin: 0;
+        padding: var(--dj-space-3, 0.75rem);
+        font-family: var(--dj-font-mono, ui-monospace, monospace);
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="dj-bar">
+      <button class="dj-button" id="up" title="Up one level">↑</button>
+      <nav class="crumbs" id="crumbs" aria-label="Path"></nav>
+      <span class="dj-spacer"></span>
+      <button class="dj-button" id="mkdir">New folder</button>
+    </div>
+
+    <div class="dj-body" id="body" data-pane="list">
+      <div class="dj-list" id="list"></div>
+      <div class="dj-main">
+        <pre class="preview" id="preview">Pick a file.</pre>
+      </div>
+    </div>
+
+    <p class="dj-status" id="status">Loading…</p>
+
+    <script type="module">
+      import { bus, failure, text } from "/kit/bus.js";
+
+      const list = document.getElementById("list");
+      const preview = document.getElementById("preview");
+      const status = document.getElementById("status");
+      const crumbs = document.getElementById("crumbs");
+      const body = document.getElementById("body");
+
+      /**
+       * Addresses are `node:/path` or `/path` in the core's one namespace, and
+       * this UI never builds a host path. `/` is the working directory on
+       * whichever node is answering.
+       */
+      let here = "/";
+
+      /** A preview is capped: a panel asks for little and fails fast rather
+       * than pulling a gigabyte across to show the first screen of it. */
+      const PREVIEW_BYTES = 128 * 1024;
+
+      function say(message) {
+        status.textContent = message;
+      }
+
+      function size(bytes) {
+        if (bytes < 1024) return `${bytes} B`;
+        const units = ["KB", "MB", "GB", "TB"];
+        let value = bytes / 1024;
+        let i = 0;
+        while (value >= 1024 && i < units.length - 1) {
+          value /= 1024;
+          i++;
+        }
+        return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[i]}`;
+      }
+
+      function drawCrumbs() {
+        const parts = here.split("/").filter(Boolean);
+        const items = [{ label: "Working directory", path: "/" }];
+        let path = "";
+        for (const part of parts) {
+          path += `/${part}`;
+          items.push({ label: part, path });
+        }
+        crumbs.innerHTML = items
+          .map(
+            (c, i) =>
+              `${i ? '<span class="crumb" aria-hidden="true">/</span>' : ""}` +
+              `<button class="crumb" data-path="${text(c.path)}">${text(c.label)}</button>`,
+          )
+          .join("");
+        for (const button of crumbs.querySelectorAll(".crumb[data-path]")) {
+          button.addEventListener("click", () => open(button.dataset.path));
+        }
+      }
+
+      async function open(path) {
+        const result = await bus.invoke("files.list", { path });
+        here = String(result.path ?? path);
+        drawCrumbs();
+
+        const entries = result.entries ?? [];
+        // Folders first, then by name: the order a file manager is expected
+        // to have, decided here because the command returns what the
+        // filesystem gave it.
+        entries.sort(
+          (a, b) =>
+            Number(b.kind === "dir") - Number(a.kind === "dir") ||
+            a.name.localeCompare(b.name),
+        );
+
+        if (entries.length === 0) {
+          list.innerHTML = '<p class="dj-empty">Nothing here.</p>';
+        } else {
+          list.innerHTML = entries
+            .map(
+              (e) => `
+              <button class="dj-row" data-path="${text(e.path)}" data-kind="${text(e.kind)}"
+                      ${e.escapes ? 'title="This link points outside the working directory and cannot be opened."' : ""}>
+                <span class="kind">${e.kind === "dir" ? "/" : e.escapes ? "!" : ""}</span>
+                <span class="dj-row-name">${text(e.name)}</span>
+                <span class="dj-row-meta">${e.kind === "dir" ? "" : size(e.len ?? 0)}</span>
+              </button>`,
+            )
+            .join("");
+          for (const row of list.querySelectorAll(".dj-row")) {
+            row.addEventListener("click", () =>
+              (row.dataset.kind === "dir" ? open(row.dataset.path) : show(row.dataset.path)).catch(
+                (e) => failure(status, e),
+              ),
+            );
+          }
+        }
+
+        let note = `${entries.length} item${entries.length === 1 ? "" : "s"}`;
+        if (result.truncated) note += " (listing was cut short)";
+        say(note);
+        preview.textContent = "Pick a file.";
+        body.dataset.pane = "list";
+      }
+
+      async function show(path) {
+        body.dataset.pane = "main";
+        preview.textContent = "Reading…";
+        try {
+          const result = await bus.invoke("files.read", { path, max_bytes: PREVIEW_BYTES });
+          // The core answers with text, or says it could not: a binary file
+          // is not something to render as mojibake.
+          preview.textContent = String(result.content ?? "");
+          say(path);
+        } catch (e) {
+          preview.textContent = "";
+          failure(status, e);
+        }
+      }
+
+      document.getElementById("up").addEventListener("click", () => {
+        const parts = here.split("/").filter(Boolean);
+        parts.pop();
+        open(`/${parts.join("/")}`.replace(/\/+$/, "") || "/").catch((e) => failure(status, e));
+      });
+
+      document.getElementById("mkdir").addEventListener("click", async () => {
+        const name = prompt("New folder name");
+        if (!name) return;
+        const path = here === "/" ? `/${name}` : `${here}/${name}`;
+        try {
+          await bus.invoke("files.mkdir", { path });
+          await open(here);
+        } catch (e) {
+          failure(status, e);
+        }
+      });
+
+      open("/").catch((e) => failure(document.body, e));
+    </script>
+  </body>
+</html>

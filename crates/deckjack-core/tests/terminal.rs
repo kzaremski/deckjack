@@ -21,7 +21,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use deckjack_core::auth::session::SessionId;
+use deckjack_core::auth::session::{SessionHash, SessionId};
 use deckjack_core::terminal::{
     Env, Hangup, Limits, Opener, Output, Program, PtyBackend, PtyProcess, Registry, SessionSpec,
     TerminalError, TerminalId, TerminalSession, WinSize,
@@ -373,12 +373,15 @@ fn shell_spec() -> SessionSpec {
     SessionSpec::login_shell("/srv/deckjack")
 }
 
-fn client(session: &SessionId) -> SessionSpec {
-    shell_spec().opened_by(Opener::Client(session.clone()))
+fn client(session: &SessionHash) -> SessionSpec {
+    shell_spec().opened_by(Opener::Client(*session))
 }
 
-fn an_id() -> SessionId {
-    SessionId::generate().unwrap()
+/// The registry records who opened a terminal by the hash of their session
+/// id, never the id itself: the registry outlives any one request and is
+/// dumped into logs and lockdown reports, and a session id is a credential.
+fn an_id() -> SessionHash {
+    SessionId::generate().unwrap().hash()
 }
 
 /// Follow a terminal from `cursor` until it reports an exit, exactly as the
@@ -1099,18 +1102,23 @@ fn a_generated_id_survives_the_round_trip_a_client_puts_it_through() {
 
 #[test]
 fn a_terminal_never_prints_the_session_that_opened_it() {
-    // Every open writes a log line that includes `opened_by`. A session id
-    // is a bearer cookie: in a log file it is a way back into the server.
-    let signed_in = an_id();
+    // Every open writes a log line that includes `opened_by`. A session id is
+    // a bearer cookie: in a log file it is a way back into the server. The
+    // registry never holds one — `Opener::Client` carries the hash — so this
+    // is now structurally true rather than a property of a `Debug` impl, and
+    // the test says so by starting from a real cookie.
+    let cookie = SessionId::generate().unwrap();
     let r = rig(Limits::default());
-    let term = r.registry.open(client(&signed_in)).unwrap();
+    let term = r.registry.open(client(&cookie.hash())).unwrap();
 
     let printed = format!("{term:?} {:?}", term.opened_by());
     assert!(
-        !printed.contains(&signed_in.encode()),
+        !printed.contains(&cookie.encode()),
         "a session id reached a Debug line: {printed}"
     );
-    assert!(printed.contains("redacted"), "got {printed}");
+    // The digest does appear, and is meant to: matching a log line against a
+    // revocation is the one thing `opened_by` is for.
+    assert!(printed.contains(&cookie.hash().hex()), "got {printed}");
 }
 
 #[test]

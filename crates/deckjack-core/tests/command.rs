@@ -744,6 +744,76 @@ fn pausing_agents_stops_them_without_touching_the_operator() {
     );
 }
 
+/// The other half of the same gate: something OUTSIDE the bus holding agents.
+///
+/// In the product that something is the lockdown, attached in `wiring::bus`
+/// as a `Halt`. Here it is a bare flag, because what is under test is the
+/// bus's half of the contract: a hold refuses agents, the operator's lever
+/// cannot clear a hold, and releasing a hold resumes agents with nothing
+/// called on its behalf.
+#[test]
+fn a_halt_refuses_agents_and_resume_agents_cannot_clear_it() {
+    use std::sync::atomic::AtomicBool;
+
+    struct TestHalt(Arc<AtomicBool>);
+
+    impl Halt for TestHalt {
+        fn agents_halted(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    let h = harness();
+    h.grants.put(
+        AgentSessionId::new("coding"),
+        grant(&["probe.*"], RiskLevel::Destructive),
+    );
+
+    let halted = Arc::new(AtomicBool::new(true));
+    let bus = Bus::new(Arc::clone(&h.registry), NodeId::new(NODE), TestEnv::new())
+        .with_grants(Arc::clone(&h.grants) as Arc<dyn Grants>)
+        .with_halt(Arc::new(TestHalt(Arc::clone(&halted))));
+
+    assert!(
+        matches!(
+            bus.dispatch(from("probe.read", Issuer::agent("coding")))
+                .expect_err("something is holding agents"),
+            Refused::AgentsPaused
+        ),
+        "a halt must refuse an agent even with a grant that covers the command"
+    );
+
+    // The operator's lever does not own the halt and must not be able to
+    // release it. A `resume_agents` that cleared a lockdown would be a way
+    // out of the kill switch that costs no recovery code.
+    bus.resume_agents();
+    assert!(
+        matches!(
+            bus.dispatch(from("probe.read", Issuer::agent("coding")))
+                .expect_err("the halt still holds"),
+            Refused::AgentsPaused
+        ),
+        "resume_agents released a hold it does not own"
+    );
+
+    // And when the halt lets go, agents resume with nothing called.
+    halted.store(false, Ordering::SeqCst);
+    assert!(
+        bus.dispatch(from("probe.read", Issuer::agent("coding")))
+            .is_ok(),
+        "releasing the halt must resume agents by itself; nothing is going to \
+         call resume_agents on its behalf"
+    );
+
+    // The operator's lever still works on its own, with no halt in play.
+    bus.pause_agents();
+    assert!(matches!(
+        bus.dispatch(from("probe.read", Issuer::agent("coding")))
+            .expect_err("the operator paused them"),
+        Refused::AgentsPaused
+    ));
+}
+
 #[test]
 fn queuing_with_no_inbox_attached_is_refused_rather_than_run() {
     // A bus with the honest defaults: no Assistant, so nothing to queue for.
@@ -1677,4 +1747,43 @@ fn the_palette_lists_what_an_agent_may_use_and_the_operator_everything() {
         .list(Some(&grant(&["other.*"], RiskLevel::Destructive)));
     assert_eq!(scoped.len(), 1);
     assert_eq!(scoped[0].spec.id().as_str(), "other.read");
+}
+
+/// The audit log's session tag must be a prefix of the hash the store keys
+/// `sessions` by.
+///
+/// This is the test that was missing when the two derivations drifted: each
+/// side hashed "the session id" — one the raw bytes, one the base64 text —
+/// and each was internally consistent, tested, and green. The result was an
+/// audit log that could not be joined to the sessions table or to a
+/// revocation, which is the one question an audit log exists to answer. The
+/// defect was only visible with both values in front of you on a running
+/// node, so this is what holds them together from now on.
+#[test]
+fn a_log_rows_session_tag_joins_to_the_stored_session_hash() {
+    let id = deckjack_core::auth::SessionId::generate().expect("a session id");
+    let tag = deckjack_core::command::BrowserSession::new(id.clone()).tag();
+    let stored = id.hash().hex();
+
+    assert!(
+        stored.starts_with(tag.as_str()),
+        "the log says {tag} and the store says {stored}: an entry cannot be \
+         matched to its session"
+    );
+    // A tag long enough to be worth joining on, and short enough to read.
+    assert_eq!(tag.as_str().len(), 16);
+    assert!(
+        tag.as_str()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+    );
+
+    // Different sessions get different tags, or the join is worthless.
+    let other = deckjack_core::auth::SessionId::generate().expect("a second id");
+    assert_ne!(
+        tag.as_str(),
+        deckjack_core::command::BrowserSession::new(other)
+            .tag()
+            .as_str()
+    );
 }

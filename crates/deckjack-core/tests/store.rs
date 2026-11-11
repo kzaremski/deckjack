@@ -15,7 +15,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use deckjack_core::auth::session::{Session, SessionId};
+use deckjack_core::auth::session::{Session, SessionHash, SessionId};
 use deckjack_core::store::{DB_PATH, SCHEMA_VERSION, Store, StoreError};
 use rusqlite::Connection;
 
@@ -29,14 +29,22 @@ fn raw(dir: &Path) -> Connection {
 
 fn session(ip: &str, lasts_secs: u64) -> Session {
     let now = SystemTime::now();
-    Session {
-        ip: ip.parse::<IpAddr>().unwrap(),
-        created: now,
-        expires: now + Duration::from_secs(lasts_secs),
-    }
+    Session::new(
+        ip.parse::<IpAddr>().unwrap(),
+        now,
+        now + Duration::from_secs(lasts_secs),
+    )
 }
 
-fn an_id() -> SessionId {
+/// A session as everything but the live request path sees it: the hash, not
+/// the cookie. `insert_session` takes only this, which is what keeps a cookie
+/// out of the file.
+fn an_id() -> SessionHash {
+    a_cookie().hash()
+}
+
+/// The cookie itself. Only the tests that are *about* the cookie want one.
+fn a_cookie() -> SessionId {
     SessionId::generate().unwrap()
 }
 
@@ -93,12 +101,47 @@ PRAGMA user_version = 1;
 
 /// Write a session row straight into the table, bypassing `insert_session`,
 /// so a test can describe a row no current code path would produce.
-fn seed_session(conn: &Connection, id: &str, ip: &str, expires: i64) {
+fn seed_session(conn: &Connection, hash: &str, ip: &str, expires: i64) {
+    conn.execute(
+        "INSERT INTO sessions (hash, ip, created, expires) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![hash, ip, 0_i64, expires],
+    )
+    .unwrap();
+}
+
+/// The same, against the version 1 schema, whose primary key was the cookie
+/// itself. Only the migration tests have a database in that shape.
+fn seed_v1_session(conn: &Connection, id: &str, ip: &str, expires: i64) {
     conn.execute(
         "INSERT INTO sessions (id, ip, created, expires) VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![id, ip, 0_i64, expires],
     )
     .unwrap();
+}
+
+/// No file under `.deckjack/` contains this cookie.
+///
+/// Every file, not just `state.db`: `DROP TABLE` leaves the bytes in freed
+/// pages, and in WAL mode a plain `VACUUM` writes its result into `-wal`
+/// while the main file keeps the old pages untouched — mtime and all.
+/// Checking one file would pass while the cookie sat in the other.
+fn assert_scrubbed(working_dir: &std::path::Path, cookie: &SessionId) {
+    let plaintext = cookie.encode().into_bytes();
+    let dir = working_dir.join(".deckjack");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("the hidden directory") {
+        let path = entry.unwrap().path();
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        checked += 1;
+        assert!(
+            !bytes.windows(plaintext.len()).any(|w| w == plaintext),
+            "a session cookie is still readable in {}",
+            path.display()
+        );
+    }
+    assert!(checked > 0, "nothing was checked in {}", dir.display());
 }
 
 // ---- migrations ---------------------------------------------------------
@@ -161,29 +204,32 @@ fn reopening_a_current_database_changes_neither_its_version_nor_its_schema() {
 }
 
 #[test]
-fn a_version_one_database_migrates_forward_with_its_rows_intact() {
+fn a_version_one_database_migrates_forward_and_drops_its_plaintext_sessions() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join(".deckjack")).unwrap();
-    let id = an_id();
+    let cookie = a_cookie();
     let expires = SystemTime::now() + Duration::from_secs(3600);
     {
         let conn = raw(dir.path());
         conn.execute_batch(V1_SCHEMA).unwrap();
-        seed_session(&conn, &id.encode(), "100.69.236.100", unix(expires));
+        seed_v1_session(&conn, &cookie.encode(), "100.69.236.100", unix(expires));
     }
 
     let store = Store::open(dir.path()).unwrap();
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
 
-    // The row written by the old build is still honored by the new one.
-    let live = store.live_sessions(SystemTime::now()).unwrap();
-    assert_eq!(
-        live.len(),
-        1,
-        "migrating 1 -> {SCHEMA_VERSION} lost a session"
+    // Deliberately lost. The version 1 row's primary key was the cookie
+    // itself, and carrying it across by hashing it in place would leave the
+    // plaintext in the freed pages — which is the one thing migration 4 is
+    // for. The cost is stated where it is paid: everyone signs in again once.
+    assert!(
+        store.live_sessions(SystemTime::now()).unwrap().is_empty(),
+        "migration 4 kept a session row whose key was a live cookie"
     );
-    assert_eq!(live[0].0.encode(), id.encode());
     drop(store);
+
+    // And the bytes are gone from the files, not merely unreachable by SQL.
+    assert_scrubbed(dir.path(), &cookie);
 
     let conn = raw(dir.path());
     assert!(table_exists(&conn, "events"), "migration 2 did not run");
@@ -193,26 +239,53 @@ fn a_version_one_database_migrates_forward_with_its_rows_intact() {
 #[test]
 fn a_version_two_database_migrates_forward_with_its_rows_intact() {
     let dir = tempfile::tempdir().unwrap();
-    let id = an_id();
+    let cookie = a_cookie();
     let expires = SystemTime::now() + Duration::from_secs(3600);
 
-    // Build a genuine v2 file by taking a current one and reversing migration
-    // 3, which is exactly "add a column, add an index over it". Reversing it
-    // beats transcribing 200 lines of migration 2 into this file.
+    // Build a genuine v2 file by taking a current one and reversing every
+    // migration after 2. Reversing beats transcribing 200 lines of migration
+    // 2 into this file — but it has a running cost, and this is the comment
+    // that has to be read when it bites:
+    //
+    //   EVERY NEW MIGRATION MUST BE UNDONE HERE.
+    //
+    // Forget one and this test fails on the re-run with a message about a
+    // duplicate column, which says nothing about the real problem. Adding
+    // migration 5 did exactly that.
     {
         let store = Store::open(dir.path()).unwrap();
-        store
-            .insert_session(&id, &session("100.69.236.100", 3600))
-            .unwrap();
         drop(store);
         let conn = raw(dir.path());
         conn.execute_batch(
-            "DROP INDEX command_log_session;
+            // 7 and 4: the sessions table is dropped and rebuilt in its
+            // version 1 shape below, so `kind` goes with it.
+            // 6: the grant owner column.
+            "DROP INDEX grants_owner;
+             ALTER TABLE grants DROP COLUMN owner;
+             -- 5: the four columns that made `events` the audit log.
+             DROP INDEX events_dispatch;
+             ALTER TABLE events DROP COLUMN dispatch;
+             ALTER TABLE events DROP COLUMN risk;
+             ALTER TABLE events DROP COLUMN issuer_session;
+             ALTER TABLE events DROP COLUMN phase;
+             -- 4: the sessions table and the known-address list.
+             DROP TABLE sessions;
+             DROP TABLE known_addresses;
+             -- 3: the issuing session on a command log row.
+             DROP INDEX command_log_session;
              ALTER TABLE command_log DROP COLUMN issuer_session;
+             CREATE TABLE sessions (
+                id      TEXT    PRIMARY KEY,
+                ip      TEXT    NOT NULL,
+                created INTEGER NOT NULL,
+                expires INTEGER NOT NULL
+             ) STRICT;
+             CREATE INDEX sessions_expires ON sessions (expires);
              PRAGMA user_version = 2;",
         )
         .unwrap();
         assert!(!has_column(&conn, "command_log", "issuer_session"));
+        seed_v1_session(&conn, &cookie.encode(), "100.69.236.100", unix(expires));
         // A populated v2 database: a log row an older build wrote.
         conn.execute(
             "INSERT INTO command_log (dispatch, at, node, command, risk, issuer, decision)
@@ -224,15 +297,15 @@ fn a_version_two_database_migrates_forward_with_its_rows_intact() {
 
     let store = Store::open(dir.path()).unwrap();
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-    let live = store.live_sessions(SystemTime::now()).unwrap();
-    assert_eq!(
-        live.len(),
-        1,
-        "migrating 2 -> {SCHEMA_VERSION} lost a session"
+    // The sessions go, for the reason migration 4 exists; everything else
+    // carries forward, which is what the rest of this test checks.
+    assert!(
+        store.live_sessions(SystemTime::now()).unwrap().is_empty(),
+        "migration 4 kept a session row whose key was a live cookie"
     );
-    assert_eq!(live[0].0.encode(), id.encode());
-    assert_eq!(unix(live[0].1.expires), unix(expires), "expiry shifted");
     drop(store);
+
+    assert_scrubbed(dir.path(), &cookie);
 
     let conn = raw(dir.path());
     // The pre-existing row survived the ALTER and reads as "no session known"
@@ -370,29 +443,78 @@ fn the_state_file_is_readable_only_by_the_user_running_the_server() {
 }
 
 #[test]
-#[ignore = "known defect: sessions.id is the cookie itself, stored in plaintext. \
-            The fix is to store a hash and have auth look sessions up by hash, which \
-            means auth/state.rs and the cookie path, not store.rs alone."]
 fn a_live_session_cookie_is_never_written_to_the_state_file_in_plaintext() {
     let dir = tempfile::tempdir().unwrap();
-    let id = an_id();
+    let id = a_cookie();
     let store = Store::open(dir.path()).unwrap();
     store
-        .insert_session(&id, &session("100.69.236.100", 3600))
+        .insert_session(&id.hash(), &session("100.69.236.100", 3600))
         .unwrap();
     store.checkpoint().unwrap();
 
     // The rule this file sets for itself: the command log stores a hash of
     // the session id "never the cookie, because this file is readable from
-    // the terminal". The sessions table breaks that rule — the value in it is
-    // the cookie, so a copy of the directory, a backup or a sync target hands
-    // over live credentials rather than state.
+    // the terminal". The sessions table holds a digest for the same reason,
+    // so a copy of the directory — a backup, a sync target, another local
+    // account that can read it — is state rather than live credentials.
     let bytes = std::fs::read(dir.path().join(DB_PATH)).unwrap();
     let cookie = id.encode().into_bytes();
     assert!(
         !bytes.windows(cookie.len()).any(|w| w == cookie),
         "a live session cookie is sitting in {DB_PATH} in plaintext"
     );
+}
+
+#[test]
+fn the_migrations_that_turn_the_unused_tables_on_are_actually_applied() {
+    // A migration that silently never runs leaves a version number that looks
+    // right and a database that is missing a column, so each of the three is
+    // checked by the thing it added rather than by the version alone.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    drop(store);
+    let conn = raw(dir.path());
+
+    // 5: `events` becomes the audit log. `phase` is the one that matters most
+    // — without it a dispatch logged on admission and again on completion is
+    // two rows nothing can tell apart.
+    for column in ["dispatch", "risk", "issuer_session", "phase"] {
+        assert!(
+            has_column(&conn, "events", column),
+            "migration 5 did not add events.{column}"
+        );
+    }
+
+    // 6: a standing grant records who holds it, so one sessionless issuer
+    // does not inherit the union of every standing grant.
+    assert!(
+        has_column(&conn, "grants", "owner"),
+        "migration 6 did not add grants.owner"
+    );
+
+    // 7: a session records how it was proved, which is what step-up needs.
+    assert!(
+        has_column(&conn, "sessions", "kind"),
+        "migration 7 did not add sessions.kind"
+    );
+}
+
+#[test]
+fn an_existing_session_is_read_as_the_weaker_kind_not_the_stronger_one() {
+    // Every session that exists when migration 7 runs was created by the
+    // one-time code. Defaulting the column to 'passkey' would hand an old
+    // row access it never earned.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store
+        .insert_session(&an_id(), &session("127.0.0.1", 3600))
+        .unwrap();
+    drop(store);
+    let kind: String = raw(dir.path())
+        .query_row("SELECT kind FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(kind, "tether");
 }
 
 // ---- WAL and checkpoint -------------------------------------------------
@@ -434,7 +556,7 @@ fn checkpoint_folds_the_wal_back_so_the_main_file_alone_carries_the_rows() {
     let moved = Store::open(carried.path()).unwrap();
     let live = moved.live_sessions(SystemTime::now()).unwrap();
     assert_eq!(live.len(), 1, "the checkpointed file lost the session");
-    assert_eq!(live[0].0.encode(), id.encode());
+    assert_eq!(live[0].0, id);
 }
 
 #[test]
@@ -495,7 +617,7 @@ fn an_expired_session_is_deleted_from_the_file_not_merely_filtered_out() {
 
     let returned = store.live_sessions(SystemTime::now()).unwrap();
     assert_eq!(returned.len(), 1);
-    assert_eq!(returned[0].0.encode(), live_id.encode());
+    assert_eq!(returned[0].0, live_id);
 
     // Asked of another connection: a dormant directory must not come back
     // years later carrying every session it ever issued.
@@ -514,11 +636,11 @@ fn a_session_whose_expiry_has_just_arrived_is_not_live() {
     store
         .insert_session(
             &id,
-            &Session {
-                ip: "127.0.0.1".parse().unwrap(),
-                created: now - Duration::from_secs(60),
-                expires: now,
-            },
+            &Session::new(
+                "127.0.0.1".parse().unwrap(),
+                now - Duration::from_secs(60),
+                now,
+            ),
         )
         .unwrap();
 
@@ -535,7 +657,7 @@ fn an_expiry_before_the_epoch_counts_as_expired_not_as_far_future() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     drop(store);
-    seed_session(&raw(dir.path()), &an_id().encode(), "127.0.0.1", -1);
+    seed_session(&raw(dir.path()), &an_id().hex(), "127.0.0.1", -1);
 
     // A negative stamp read as unsigned would become an expiry 292 billion
     // years out — a session that never dies.
@@ -557,7 +679,7 @@ fn an_absurd_expiry_does_not_take_down_the_load() {
             .unwrap();
     }
     let conn = raw(dir.path());
-    seed_session(&conn, &an_id().encode(), "127.0.0.1", i64::MAX);
+    seed_session(&conn, &an_id().hex(), "127.0.0.1", i64::MAX);
     drop(conn);
 
     // Nothing stops a shell as the host user from writing this row, and
@@ -565,7 +687,7 @@ fn an_absurd_expiry_does_not_take_down_the_load() {
     let store = Store::open(dir.path()).unwrap();
     let live = store.live_sessions(SystemTime::now()).unwrap();
     assert!(
-        live.iter().any(|(id, _)| id.encode() == good.encode()),
+        live.iter().any(|(hash, _)| *hash == good),
         "an absurd expiry hid the sessions around it"
     );
 }
@@ -584,11 +706,11 @@ fn an_unreadable_session_row_is_skipped_and_the_readable_ones_still_load() {
     {
         let conn = raw(dir.path());
         // Three ways a row can be unreadable, all of them reachable from the
-        // terminal: a truncated id, a well-formed id that is not 32 bytes,
-        // and something that is not an address.
+        // terminal: a truncated digest, a well-formed digest with something
+        // that is not an address beside it, and non-hex junk.
         seed_session(&conn, "too-short", "127.0.0.1", future);
-        seed_session(&conn, &"A".repeat(43), "not-an-ip", future);
-        seed_session(&conn, "!!!not base64!!!", "127.0.0.1", future);
+        seed_session(&conn, &"a".repeat(64), "not-an-ip", future);
+        seed_session(&conn, &"z".repeat(64), "127.0.0.1", future);
     }
 
     let store = Store::open(dir.path()).unwrap();
@@ -600,7 +722,7 @@ fn an_unreadable_session_row_is_skipped_and_the_readable_ones_still_load() {
         1,
         "a bad row was honored or a good one was lost"
     );
-    assert_eq!(live[0].0.encode(), good.encode());
+    assert_eq!(live[0].0, good);
 }
 
 #[test]
@@ -672,5 +794,5 @@ fn a_second_store_on_the_same_file_sees_what_the_first_one_wrote() {
     assert_eq!(reader.schema_version().unwrap(), SCHEMA_VERSION);
     let live = reader.live_sessions(SystemTime::now()).unwrap();
     assert_eq!(live.len(), 1);
-    assert_eq!(live[0].0.encode(), id.encode());
+    assert_eq!(live[0].0, id);
 }

@@ -317,7 +317,7 @@ fn load_manifest(toml: &str) -> Result<Manifest, ManifestError> {
     let env = FakeEnv::new();
     let path = format!("{INSTALL}/apps/probe/app.toml");
     env.write(&path, toml);
-    Manifest::load(Path::new(&path), &env)
+    apps::load_manifest(Path::new(&path), &env)
 }
 
 fn discovered(env: &FakeEnv, name: &str) -> Installed {

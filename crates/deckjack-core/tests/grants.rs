@@ -149,6 +149,7 @@ fn raw_grant(namespaces: Vec<Pattern>, nodes: NodeScope) -> Grant {
         id: GrantId::from_text("g1"),
         label: "hand-built".to_string(),
         session: Some("s1".to_string()),
+        owner: None,
         project: None,
         namespaces,
         nodes,
@@ -248,7 +249,7 @@ fn a_grant_of_the_whole_bus_is_refused_and_not_stored() {
     let (grants, store, _clock) = session_grants(Policy::default());
 
     let err = grants
-        .issue(spec("too much", &["*"]))
+        .issue(None, spec("too much", &["*"]))
         .expect_err("a bare * leaves nothing outside the grant");
     assert!(matches!(err, IssueError::Unrestricted { .. }), "{err}");
 
@@ -274,7 +275,7 @@ fn an_all_wildcard_pattern_is_the_whole_bus_however_it_is_spelled() {
 
     let (grants, _store, _clock) = session_grants(Policy::default());
     assert!(matches!(
-        grants.issue(spec("sneaky", &["*.*"])),
+        grants.issue(None, spec("sneaky", &["*.*"])),
         Err(IssueError::Unrestricted { .. })
     ));
 
@@ -285,7 +286,7 @@ fn an_all_wildcard_pattern_is_the_whole_bus_however_it_is_spelled() {
     };
     let (grants, _store, _clock) = session_grants(policy);
     let grant = grants
-        .issue(spec("operator tooling", &["*.*"]))
+        .issue(None, spec("operator tooling", &["*.*"]))
         .expect("an explicit opt-in may hold the bus");
     assert!(
         grant.is_unrestricted(),
@@ -301,7 +302,7 @@ fn an_all_wildcard_pattern_is_the_whole_bus_however_it_is_spelled() {
 fn an_empty_grant_permits_nothing() {
     let (grants, _store, _clock) = session_grants(Policy::default());
     assert!(matches!(
-        grants.issue(spec("blank", &[])),
+        grants.issue(None, spec("blank", &[])),
         Err(IssueError::NoNamespaces { .. })
     ));
 
@@ -370,17 +371,23 @@ fn a_grant_with_no_node_scope_is_refused_rather_than_defaulted_to_every_node() {
     let (grants, _store, _clock) = session_grants(Policy::default());
 
     assert!(matches!(
-        grants.issue(GrantSpec {
-            nodes: None,
-            ..spec("nodeless", &["git.*"])
-        }),
+        grants.issue(
+            None,
+            GrantSpec {
+                nodes: None,
+                ..spec("nodeless", &["git.*"])
+            }
+        ),
         Err(IssueError::NoNodes { .. })
     ));
     assert!(matches!(
-        grants.issue(GrantSpec {
-            nodes: Some(NodeScope::Only(vec![])),
-            ..spec("nodeless", &["git.*"])
-        }),
+        grants.issue(
+            None,
+            GrantSpec {
+                nodes: Some(NodeScope::Only(vec![])),
+                ..spec("nodeless", &["git.*"])
+            }
+        ),
         Err(IssueError::NoNodes { .. })
     ));
 }
@@ -408,11 +415,14 @@ fn an_unreadable_stored_pattern_fails_closed() {
 fn an_expired_grant_permits_nothing_not_even_a_read() {
     let (grants, _store, clock) = session_grants(Policy::default());
     let grant = grants
-        .issue(GrantSpec {
-            session: Some("s1".to_string()),
-            ttl_secs: Some(100),
-            ..spec("short-lived", &["git.*"])
-        })
+        .issue(
+            None,
+            GrantSpec {
+                session: Some("s1".to_string()),
+                ttl_secs: Some(100),
+                ..spec("short-lived", &["git.*"])
+            },
+        )
         .expect("issued");
 
     let read = Cmd::new("git.status", Risk::ReadOnly);
@@ -439,11 +449,14 @@ fn an_expired_or_revoked_grant_refuses_a_destructive_command_instead_of_queueing
     // questions in front of the operator.
     let (grants, _store, clock) = session_grants(Policy::default());
     let grant = grants
-        .issue(GrantSpec {
-            session: Some("s1".to_string()),
-            ttl_secs: Some(100),
-            ..spec("short-lived", &["files.*"])
-        })
+        .issue(
+            None,
+            GrantSpec {
+                session: Some("s1".to_string()),
+                ttl_secs: Some(100),
+                ..spec("short-lived", &["files.*"])
+            },
+        )
         .expect("issued");
     let destructive = Cmd::new("files.delete", Risk::Destructive).touching(Scale::Count(412));
 
@@ -455,10 +468,13 @@ fn an_expired_or_revoked_grant_refuses_a_destructive_command_instead_of_queueing
 
     let (grants, _store, clock) = session_grants(Policy::default());
     let grant = grants
-        .issue(GrantSpec {
-            session: Some("s1".to_string()),
-            ..spec("revoked", &["files.*"])
-        })
+        .issue(
+            None,
+            GrantSpec {
+                session: Some("s1".to_string()),
+                ..spec("revoked", &["files.*"])
+            },
+        )
         .expect("issued");
     assert!(grants.revoke(&grant.id).expect("revocable"));
     let grant = grants
@@ -475,16 +491,22 @@ fn an_expired_or_revoked_grant_refuses_a_destructive_command_instead_of_queueing
 fn the_kill_switch_refuses_every_command_under_every_grant() {
     let (grants, _store, _clock) = session_grants(Policy::default());
     grants
-        .issue(GrantSpec {
-            session: Some("s1".to_string()),
-            ..spec("one", &["git.*"])
-        })
+        .issue(
+            None,
+            GrantSpec {
+                session: Some("s1".to_string()),
+                ..spec("one", &["git.*"])
+            },
+        )
         .expect("issued");
     grants
-        .issue(GrantSpec {
-            session: Some("s2".to_string()),
-            ..spec("two", &["files.*"])
-        })
+        .issue(
+            None,
+            GrantSpec {
+                session: Some("s2".to_string()),
+                ..spec("two", &["files.*"])
+            },
+        )
         .expect("issued");
 
     assert_eq!(grants.revoke_all().expect("revocable"), 2);
@@ -502,10 +524,13 @@ fn the_kill_switch_refuses_every_command_under_every_grant() {
 fn one_sessions_grant_never_authorizes_another_session() {
     let (grants, _store, _clock) = session_grants(Policy::default());
     grants
-        .issue(GrantSpec {
-            session: Some("s1".to_string()),
-            ..spec("session one", &["git.*"])
-        })
+        .issue(
+            None,
+            GrantSpec {
+                session: Some("s1".to_string()),
+                ..spec("session one", &["git.*"])
+            },
+        )
         .expect("issued");
 
     let cmd = Cmd::new("git.status", Risk::ReadOnly);
@@ -562,10 +587,13 @@ fn a_session_with_no_grant_at_all_is_refused_by_name() {
 fn a_grant_cannot_outlive_the_policy_maximum_or_stand_forever_against_policy() {
     let (grants, _store, _clock) = session_grants(Policy::default());
     assert!(matches!(
-        grants.issue(GrantSpec {
-            ttl_secs: Some(Policy::default().max_grant_ttl_secs + 1),
-            ..spec("too long", &["git.*"])
-        }),
+        grants.issue(
+            None,
+            GrantSpec {
+                ttl_secs: Some(Policy::default().max_grant_ttl_secs + 1),
+                ..spec("too long", &["git.*"])
+            }
+        ),
         Err(IssueError::TtlTooLong { .. })
     ));
 
@@ -575,16 +603,18 @@ fn a_grant_cannot_outlive_the_policy_maximum_or_stand_forever_against_policy() {
     };
     let (grants, _store, _clock) = session_grants(policy);
     assert!(matches!(
-        grants.issue(GrantSpec {
-            ttl_secs: None,
-            ..spec("forever", &["git.*"])
-        }),
+        grants.issue(
+            None,
+            GrantSpec {
+                ttl_secs: None,
+                ..spec("forever", &["git.*"])
+            }
+        ),
         Err(IssueError::StandingNotAllowed { .. })
     ));
 }
 
 #[test]
-#[ignore = "standing grants are not attributed to an issuer: see bugs_found, the fix needs an owner column in store.rs, which this agent does not own"]
 fn a_standing_grant_for_one_agent_does_not_authorize_another_sessionless_issuer() {
     let policy = Policy {
         allow_unrestricted_grants: true,
@@ -595,18 +625,24 @@ fn a_standing_grant_for_one_agent_does_not_authorize_another_sessionless_issuer(
     // The operator's own tooling holds the bus, as the module's comments
     // anticipate. The always-on assistant holds one narrow namespace.
     grants
-        .issue(GrantSpec {
-            session: None,
-            ttl_secs: None,
-            ..spec("operator tooling", &["*"])
-        })
+        .issue(
+            Some("operator tooling"),
+            GrantSpec {
+                session: None,
+                ttl_secs: None,
+                ..spec("operator tooling", &["*"])
+            },
+        )
         .expect("issued");
     grants
-        .issue(GrantSpec {
-            session: None,
-            ttl_secs: None,
-            ..spec("Assistant", &["git.status"])
-        })
+        .issue(
+            Some("Assistant"),
+            GrantSpec {
+                session: None,
+                ttl_secs: None,
+                ..spec("Assistant", &["git.status"])
+            },
+        )
         .expect("issued");
 
     let assistant = Issuer::Session {
@@ -617,6 +653,101 @@ fn a_standing_grant_for_one_agent_does_not_authorize_another_sessionless_issuer(
     match grants.decide_for(&assistant, &cmd).expect("decidable") {
         Decision::Refuse(_) => {}
         other => panic!("the Assistant inherited another standing grant: {other:?}"),
+    }
+}
+
+/// A standing grant held by nobody authorizes nobody.
+///
+/// A row written before migration 6 has `session` NULL and `owner` NULL. It
+/// is the case that looks permissive, because "held by nobody in particular"
+/// reads like "held by anyone", and reading it that way re-creates the defect
+/// the owner column was added for. Written straight through `GrantStore`
+/// because `Grants::issue` refuses `*` under the default policy — which is
+/// exactly how such a row gets into a real database: an older schema, not an
+/// issuance.
+#[test]
+fn a_standing_grant_with_no_owner_authorizes_nobody() {
+    use deckjack_core::grants::GrantStore as _;
+
+    let orphan = Grant {
+        id: GrantId::from_text("pre-migration-6"),
+        label: "an old standing grant".to_string(),
+        session: None,
+        owner: None,
+        project: None,
+        namespaces: vec![Pattern::parse("*").expect("a pattern")],
+        nodes: NodeScope::All,
+        issued_at: 1_000_000,
+        expires_at: None,
+        revoked_at: None,
+    };
+
+    let store = Arc::new(MemoryGrants::new());
+    store.put_grant(&orphan).expect("written");
+    let grants = Grants::new(Arc::clone(&store), Clock::new(), Policy::default());
+
+    let cmd = Cmd::new("mail.send", Risk::Outbound);
+    for issuer in [
+        Issuer::Session {
+            label: "Assistant".to_string(),
+            session: None,
+        },
+        Issuer::Operator,
+        Issuer::Cli,
+    ] {
+        match grants.decide_for(&issuer, &cmd).expect("decidable") {
+            Decision::Refuse(_) => {}
+            other => panic!(
+                "{} inherited a standing grant nobody holds: {other:?}",
+                issuer.label()
+            ),
+        }
+    }
+}
+
+/// Neither the operator nor the CLI holds a standing grant, even one labelled
+/// with their own name.
+///
+/// `Issuer::owner` answers `None` for both, and `decide_for` gives them an
+/// empty slice rather than looking a grant up by their display name. The
+/// grants below are owned by the exact strings `Issuer::label` returns, so a
+/// version of `owner()` that answered `Some(self.label())` would find them —
+/// which is the regression this pins, and which a NULL-owner fixture cannot
+/// see at all. Neither issuer routes through this module: the operator's own
+/// commands are gated by `operator_only`, not by a grant, so a grant found
+/// here is authority nobody issued.
+#[test]
+fn neither_the_operator_nor_the_cli_holds_a_standing_grant() {
+    use deckjack_core::grants::GrantStore as _;
+
+    let store = Arc::new(MemoryGrants::new());
+    for (id, owner) in [("g-op", "the operator"), ("g-cli", "the CLI")] {
+        store
+            .put_grant(&Grant {
+                id: GrantId::from_text(id),
+                label: owner.to_string(),
+                session: None,
+                owner: Some(owner.to_string()),
+                project: None,
+                namespaces: vec![Pattern::parse("*").expect("a pattern")],
+                nodes: NodeScope::All,
+                issued_at: 1_000_000,
+                expires_at: None,
+                revoked_at: None,
+            })
+            .expect("written");
+    }
+    let grants = Grants::new(Arc::clone(&store), Clock::new(), Policy::default());
+
+    let cmd = Cmd::new("mail.send", Risk::Outbound);
+    for issuer in [Issuer::Operator, Issuer::Cli] {
+        match grants.decide_for(&issuer, &cmd).expect("decidable") {
+            Decision::Refuse(_) => {}
+            other => panic!(
+                "{} was handed a standing grant by its own display name: {other:?}",
+                issuer.label()
+            ),
+        }
     }
 }
 

@@ -1,3 +1,5 @@
+import { ref } from "vue";
+
 import type { Size } from "../shell/geometry.ts";
 
 /**
@@ -144,4 +146,61 @@ export function unknownApp(id: string): AppContract {
     compact: true,
     wide: true,
   };
+}
+
+/**
+ * Apps the core has discovered on this node, by name.
+ *
+ * The built-in table above is what the shell knows before any app binary is
+ * installed; this is what is actually there. `system.apps` reports it, and a
+ * window for one of these renders the app's own UI in a frame rather than a
+ * built-in panel.
+ *
+ * A module-level ref rather than part of the windows store: the dock, the
+ * palette and the window surface all want the same answer, and none of them
+ * owns it.
+ */
+export interface InstalledApp {
+  name: string;
+  title: string;
+  version: string;
+  lifecycle: "service" | "on-demand";
+  minWidth?: number;
+  status: "live" | "reconnecting" | "unavailable";
+}
+
+export const installed = ref<InstalledApp[]>([]);
+
+export function isInstalled(name: string): boolean {
+  return installed.value.some((app) => app.name === name);
+}
+
+/**
+ * Ask the core what is installed.
+ *
+ * Failure is not an error worth surfacing: `system.apps` is absent on a core
+ * with no app host, and the honest result then is "no installed apps" rather
+ * than a banner about a command the operator cannot do anything about.
+ */
+export async function loadInstalled(
+  call: (command: string, params?: Record<string, unknown>) => Promise<unknown>,
+): Promise<void> {
+  try {
+    const result = (await call("system.apps")) as { apps?: unknown } | undefined;
+    const list = Array.isArray(result?.apps) ? result.apps : [];
+    installed.value = list
+      .filter((a): a is Record<string, unknown> => typeof a === "object" && a !== null)
+      .map<InstalledApp>((a) => ({
+        name: String(a.name ?? ""),
+        title: String(a.title ?? a.name ?? ""),
+        version: String(a.version ?? ""),
+        lifecycle: a.lifecycle === "service" ? "service" : "on-demand",
+        minWidth: typeof a.min_width === "number" ? a.min_width : undefined,
+        status:
+          a.status === "live" || a.status === "reconnecting" ? a.status : "unavailable",
+      }))
+      .filter((a) => a.name !== "");
+  } catch {
+    installed.value = [];
+  }
 }

@@ -1,0 +1,24 @@
+[package]
+name = "deckjack-notes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Deckjack app: notes as Markdown files in the working directory"
+
+[[bin]]
+name = "deckjack-notes"
+path = "src/main.rs"
+
+[dependencies]
+deckjack-app.workspace = true
+anyhow.workspace = true
+rust-embed.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

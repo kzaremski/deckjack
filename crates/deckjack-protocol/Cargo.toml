@@ -1,0 +1,16 @@
+[package]
+name = "deckjack-protocol"
+version.workspace = true
+edition.workspace = true
+# Permissive on purpose, unlike the rest of the workspace. See the crate doc.
+license = "MIT OR Apache-2.0"
+authors.workspace = true
+repository.workspace = true
+description = "The Deckjack app protocol: manifest, frames and version numbers"
+
+[dependencies]
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true

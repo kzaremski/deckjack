@@ -57,6 +57,51 @@ max_sessions = 4
 # Pause after a wrong code. Long enough to make guessing pointless, short
 # enough not to notice when you mistype once.
 failure_delay_ms = 750
+
+[passkey]
+# The name the browser is asked to bind a passkey to, and the origin it must
+# be loaded from. Both empty means loopback: `localhost` over the listen port,
+# which WebAuthn accepts as a secure context with no certificate, so a first
+# run works out of the box.
+#
+# Set these BEFORE enrolling the first passkey. A credential is bound to the
+# rp_id it was created under and cannot be moved: changing rp_id afterwards
+# does not break sign-in temporarily, it orphans every passkey already
+# enrolled, permanently.
+#
+# rp_id is a registrable domain — no scheme, no port, and NOT an IP address,
+# which WebAuthn does not accept. origin is the full URL the browser loads,
+# and must be https:// for anything but localhost. For a tailnet name:
+#
+#   rp_id = "pocket.tail1234.ts.net"
+#   origin = "https://pocket.tail1234.ts.net"
+#
+# Left empty on a node that listens on a non-loopback address, passkeys are
+# switched off with a warning rather than enrolled against a name the browser
+# will later reject.
+rp_id = ""
+origin = ""
+
+[agents]
+# Agent sessions this node opens a door for. Each listed id gets one socket
+# under ~/.deckjack/run/agents/, in a directory only this user can read, and
+# an agent attaches by connecting to it:
+#
+#   sessions = ["assistant"]
+#
+# Then point an MCP client at it:
+#
+#   command = "deckjack", args = ["agent", "assistant", "--dir", "/path/to/workdir"]
+#
+# Listing a session here does NOT grant it anything. The socket is the door;
+# the grant issued to the same id is the authority, and a session with no
+# grant attaches successfully and is offered no tools at all. Issue grants
+# with system.grant.issue, from the Inbox, and revoke them there.
+#
+# Whoever can open the socket IS that session, so the two are separate knobs
+# on purpose: you can revoke an agent's authority without taking its door
+# away, and see every door in this one list.
+sessions = []
 "##;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +110,8 @@ failure_delay_ms = 750
 pub struct Config {
     pub server: Server,
     pub auth: Auth,
+    pub passkey: Passkey,
+    pub agents: Agents,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +129,58 @@ pub struct Auth {
     pub session_max_hours: u32,
     pub max_sessions: u32,
     pub failure_delay_ms: u64,
+}
+
+/// Which agent sessions this node opens a door for.
+///
+/// Listing a session here creates its socket; it does **not** grant it
+/// anything. The two are separate on purpose. Deriving the sockets from the
+/// grant store instead would mean issuing a grant silently opened a door and
+/// revoking one silently removed it, so the operator could never see the
+/// node's agent surface in one place — and a door that appears as a
+/// side effect of a permission change is exactly the kind of thing nobody
+/// audits.
+///
+/// An empty list means no agent can attach, which is the default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct Agents {
+    /// Agent session ids. Each gets one socket under the hidden directory,
+    /// and whatever grant the operator issued to that same id.
+    pub sessions: Vec<String>,
+}
+
+/// What a passkey ceremony is bound to.
+///
+/// Both empty means "derive loopback settings from `server.listen`", which is
+/// the only thing that can be derived correctly: WebAuthn needs a secure
+/// context and a registrable domain, and neither can be guessed from an IP
+/// address. See [`DEFAULT_TOML`] for why these must be set before the first
+/// enrollment rather than after.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct Passkey {
+    /// Registrable domain: no scheme, no port, not an IP.
+    pub rp_id: String,
+    /// The full URL the browser loads.
+    pub origin: String,
+}
+
+impl Passkey {
+    /// Whether the operator stated both halves.
+    ///
+    /// Both or neither: an `rp_id` with no `origin` (or the reverse) is a
+    /// configuration that produces ceremonies the browser rejects, and
+    /// guessing the missing half is how you bind credentials to a name
+    /// nobody chose.
+    pub fn is_set(&self) -> bool {
+        !self.rp_id.is_empty() && !self.origin.is_empty()
+    }
+
+    /// Set, half-set or unset — the three cases a caller has to tell apart.
+    pub fn half_set(&self) -> bool {
+        self.rp_id.is_empty() != self.origin.is_empty()
+    }
 }
 
 impl Default for Server {
@@ -214,6 +313,50 @@ impl Config {
                 "auth.max_sessions must be at least {MIN_SESSIONS}"
             )));
         }
+        for session in &self.agents.sessions {
+            if let Err(e) = crate::mcpserve::check_session_name(session) {
+                return Err(bad(format!("agents.sessions has an unusable id: {e}")));
+            }
+        }
+        {
+            // A duplicate would bind the same socket twice: the second mount
+            // would fail at startup with "address in use" long after the
+            // config was read, which is a confusing way to learn about a
+            // typo in a list.
+            let mut seen = std::collections::BTreeSet::new();
+            for session in &self.agents.sessions {
+                if !seen.insert(session) {
+                    return Err(bad(format!(
+                        "agents.sessions lists {session:?} more than once"
+                    )));
+                }
+            }
+        }
+        if self.passkey.half_set() {
+            return Err(bad(
+                "passkey.rp_id and passkey.origin must both be set or both be empty: one \
+                 without the other produces ceremonies the browser rejects, and \
+                 guessing the other half would bind every enrolled credential to \
+                 a name nobody chose"
+                    .to_string(),
+            ));
+        }
+        // An rp_id is a registrable domain. Caught here rather than at the
+        // first ceremony, because by then a credential may already be bound
+        // to it and a credential cannot be rebound.
+        if !self.passkey.rp_id.is_empty() {
+            let bad_rp = self.passkey.rp_id.contains("://")
+                || self.passkey.rp_id.contains(':')
+                || self.passkey.rp_id.contains('/')
+                || self.passkey.rp_id.parse::<IpAddr>().is_ok();
+            if bad_rp {
+                return Err(bad(format!(
+                    "passkey.rp_id must be a bare domain with no scheme, no port and no path, \
+                     and cannot be an IP address: {:?} is not one",
+                    self.passkey.rp_id
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -281,6 +424,60 @@ mod tests {
     #[test]
     fn config_lives_in_the_hidden_directory() {
         assert!(Path::new(CONFIG_PATH).starts_with(".deckjack"));
+    }
+
+    #[test]
+    fn a_half_written_passkey_section_is_refused() {
+        // Not defaulted, not guessed. An rp_id with no origin produces
+        // ceremonies the browser rejects; filling in the missing half would
+        // bind every credential enrolled afterwards to a name the operator
+        // never chose, and a credential cannot be rebound.
+        for text in [
+            "[passkey]\nrp_id = \"pocket.ts.net\"\n",
+            "[passkey]\norigin = \"https://pocket.ts.net\"\n",
+        ] {
+            let cfg: Config = toml::from_str(text).unwrap();
+            let err = cfg.validate(Path::new("test.toml")).unwrap_err();
+            assert!(err.to_string().contains("both"), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_rp_id_that_is_not_a_registrable_domain_is_refused() {
+        // Caught at startup rather than at the first ceremony, because by
+        // then a credential may already be bound to it.
+        for bad_id in [
+            "https://pocket.ts.net",
+            "pocket.ts.net:7878",
+            "pocket.ts.net/deckjack",
+            "192.168.1.10",
+            "::1",
+        ] {
+            let text =
+                format!("[passkey]\nrp_id = \"{bad_id}\"\norigin = \"https://pocket.ts.net\"\n");
+            let cfg: Config = toml::from_str(&text).unwrap();
+            let err = match cfg.validate(Path::new("test.toml")) {
+                Err(e) => e.to_string(),
+                Ok(()) => panic!("{bad_id} should be refused as an rp_id"),
+            };
+            assert!(err.contains("rp_id"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_whole_passkey_section_is_accepted_and_an_empty_one_is_the_default() {
+        let cfg: Config = toml::from_str(
+            "[passkey]\nrp_id = \"pocket.ts.net\"\norigin = \"https://pocket.ts.net\"\n",
+        )
+        .unwrap();
+        assert!(cfg.validate(Path::new("test.toml")).is_ok());
+        assert!(cfg.passkey.is_set());
+
+        // The default is both-empty, which means "derive loopback settings",
+        // and it must stay valid or a fresh install would not start.
+        let fresh = Config::default();
+        assert!(!fresh.passkey.is_set() && !fresh.passkey.half_set());
+        assert!(fresh.validate(Path::new("test.toml")).is_ok());
     }
 
     #[test]

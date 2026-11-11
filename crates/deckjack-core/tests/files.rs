@@ -430,16 +430,38 @@ fn a_node_name_that_reads_as_a_flag_or_a_relative_path_is_refused() {
 }
 
 #[test]
-#[ignore = "node::id encodes 16 random bytes as URL-safe base64, whose first character is \
-            '-' whenever the first byte is 0xf8..=0xfb — 4 of 256, so about 1 fresh install \
-            in 64. NodeName::parse refuses a leading '-', so register_commands fails and the \
-            server cannot start, with no fix but deleting the id file. The repair belongs in \
-            node.rs, which this test's owner does not own."]
 fn every_node_id_this_build_can_generate_is_usable_in_a_file_address() {
-    // 0xf8 >> 2 == 62, and 62 is '-' in the URL-safe alphabet.
-    let id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xf8u8; 16]);
-    assert!(id.starts_with('-'), "{id} should start with a dash");
-    NodeName::parse(&id).expect("an id node::id can generate must be a usable address");
+    // `node::id` writes hex, and this is the reason it does. URL-safe base64
+    // begins with '-' whenever the first byte is 0xf8..=0xfb — 4 of 256, so
+    // about 1 fresh install in 64 — and `NodeName::parse` refuses a leading
+    // dash because it reads as a flag wherever the name is interpolated. Such
+    // an id made its own file namespace unreachable and the server unable to
+    // start, recoverable only by deleting the id file.
+    //
+    // The old encoding, kept here as the thing that must not come back:
+    let base64_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xf8u8; 16]);
+    assert!(
+        base64_id.starts_with('-'),
+        "{base64_id} should start with a dash"
+    );
+    assert!(
+        NodeName::parse(&base64_id).is_err(),
+        "a leading dash must stay refused: that is why the encoding changed"
+    );
+
+    // What this build actually generates, over a fresh install directory each
+    // time so every byte pattern gets a turn.
+    for _ in 0..64 {
+        let dir = tempfile::tempdir().expect("an install directory");
+        let id = deckjack_core::node::id(dir.path()).expect("an id");
+        assert_eq!(id.len(), 32, "{id} is not 16 bytes of hex");
+        assert!(
+            id.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{id} is not hex"
+        );
+        NodeName::parse(&id).expect("an id node::id can generate must be a usable address");
+    }
 }
 
 #[test]

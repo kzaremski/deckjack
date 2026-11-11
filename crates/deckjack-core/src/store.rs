@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-use crate::auth::session::{Session, SessionId};
+use crate::auth::session::{Session, SessionHash};
 
 /// Where the database lives, relative to the working directory.
 pub const DB_PATH: &str = ".deckjack/state.db";
@@ -30,7 +30,7 @@ pub const DB_PATH: &str = ".deckjack/state.db";
 /// Bumped whenever [`MIGRATIONS`] grows. Checked at startup against what the
 /// file says, so a database written by a newer Deckjack is refused rather
 /// than quietly half-understood.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Applied in order; index + 1 is the version each one produces. Never edit a
 /// migration that has shipped — add another.
@@ -321,6 +321,106 @@ CREATE TABLE app_grants (
     CREATE INDEX command_log_session ON command_log (issuer_session, at)
         WHERE issuer_session IS NOT NULL;
     "#,
+    // 4 — the sessions table stops holding the cookie.
+    //
+    // Until now `sessions.id` was the session id itself, which is the value a
+    // browser presents to be signed in. That made a copy of this directory —
+    // a backup, a sync target, another local account that can read the file —
+    // a set of live credentials rather than a set of state. The rest of the
+    // file had the rule right: `command_log.issuer_session` has always stored
+    // a digest, "never the cookie, because this file is readable from the
+    // terminal".
+    //
+    // The old rows are dropped rather than carried across. Hashing them in
+    // place would keep everyone signed in, but the plaintext would stay in
+    // the freed pages, and the point of this migration is that those bytes
+    // leave the file. `migrate` VACUUMs after applying this, which rewrites
+    // the database and is what actually removes them. The cost is that
+    // existing sessions sign in once more.
+    r#"
+    DROP TABLE sessions;
+    CREATE TABLE sessions (
+        -- SHA-256 of the session id, 64 lowercase hex characters.
+        hash    TEXT    PRIMARY KEY,
+        ip      TEXT    NOT NULL,
+        created INTEGER NOT NULL,
+        expires INTEGER NOT NULL
+    ) STRICT;
+    CREATE INDEX sessions_expires ON sessions (expires);
+
+    -- Addresses that have completed a sign-in before.
+    --
+    -- The smallest thing that makes lockdown's "a sign-in from a device that
+    -- is not known" trigger mean something: without it every sign-in is from
+    -- an unknown device, including the first one on a fresh node, and the
+    -- trigger would alert on the operator typing their own code. It is not a
+    -- device registry — an address is not a device — and it is not evidence;
+    -- it is a "have I seen this before" bit.
+    --
+    -- Note the asymmetry with lockdown.json, which deliberately keeps no
+    -- addresses at all: that file is written during an incident and read by
+    -- whoever then holds the machine. This one is ordinary operating state in
+    -- a file that is already owner-only.
+    CREATE TABLE known_addresses (
+        ip        TEXT    PRIMARY KEY,
+        first_at  INTEGER NOT NULL,
+        last_at   INTEGER NOT NULL
+    ) STRICT;
+    "#,
+    // 5 — the audit log becomes the audit log.
+    //
+    // `events` has shipped since migration 2 and nothing has ever written to
+    // it: the bus's journal went to `command_log` instead, so the richer
+    // table — the one with the path, the source address and the append-only
+    // triggers — sat empty while the poorer one filled. Pointing the journal
+    // at `events` needs four facts `command_log` records and `events` cannot.
+    //
+    // `phase` is the one worth explaining. A single dispatch is logged twice
+    // in the ordinary case, once on admission and once on completion, and
+    // without a column saying which is which a timeline shows every command
+    // twice with no way to tell the rows apart. That is not a cosmetic
+    // problem: "did this run, or is it still running" is the first question
+    // anyone asks the log.
+    r#"
+    ALTER TABLE events ADD COLUMN dispatch TEXT;
+    ALTER TABLE events ADD COLUMN risk TEXT;
+    ALTER TABLE events ADD COLUMN issuer_session TEXT;
+    ALTER TABLE events ADD COLUMN phase TEXT;
+    CREATE INDEX events_dispatch ON events (dispatch);
+    "#,
+    // 6 — a standing grant records who holds it.
+    //
+    // The fix the once-ignored test at tests/grants.rs names. A standing
+    // grant has `session = NULL`, and filtering on nothing but that meant
+    // every sessionless issuer inherited the union of all of them: the
+    // always-on assistant's grant would authorize any other agent that
+    // happened to arrive without a session. `owner` is what a standing grant
+    // is held *by*, so a grant can be looked up for one issuer instead of
+    // for the absence of one. Both lookups use it now — `GrantRows::held_by`
+    // in SQL, `Grants::active_standing` in Rust, against `Grant::owner`.
+    //
+    // Nullable with no default: a grant written before this migration has an
+    // unknown owner, and inventing one would be claiming the operator
+    // approved something they did not. Both lookups treat it as "matches
+    // nobody", which is the safe reading.
+    r#"
+    ALTER TABLE grants ADD COLUMN owner TEXT;
+    CREATE INDEX grants_owner ON grants (owner) WHERE owner IS NOT NULL;
+    "#,
+    // 7 — a session records how it was proved.
+    //
+    // `Session` holds ip, created and expires, and nothing recorded *how*
+    // someone signed in. Step-up needs that: the design gives a remote
+    // session a terminal only after a passkey, and tether mode none at all,
+    // which is a rule about the kind of sign-in and not about the address it
+    // came from.
+    //
+    // Defaulted to 'tether' rather than 'passkey': every session that exists
+    // when this migration runs was created by the one-time code, and reading
+    // an old row as the stronger kind would hand it access it never earned.
+    r#"
+    ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'tether';
+    "#,
 ];
 
 #[derive(Debug, Error)]
@@ -348,6 +448,13 @@ pub enum StoreError {
     )]
     WalNotFolded { path: PathBuf },
 
+    #[error("{path} could not be replaced with its rewritten copy: {source}")]
+    Rewrite {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
 }
@@ -355,6 +462,9 @@ pub enum StoreError {
 pub struct Store {
     conn: Connection,
     path: PathBuf,
+    /// Set by [`Store::migrate`] when a migration left plaintext behind in
+    /// pages it freed. [`Store::open`] acts on it; see [`scrub`].
+    scrub_pending: bool,
 }
 
 impl Store {
@@ -375,7 +485,11 @@ impl Store {
             path: path.clone(),
             source,
         })?;
-        Store::from_connection(conn, path)
+        let store = Store::from_connection(conn, path)?;
+        if store.scrub_pending {
+            return scrub(store);
+        }
+        Ok(store)
     }
 
     /// An in-memory database, for tests.
@@ -403,12 +517,18 @@ impl Store {
             source,
         })?;
 
-        let mut store = Store { conn, path };
-        store.migrate()?;
+        let mut store = Store {
+            conn,
+            path,
+            scrub_pending: false,
+        };
+        store.scrub_pending = store.migrate()?;
         Ok(store)
     }
 
-    fn migrate(&mut self) -> Result<(), StoreError> {
+    /// Returns whether the file now needs scrubbing: true when a migration
+    /// dropped data that must not merely be unreachable by SQL.
+    fn migrate(&mut self) -> Result<bool, StoreError> {
         // Not `unwrap_or(0)`: a new or empty file genuinely reports 0, so
         // defaulting buys nothing, and it turned "this file is not a database"
         // and "the file is locked" into "version 0" — which then ran migration
@@ -430,7 +550,7 @@ impl Store {
             });
         }
         if found == SCHEMA_VERSION {
-            return Ok(());
+            return Ok(false);
         }
 
         let tx = self.conn.transaction()?;
@@ -445,7 +565,19 @@ impl Store {
         tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         tx.commit()?;
         tracing::info!(from = found, to = SCHEMA_VERSION, "state schema migrated");
-        Ok(())
+
+        // Migration 4 dropped a table whose primary key was a live session
+        // cookie, so the file needs more than a schema change. Only for a
+        // file that already existed: `found == 0` is a database created by
+        // this call, which never held one. `:memory:` has no file to rewrite.
+        // Migration 4 dropped a table whose primary key was a live session
+        // cookie, so a file that existed before it needs rewriting. The range
+        // is pinned to that migration and must not widen as migrations are
+        // added: a later schema change has no plaintext to scrub, and
+        // rewriting the whole database on every upgrade would be a surprise
+        // in proportion to how large it has become.
+        let on_disk = self.path != Path::new(":memory:");
+        Ok(on_disk && (1..4).contains(&found))
     }
 
     pub fn path(&self) -> &Path {
@@ -460,11 +592,17 @@ impl Store {
 
     // ---- sessions -------------------------------------------------------
 
-    pub fn insert_session(&self, id: &SessionId, s: &Session) -> Result<(), StoreError> {
+    /// Persist a session under the **hash** of its id.
+    ///
+    /// Taking a [`SessionHash`] is the enforcement, not a convention: this
+    /// module does not import [`crate::auth::SessionId`] at all, so there is
+    /// no way to write a cookie into this file by reaching for the wrong
+    /// variable at a call site.
+    pub fn insert_session(&self, hash: &SessionHash, s: &Session) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO sessions (id, ip, created, expires) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR REPLACE INTO sessions (hash, ip, created, expires) VALUES (?1, ?2, ?3, ?4)",
             params![
-                id.encode(),
+                hash.hex(),
                 s.ip.to_string(),
                 to_unix(s.created),
                 to_unix(s.expires),
@@ -473,9 +611,9 @@ impl Store {
         Ok(())
     }
 
-    pub fn delete_session(&self, id: &SessionId) -> Result<(), StoreError> {
+    pub fn delete_session(&self, hash: &SessionHash) -> Result<(), StoreError> {
         self.conn
-            .execute("DELETE FROM sessions WHERE id = ?1", params![id.encode()])?;
+            .execute("DELETE FROM sessions WHERE hash = ?1", params![hash.hex()])?;
         Ok(())
     }
 
@@ -487,14 +625,17 @@ impl Store {
     /// Expired rows are dropped on the way past rather than loaded and then
     /// pruned, so a long-dormant directory does not come back with thousands
     /// of dead sessions in memory.
-    pub fn live_sessions(&self, now: SystemTime) -> Result<Vec<(SessionId, Session)>, StoreError> {
+    pub fn live_sessions(
+        &self,
+        now: SystemTime,
+    ) -> Result<Vec<(SessionHash, Session)>, StoreError> {
         let cutoff = to_unix(now);
         self.conn
             .execute("DELETE FROM sessions WHERE expires <= ?1", params![cutoff])?;
 
         let mut stmt = self
             .conn
-            .prepare("SELECT id, ip, created, expires FROM sessions")?;
+            .prepare("SELECT hash, ip, created, expires FROM sessions")?;
         let rows = stmt.query_map([], |r| {
             let id: String = r.get(0)?;
             let ip: String = r.get(1)?;
@@ -508,20 +649,142 @@ impl Store {
             let (id, ip, created, expires) = row?;
             // A row we cannot parse is a row we cannot honor. Skipping it is
             // right: the worst case is someone signs in again.
-            let (Some(id), Ok(ip)) = (SessionId::decode(&id), ip.parse()) else {
+            let (Some(hash), Ok(ip)) = (SessionHash::from_hex(&id), ip.parse()) else {
                 tracing::warn!("skipping unreadable session row");
                 continue;
             };
+            // `last_seen` comes back as `created`: there is no column for it
+            // and deliberately so — see `Session::last_seen`. The cost is
+            // that the first eviction after a restart falls back to creation
+            // order.
             out.push((
-                id,
-                Session {
-                    ip,
-                    created: from_unix(created),
-                    expires: from_unix(expires),
-                },
+                hash,
+                Session::new(ip, from_unix(created), from_unix(expires)),
             ));
         }
         Ok(out)
+    }
+
+    // ---- known addresses ------------------------------------------------
+
+    /// Whether this address has signed in before. See the `known_addresses`
+    /// comment in migration 4 for what this is and is not.
+    pub fn is_known_address(&self, ip: std::net::IpAddr) -> Result<bool, StoreError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM known_addresses WHERE ip = ?1",
+            params![ip.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Record a successful sign-in from an address. `first_at` is kept on the
+    /// first write and never moved, because "when did this address first
+    /// appear" is the question worth answering afterwards.
+    pub fn remember_address(&self, ip: std::net::IpAddr, at: SystemTime) -> Result<(), StoreError> {
+        let at = to_unix(at);
+        self.conn.execute(
+            "INSERT INTO known_addresses (ip, first_at, last_at) VALUES (?1, ?2, ?2)\
+             ON CONFLICT(ip) DO UPDATE SET last_at = ?2",
+            params![ip.to_string(), at],
+        )?;
+        Ok(())
+    }
+
+    pub fn forget_addresses(&self) -> Result<usize, StoreError> {
+        Ok(self.conn.execute("DELETE FROM known_addresses", [])?)
+    }
+
+    /// Run one statement, or one small group, against the state database.
+    ///
+    /// # Why this exists
+    ///
+    /// Four subsystems — the audit log, grants, the Inbox, passkeys — each
+    /// need a handful of statements against tables that are theirs alone.
+    /// Putting all of it here would make this file a directory of other
+    /// modules' SQL, and the knowledge of what a column means would live one
+    /// file away from the type it means it for. So each subsystem keeps its
+    /// own statements in its own module and reaches the connection through
+    /// here.
+    ///
+    /// # What it does not do
+    ///
+    /// It does not hand out the connection. The closure borrows it for the
+    /// call and cannot keep it, so the three things this module actually
+    /// guarantees are untouched: there is exactly **one** connection to this
+    /// file (a second writer would be two processes racing on one WAL), the
+    /// file is **owner-only**, and a **session cookie never reaches disk** —
+    /// that last one because this module does not import
+    /// [`crate::auth::SessionId`] at all and no caller can make it.
+    ///
+    /// Hold it for one statement, never across an await: the guard is a
+    /// `std::sync::Mutex` in every caller and the bus requires `Send`
+    /// futures.
+    pub fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, StoreError> {
+        Ok(f(&self.conn)?)
+    }
+
+    // ---- app approvals ---------------------------------------------------
+    //
+    // Approvals, not the app inventory: the binaries live in the install
+    // directory, which never travels, and what the operator approved is a
+    // decision that does.
+
+    pub fn app_grant(&self, app: &str) -> Result<Option<crate::apps::Grant>, StoreError> {
+        let row: Option<(String, String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT fingerprint, needs, granted FROM app_grants WHERE app = ?1",
+                params![app],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((fingerprint, needs, granted)) = row else {
+            return Ok(None);
+        };
+        // A row we cannot parse is a row we cannot honor, and honoring it
+        // wrongly would be launching an app under permissions nobody read.
+        // Treated as no approval, so the operator is asked again.
+        let Ok(needs) = serde_json::from_str(&needs) else {
+            tracing::warn!(
+                app,
+                "an app approval could not be read; it will be asked for again"
+            );
+            return Ok(None);
+        };
+        Ok(Some(crate::apps::Grant {
+            app: app.to_string(),
+            fingerprint,
+            needs,
+            granted_at: granted.max(0) as u64,
+        }))
+    }
+
+    pub fn record_app_grant(&self, grant: &crate::apps::Grant) -> Result<(), StoreError> {
+        let needs = serde_json::to_string(&grant.needs).map_err(|e| StoreError::Open {
+            path: self.path.clone(),
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(e)),
+        })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO app_grants (app, fingerprint, needs, granted) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                grant.app,
+                grant.fingerprint,
+                needs,
+                i64::try_from(grant.granted_at).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn revoke_app_grant(&self, app: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM app_grants WHERE app = ?1", params![app])?;
+        Ok(())
     }
 
     /// Fold the WAL back into the main file so the directory can be copied.
@@ -547,14 +810,81 @@ impl Store {
     }
 }
 
+/// Rewrite the database file, keeping only what is still live.
+///
+/// `DROP TABLE` moves a table's pages to the freelist; the bytes stay in the
+/// file and a `grep` still finds them. For migration 4 those bytes are live
+/// session cookies, so "unreachable by SQL" is not the bar.
+///
+/// `VACUUM` alone does not clear it either, and that is worth stating because
+/// it looks like it should: in WAL mode the rewrite lands in `-wal`, and a
+/// checkpoint copies pages back over the main file without touching the ones
+/// that are now free. The main file keeps the old bytes, with its mtime
+/// unchanged to prove it was never written.
+///
+/// So the file is replaced rather than edited. `VACUUM INTO` writes a fresh
+/// database containing only live pages, closing the old connection folds and
+/// removes its `-wal`, and a rename puts the new file in place atomically.
+/// Nothing is deleted before the replacement exists.
+///
+/// A failure here is reported and swallowed: the schema is migrated and
+/// correct, and refusing to start over a scrub would be worse than starting
+/// with a warning that says exactly what is still readable.
+fn scrub(store: Store) -> Result<Store, StoreError> {
+    let Store { conn, path, .. } = store;
+    let tmp = path.with_extension("db-scrub");
+    let _ = std::fs::remove_file(&tmp);
+
+    let vacuumed = conn
+        .execute("VACUUM INTO ?1", params![tmp.to_string_lossy()])
+        .map(|_| ());
+    // Closing the last connection folds the WAL back and removes `-wal` and
+    // `-shm`, so there is no stale journal to apply to the replacement.
+    drop(conn);
+
+    let replaced = vacuumed.map_err(StoreError::from).and_then(|()| {
+        owner_only(&tmp);
+        std::fs::rename(&tmp, &path).map_err(|source| StoreError::Rewrite {
+            path: path.clone(),
+            source,
+        })
+    });
+
+    match replaced {
+        Ok(()) => tracing::info!(
+            path = %path.display(),
+            "state database rewritten: the dropped plaintext session rows are gone from the file"
+        ),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "could not rewrite the state database after migrating the sessions table; \
+                 the old plaintext session cookies are still readable in freed pages of \
+                 this file. They are revoked and unusable, but copy or delete the file \
+                 rather than treating it as scrubbed"
+            );
+        }
+    }
+
+    owner_only(&path);
+    let conn = Connection::open(&path).map_err(|source| StoreError::Open {
+        path: path.clone(),
+        source,
+    })?;
+    Store::from_connection(conn, path)
+}
+
 /// Make the state file readable only by the user running the server,
 /// creating it empty if it is not there yet (sqlite reads an empty file as an
 /// empty database, so creating it costs nothing).
 ///
-/// This file holds the session table, and a session id in it is the cookie a
-/// browser presents — so another local account that can read the file can
-/// present those cookies too. The terminal is the documented escape hatch for
-/// *this* user; nothing says the next user on the host gets one.
+/// The session table holds digests rather than cookies (see migration 4), so
+/// reading this file no longer hands over a way to sign in. It still holds
+/// everything else about the workspace — grants, the audit log, window state
+/// — and the terminal is the documented escape hatch for *this* user;
+/// nothing says the next user on the host gets one.
 ///
 /// A failure is warned about rather than returned: some hosts the design
 /// targets (a working directory on Android shared storage) have no unix modes
@@ -606,15 +936,15 @@ mod tests {
 
     fn session(ip: &str, lasts: u64) -> Session {
         let now = SystemTime::now();
-        Session {
-            ip: ip.parse::<IpAddr>().unwrap(),
-            created: now,
-            expires: now + Duration::from_secs(lasts),
-        }
+        Session::new(
+            ip.parse::<IpAddr>().unwrap(),
+            now,
+            now + Duration::from_secs(lasts),
+        )
     }
 
-    fn id(byte: u8) -> SessionId {
-        SessionId::from_bytes([byte; 32])
+    fn id(byte: u8) -> SessionHash {
+        crate::auth::SessionId::from_bytes([byte; 32]).hash()
     }
 
     #[test]
@@ -855,5 +1185,47 @@ impl crate::command::Journal for StoreJournal {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .append_command_log(&entry)
             .map_err(|e| crate::command::JournalError(e.to_string()))
+    }
+}
+
+/// App approvals, read and written in the state database.
+///
+/// Separate from [`StoreJournal`] because the failure modes are opposite: a
+/// lost audit row is swallowed, and a lost approval is an error the host must
+/// see. [`crate::apps::Host`] refuses to launch an app whose grant it cannot
+/// read rather than launching it unconfined.
+pub struct StoreGrants {
+    store: std::sync::Arc<std::sync::Mutex<Store>>,
+}
+
+impl StoreGrants {
+    pub fn new(store: std::sync::Arc<std::sync::Mutex<Store>>) -> StoreGrants {
+        StoreGrants { store }
+    }
+
+    fn store(&self) -> std::sync::MutexGuard<'_, Store> {
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl crate::apps::Grants for StoreGrants {
+    fn grant(&self, app: &str) -> Result<Option<crate::apps::Grant>, crate::apps::GrantError> {
+        self.store()
+            .app_grant(app)
+            .map_err(|e| crate::apps::GrantError::new(e.to_string()))
+    }
+
+    fn record(&self, grant: &crate::apps::Grant) -> Result<(), crate::apps::GrantError> {
+        self.store()
+            .record_app_grant(grant)
+            .map_err(|e| crate::apps::GrantError::new(e.to_string()))
+    }
+
+    fn revoke(&self, app: &str) -> Result<(), crate::apps::GrantError> {
+        self.store()
+            .revoke_app_grant(app)
+            .map_err(|e| crate::apps::GrantError::new(e.to_string()))
     }
 }

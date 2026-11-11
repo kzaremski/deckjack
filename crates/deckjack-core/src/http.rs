@@ -26,7 +26,7 @@ use axum::{Form, Router};
 use serde::Deserialize;
 
 use crate::auth::state::{AuthState, LoginOutcome, Now, Refusal};
-use crate::auth::{SessionId, html, session};
+use crate::auth::{RevokeReason, SessionHash, SessionId, html, session};
 use crate::store::Store;
 
 /// How long a wrong code is made to wait. Long enough to make guessing over a
@@ -34,7 +34,10 @@ use crate::store::Store;
 pub const FAILURE_DELAY: Duration = Duration::from_millis(750);
 
 pub struct Ctx {
-    state: Mutex<AuthState>,
+    /// Shared rather than owned, because lockdown's step 1 — revoke every
+    /// session — has to reach the same state machine without reaching
+    /// through the HTTP context to do it. See `wiring::AuthSessions`.
+    state: Arc<Mutex<AuthState>>,
     /// `rusqlite::Connection` is `Send` but not `Sync`, so the store is
     /// behind its own lock. Held only across a single statement, never an
     /// await, so it never blocks the runtime.
@@ -52,34 +55,66 @@ pub struct Ctx {
     /// NOT run when a socket closes. A reload drops every connection and
     /// must not kill the shell — that is the whole point of reattach.
     reapers: Vec<Reaper>,
+    /// Run after a sign-in succeeds, with the address it came from.
+    ///
+    /// A closure for the same reason the reapers are: this is how lockdown's
+    /// "a sign-in from a device that is not known" trigger is fed, and `http`
+    /// has no business knowing the kill switch exists.
+    sign_in_watchers: Vec<SignInWatch>,
+    /// Where the audit row for a revoked session goes. Built here from
+    /// `store`, not injected, and that is the point: see
+    /// [`Ctx::record_revocation`].
+    audit: Arc<crate::audit::StoreSink>,
+    /// This node's id, for the audit row's `target_node`. Required by
+    /// [`Ctx::new`] rather than registered afterwards, because an audit row
+    /// that the product does not write and the test harness does is worse
+    /// than no audit row at all.
+    node_id: String,
 }
 
 /// Cleans up after a session that has ended; returns how many things it
 /// closed, for the log.
-type Reaper = Box<dyn Fn(&SessionId) -> usize + Send + Sync>;
+type Reaper = Box<dyn Fn(&SessionHash) -> usize + Send + Sync>;
+
+type SignInWatch = Box<dyn Fn(IpAddr) + Send + Sync>;
 
 impl Ctx {
+    /// `node_id` is a required argument and not a `with_node_id` builder,
+    /// for the reason `wiring::BusParts` requires every field: a `mut self`
+    /// builder has no getter, so a forgotten call is neither a compile error
+    /// nor observable to any test, and this repo has already shipped a bus
+    /// with no grant storage that way.
     pub fn new(
-        state: AuthState,
+        state: Arc<Mutex<AuthState>>,
         store: Arc<Mutex<Store>>,
         failure_delay: Duration,
         trusted_proxies: Vec<IpAddr>,
+        node_id: String,
     ) -> Ctx {
         Ctx {
-            state: Mutex::new(state),
+            audit: crate::audit::StoreSink::new(Arc::clone(&store)),
+            state,
             store,
             failure_delay,
             trusted_proxies,
             reapers: Vec::new(),
+            sign_in_watchers: Vec::new(),
+            node_id,
         }
     }
 
     /// Register something to clean up after a session that has ended.
     pub fn on_session_end(
         mut self,
-        reap: impl Fn(&SessionId) -> usize + Send + Sync + 'static,
+        reap: impl Fn(&SessionHash) -> usize + Send + Sync + 'static,
     ) -> Ctx {
         self.reapers.push(Box::new(reap));
+        self
+    }
+
+    /// Register something to run when a sign-in succeeds.
+    pub fn on_sign_in(mut self, watch: impl Fn(IpAddr) + Send + Sync + 'static) -> Ctx {
+        self.sign_in_watchers.push(Box::new(watch));
         self
     }
 
@@ -92,10 +127,81 @@ impl Ctx {
             .checkpoint()
     }
 
-    fn session_ended(&self, id: &SessionId) {
-        let closed: usize = self.reapers.iter().map(|reap| reap(id)).sum();
+    fn session_ended(&self, hash: &SessionHash) {
+        let closed: usize = self.reapers.iter().map(|reap| reap(hash)).sum();
         if closed > 0 {
             tracing::info!(closed, "reaped what the session owned");
+        }
+    }
+
+    /// Act on what a transition reported, then log it.
+    ///
+    /// The only interesting case is a revocation nobody asked for: the
+    /// stalest session dropped for `max_sessions`, or every session belonging to an
+    /// address that has just been blocked. Signing out already deletes the
+    /// row and reaps the shells; these paths have to do the same, or a
+    /// revoked session comes back at the next restart with its pty still
+    /// running in the meantime.
+    pub(crate) fn apply(&self, events: Vec<crate::auth::Event>) {
+        for e in events {
+            if let crate::auth::Event::SessionRevoked { hash, ip, reason } = e {
+                self.forget(&hash);
+                self.session_ended(&hash);
+                // Written down after the row is gone and the ptys are dead,
+                // so the log never claims a revocation that did not finish.
+                self.record_revocation(&hash, ip, reason);
+            }
+            tracing::info!(event = ?e, "auth");
+        }
+    }
+
+    /// The audit row for a session that was taken away: dropped to honor
+    /// `max_sessions`, or taken with an address that was just blocked.
+    ///
+    /// Written here, from the store this context already holds, rather than
+    /// by a closure `main.rs` registers. A registration is a line that can
+    /// be left out of `main.rs` and put into `tests/end_to_end.rs`'s
+    /// hand-copied builder chain, which would leave every test green and the
+    /// row missing at runtime — the failure this codebase keeps hitting.
+    /// There is nothing to register, so there is nothing to forget.
+    ///
+    /// NOT every revocation. `AuthState::kick` — lockdown's step 1 — drains
+    /// its sessions and pushes no `Event`, so a lockdown writes no rows
+    /// here; what it writes is its own engagement, in lockdown's journal.
+    /// The two paths covered here are the two that take a session away while
+    /// the node carries on as normal, which are the ones nothing else
+    /// records.
+    ///
+    /// [`crate::events::Issuer::System`], because nobody asked for it — the
+    /// node did it to make room. The victim is named by its session tag, the
+    /// same 16 hex characters `command::SessionTag` uses, so an audit row
+    /// joins to the `sessions` row it is about; the full hash is not in the
+    /// row and the cookie is nowhere near it. The reason goes in `params`
+    /// rather than in `detail`, because `detail` is only filled for the
+    /// outcomes that failed and this revocation succeeded.
+    fn record_revocation(&self, hash: &SessionHash, ip: IpAddr, reason: RevokeReason) {
+        // Field names chosen around `ParamsSummary`'s redaction list: it
+        // blanks any field whose name contains "session", so the tag goes in
+        // one called `tag`.
+        let record = crate::events::Record::new(
+            crate::events::Issuer::System,
+            "auth.session.revoked",
+            self.node_id.clone(),
+            crate::events::Outcome::Ok,
+        )
+        .from(ip)
+        .params(crate::events::ParamsSummary::from_json(
+            &serde_json::json!({ "reason": reason.as_str(), "tag": hash.tag() }),
+        ));
+        if let Err(e) = self.audit.append_dispatch(
+            std::time::SystemTime::now(),
+            &record,
+            &crate::audit::DispatchFacts::none(),
+        ) {
+            // Logged and swallowed. The session is already gone; failing the
+            // revocation because the log could not be written would leave a
+            // session alive that the cap says must not be.
+            tracing::warn!(error = %e, "cannot record a revoked session in the audit log");
         }
     }
 
@@ -103,23 +209,23 @@ impl Ctx {
     /// and swallowed: the sign-in itself succeeded, and refusing it because
     /// the database is unhappy would be a worse outcome than a session that
     /// does not outlive the process.
-    fn remember(&self, id: &SessionId, session: &crate::auth::session::Session) {
+    fn remember(&self, hash: &SessionHash, session: &crate::auth::session::Session) {
         if let Err(e) = self
             .store
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert_session(id, session)
+            .insert_session(hash, session)
         {
             tracing::warn!(error = %e, "cannot persist session");
         }
     }
 
-    fn forget(&self, id: &SessionId) {
+    fn forget(&self, hash: &SessionHash) {
         if let Err(e) = self
             .store
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .delete_session(id)
+            .delete_session(hash)
         {
             tracing::warn!(error = %e, "cannot remove persisted session");
         }
@@ -275,6 +381,40 @@ async fn shell_asset(
     crate::shell::serve(uri.path())
 }
 
+/// Put a router behind the session cookie.
+///
+/// For things that are not served out of this module and must not be
+/// reachable without signing in — the app UI mount above all. An app's own
+/// web build is served from the core's origin precisely so that sign-in, CSP
+/// and theming stay the core's to enforce; serving it without this layer
+/// would hand that away and leave an unauthenticated route into every
+/// installed app.
+///
+/// Mounted as
+/// `middleware::from_fn_with_state(Arc::clone(&ctx), require_session)`.
+pub async fn require_session(
+    State(ctx): State<Arc<Ctx>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let ip = ctx.client_ip(peer, request.headers());
+    let id = cookie_session(request.headers());
+    let signed_in = {
+        let mut st = ctx.state();
+        matches!(
+            st.verify(ip, id.as_ref(), Now::current()),
+            crate::auth::state::VerifyOutcome::Ok
+        )
+    };
+    if !signed_in {
+        // A redirect, as for any other page: these paths are opened by the
+        // browser's address bar as often as by the shell.
+        return redirect_to_login();
+    }
+    next.run(request).await
+}
+
 async fn login_page(
     State(ctx): State<Arc<Ctx>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -324,9 +464,7 @@ async fn login_submit(
             &mut events,
         )
     };
-    for e in events {
-        tracing::info!(event = ?e, "auth");
-    }
+    ctx.apply(events);
 
     match outcome {
         LoginOutcome::Success { revoked } => {
@@ -334,7 +472,13 @@ async fn login_submit(
             // Read back what `login` actually stored rather than rebuilding
             // it here, so the persisted row cannot drift from the live one.
             if let Some(s) = ctx.state().session(&new_session) {
-                ctx.remember(&new_session, &s);
+                ctx.remember(&new_session.hash(), &s);
+            }
+            // After the session is persisted, because a watcher may lock the
+            // node down, and a lockdown that races the row it is revoking
+            // would leave it behind.
+            for watch in &ctx.sign_in_watchers {
+                watch(ip);
             }
             (
                 StatusCode::SEE_OTHER,
@@ -390,8 +534,8 @@ async fn logout(
     if let Some(id) = cookie_session(&headers)
         && ctx.state().logout(&id)
     {
-        ctx.forget(&id);
-        ctx.session_ended(&id);
+        ctx.forget(&id.hash());
+        ctx.session_ended(&id.hash());
     }
     (
         StatusCode::SEE_OTHER,
@@ -421,10 +565,15 @@ mod tests {
             max_sessions: 4,
         };
         Ctx::new(
-            AuthState::new(limits, Code::generate().unwrap(), Now::current()),
+            Arc::new(Mutex::new(AuthState::new(
+                limits,
+                Code::generate().unwrap(),
+                Now::current(),
+            ))),
             Arc::new(std::sync::Mutex::new(Store::in_memory().unwrap())),
             Duration::from_millis(0),
             trusted.iter().map(|s| s.parse().unwrap()).collect(),
+            "test-node".to_string(),
         )
     }
 

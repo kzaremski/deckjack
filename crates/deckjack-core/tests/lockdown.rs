@@ -1656,3 +1656,130 @@ fn the_two_command_ids_are_the_ones_the_rest_of_the_system_will_name() {
     assert_eq!(lockdown::CMD_ENGAGE, "system.lockdown");
     assert_eq!(lockdown::CMD_UNLOCK, "system.unlock");
 }
+
+// ---------------------------------------------------------------------------
+// Step 4, over the bus
+// ---------------------------------------------------------------------------
+
+/// A lockdown holds agents on the BUS, not just on the router.
+///
+/// `lockdown::gate` is axum middleware, so it covers every HTTP and ws route
+/// and nothing else. An app invokes bus commands over its own Unix socket —
+/// `apphost`'s `Invocations::begin` into `AgentBridge::invoke_for_app` — and
+/// never passes through that middleware, so the bus has to ask the lockdown
+/// itself.
+///
+/// Built through `wiring::bus` ON PURPOSE. The defect this catches is a
+/// missing wiring line, and a bus assembled by hand in this file would pass
+/// with that line gone — which is exactly how this feature came to be fully
+/// implemented, fully unit-tested and never constructed.
+///
+/// No command is registered, and that is the assertion's sharpest edge:
+/// `Bus::plan` checks the hold BEFORE it touches the registry, so a locked
+/// node answers `AgentsPaused` where an unlocked one answers
+/// `UnknownCommand`. Two different refusals, no probe command needed, and no
+/// leak of which commands exist to a locked-out caller.
+#[test]
+fn a_lockdown_holds_agents_on_the_bus_and_unlocking_releases_them() {
+    use deckjack_core::command::{
+        Approvals as BusApprovals, CommandId, Grants as BusGrants, Issuer, Journal as BusJournal,
+        NoGrants, NoInbox, Refused, Registry, Request, TracingJournal,
+    };
+    use deckjack_core::wiring;
+
+    let mut f = Fixture::new();
+    f.passkeys = Passkeys::Accept;
+    let lockdown = Arc::new(f.fresh());
+    // Minted while unlocked: `issue_recovery_codes` refuses from the locked
+    // state, so the way out has to exist before the way in is taken.
+    let codes = lockdown
+        .issue_recovery_codes(1)
+        .expect("codes issue while unlocked");
+
+    let bus = wiring::bus(wiring::BusParts {
+        registry: Arc::new(Registry::new()),
+        node_id: "node-test".to_string(),
+        journal: Arc::new(TracingJournal) as Arc<dyn BusJournal>,
+        watchdog: Arc::new(Watchdog::new(AutoPolicy::default())),
+        lockdown: Arc::clone(&lockdown),
+        grants: Arc::new(NoGrants) as Arc<dyn BusGrants>,
+        approvals: Arc::new(NoInbox) as Arc<dyn BusApprovals>,
+        halt: Arc::new(wiring::LockdownHalt(Arc::clone(&lockdown))),
+    });
+
+    // An app's invocation, shaped the way `agentbridge::app_identity` shapes
+    // it: an `Issuer::Agent` whose session is the reserved `app:<name>`,
+    // arriving over a socket the HTTP gate never sees.
+    let from_an_app = || {
+        Request::new(
+            CommandId::new("probe.read").expect("a valid command id"),
+            serde_json::json!({}),
+            Issuer::agent("app:notes"),
+        )
+    };
+
+    assert!(
+        matches!(
+            bus.dispatch(from_an_app())
+                .expect_err("no command is registered"),
+            Refused::UnknownCommand(_)
+        ),
+        "unlocked, an agent dispatch should get as far as the registry; if it \
+         does not, the rest of this test proves nothing"
+    );
+
+    lockdown.engage(Trigger::HostCommand);
+    assert!(
+        matches!(
+            bus.dispatch(from_an_app())
+                .expect_err("this node is locked"),
+            Refused::AgentsPaused
+        ),
+        "a lockdown must stop an app's dispatch, and stop it before the \
+         registry is touched"
+    );
+
+    // The operator's lever cannot release the lockdown's hold. Structural,
+    // not a conditional refusal: `agents_paused` reads both.
+    bus.resume_agents();
+    assert!(
+        matches!(
+            bus.dispatch(from_an_app()).expect_err("still locked"),
+            Refused::AgentsPaused
+        ),
+        "resume_agents released a hold it does not own"
+    );
+
+    // The operator is a different axis. Lockdown revokes their sessions and
+    // the HTTP gate serves them the locked page; the BUS does not refuse
+    // them by issuer, and conflating the two would hide which lever did it.
+    assert!(
+        matches!(
+            bus.dispatch(Request::new(
+                CommandId::new("probe.read").expect("a valid command id"),
+                serde_json::json!({}),
+                Issuer::operator(),
+            ))
+            .expect_err("no command is registered"),
+            Refused::UnknownCommand(_)
+        ),
+        "holding agents must not be conflated with stopping the operator"
+    );
+
+    lockdown
+        .unlock(UnlockRequest {
+            identity: Identity::HostConsole,
+            second: SecondFactor::RecoveryCode(codes[0].reveal()),
+        })
+        .expect("the host console plus a recovery code unlocks");
+
+    assert!(
+        matches!(
+            bus.dispatch(from_an_app())
+                .expect_err("no command is registered"),
+            Refused::UnknownCommand(_)
+        ),
+        "unlocking must release agents: a lockdown you cannot leave is worse \
+         than one that does not engage"
+    );
+}

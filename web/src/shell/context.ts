@@ -1,5 +1,6 @@
 import { inject, provide, ref, type InjectionKey, type Ref } from "vue";
 
+import { loadInstalled } from "../stores/apps.ts";
 import { createBus, browserBusEnv, type Bus } from "../stores/bus.ts";
 import type { Risk } from "../protocol.ts";
 import { createCommands, type CommandsStore } from "../stores/commands.ts";
@@ -116,6 +117,14 @@ export function createShell(): Shell {
   );
 
   bus.connect();
+
+  // What is actually installed on this node, so a window for an app binary
+  // renders that app's own UI instead of a placeholder. Fired once after
+  // connecting; a failure leaves the list empty, which is the right answer on
+  // a core with no app host.
+  void loadInstalled((command, params) => bus.call(command, params ?? {}).then((outcome) =>
+    outcome.status === "ok" ? outcome.value : Promise.reject(new Error("refused")),
+  ));
 
   return {
     bus,

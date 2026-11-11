@@ -94,10 +94,17 @@ const MAX_CODE_INPUT: usize = 128;
 /// Command ids on the bus, so the palette, the CLI and the MCP tool surface
 /// all name the same two commands.
 ///
-/// TODO(command-bus): there is no bus module yet, so the risk level these
-/// carry cannot be declared here. `system.lockdown` is deliberately *low*
-/// risk (any signed-in session, no confirmation) and `system.unlock` is the
-/// highest (passkey plus a second factor); wire both when the bus lands.
+/// `wiring::Lockdown` registers [`CMD_ENGAGE`] and declares its risk there,
+/// deliberately as `Write` rather than `Destructive`: risk level decides
+/// whether the *operator* is asked to confirm, and triggering is one click by
+/// design. What keeps an agent out is the grant.
+///
+/// [`CMD_UNLOCK`] is deliberately **not** on the bus. Every bus route is
+/// behind the gate, which refuses everything while locked, so a command there
+/// could never be reached in the one state it exists for. The unlock surface
+/// is `POST /unlock` — see [`unlock_router`] — which is in
+/// [`ALLOWED_WHILE_LOCKED`] and needs the host token plus a recovery code.
+/// The constant stays because the CLI and the MCP tool surface name it.
 pub const CMD_ENGAGE: &str = "system.lockdown";
 pub const CMD_UNLOCK: &str = "system.unlock";
 
@@ -893,6 +900,13 @@ pub struct AutoPolicy {
     /// A terminal opened from a tether session. Engage: tether mode has no
     /// terminal by design, so a terminal from one means the scope check was
     /// bypassed.
+    ///
+    /// Inert today, and left at `Engage` rather than softened: nothing
+    /// produces [`Observation::TetherTerminal`], so this value decides
+    /// nothing. Note that the reasoning above assumes the scope check
+    /// exists. It does not — `wiring::Open::run` consults neither the
+    /// session's kind nor its step-up state — so `Engage` becomes the right
+    /// default only once a refused tether terminal is what reaches here.
     pub tether_terminal: Response,
     /// A burst of refused agent commands. Alert by default: a confused agent
     /// retrying a command it has no grant for is common, and the refusals
@@ -1544,6 +1558,31 @@ pub enum Observation {
     },
     /// A terminal was opened from a tether session, which tether mode's own
     /// scope rules should already have refused.
+    ///
+    /// **Produced by nobody, and not for want of a call site.** The only
+    /// place a terminal is opened is `wiring::Open::run`, which holds the
+    /// browser session and could read `sessions.kind` through the store. What
+    /// is missing is the fact, not the wiring.
+    ///
+    /// `sessions.kind` records which *credential* proved a session —
+    /// `'passkey'`, or `'tether'` by migration 7's DEFAULT — and the only
+    /// writer of `'passkey'` is `passkeyhttp::PasskeyCtx::admit`. So every
+    /// one-time-code sign-in reads as `'tether'`, including the operator's
+    /// own machine on the tailnet, which docs/DESIGN.md ("Scope by session
+    /// type") gives full terminal access. Reading that column as "this is a
+    /// tether session" and acting on [`AutoPolicy::tether_terminal`]'s
+    /// `Engage` would lock the node down the first time the operator opened a
+    /// shell.
+    ///
+    /// Tether mode as the design means it — served over the cable, dying with
+    /// it — is not implemented, so the fact this observation needs does not
+    /// exist. It wants its own marker, written only by that sign-in path. The
+    /// credential axis cannot stand in for the mode axis, any more than risk
+    /// level can stand in for a grant.
+    ///
+    /// Note that `wiring::Open::run`'s own ownership check is a third axis
+    /// again: it answers *which caller* a pty belongs to, not which mode or
+    /// credential opened it.
     TetherTerminal,
     /// An agent command was refused by the risk gate.
     RefusedAgentCommand {
@@ -1807,4 +1846,229 @@ pub async fn gate(
     }
     tracing::info!(%path, "refused: locked down");
     locked_response(&lockdown.status())
+}
+
+// ---- the way out: the host token and the /unlock route -----------------
+
+/// Where the host token lives, relative to the working directory.
+pub const HOST_TOKEN_PATH: &str = ".deckjack/unlock.token";
+
+/// Proof that a request came from something with access to the working
+/// directory, which is what [`Identity::HostConsole`] means in practice.
+///
+/// Lockdown's unlock rule is the passkey plus a second factor, and until
+/// WebAuthn exists [`Policy::allow_host_console_identity`] lets the host
+/// console stand in for the passkey. That raised a question the module left
+/// open: over HTTP, what *is* the host console?
+///
+/// Not "the request arrived on loopback". `tailscale serve` proxies from
+/// loopback, so every remote request looks local. Not "loopback and no
+/// `X-Forwarded-For`" either — hanging an authentication decision on a
+/// header being absent is the kind of thing that is true until some
+/// intermediary changes.
+///
+/// So: a random value written to a file inside the working directory, mode
+/// 0600. Reading it needs filesystem access on the host as the user running
+/// the server, which is exactly the access `Identity::HostConsole` is
+/// claiming. `deckjack unlock` reads the file and sends it; nothing reachable
+/// over the network can.
+///
+/// It is not a second factor by itself, and the code never treats it as one.
+/// The recovery code is still required, and it exists only on paper — the
+/// journal holds digests — so host access alone does not unlock anything.
+#[derive(Clone)]
+pub struct HostToken(String);
+
+impl fmt::Debug for HostToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HostToken(<redacted>)")
+    }
+}
+
+impl HostToken {
+    /// Read the token for a working directory, creating it if it is not
+    /// there. Stable across restarts on purpose: a token that changed every
+    /// start would invalidate a `deckjack unlock` the operator was midway
+    /// through typing.
+    pub fn load_or_create(working_dir: &Path, random: &dyn Random) -> io::Result<HostToken> {
+        let path = working_dir.join(HOST_TOKEN_PATH);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if let Ok(text) = fs::read_to_string(&path) {
+            let trimmed = text.trim();
+            if trimmed.len() == 64 {
+                return Ok(HostToken(trimmed.to_string()));
+            }
+            tracing::warn!(
+                path = %path.display(),
+                "the host unlock token is not a 64-character value; replacing it"
+            );
+        }
+
+        let mut bytes = [0u8; 32];
+        random
+            .fill(&mut bytes)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let token = HostToken(hex(&bytes));
+
+        // Owner-only before the bytes go in, not after: a token that spends a
+        // moment at 0644 is a token that may have been read.
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)?;
+            f.write_all(token.0.as_bytes())?;
+            f.write_all(b"\n")?;
+        }
+        #[cfg(not(unix))]
+        fs::write(&path, format!("{}\n", token.0))?;
+
+        Ok(token)
+    }
+
+    /// Constant time, so a wrong token does not leak how much of it was
+    /// right to something that can time the response.
+    pub fn matches(&self, typed: &str) -> bool {
+        let typed = typed.trim();
+        self.0.len() == typed.len() && bool::from(self.0.as_bytes().ct_eq(typed.as_bytes()))
+    }
+
+    pub fn reveal(&self) -> &str {
+        &self.0
+    }
+}
+
+/// What the `/unlock` route needs. Held together so the route's state is one
+/// type and the router does not force the rest of the app's state on it.
+pub struct UnlockCtx {
+    lockdown: std::sync::Arc<Lockdown>,
+    token: HostToken,
+}
+
+impl UnlockCtx {
+    pub fn new(lockdown: std::sync::Arc<Lockdown>, token: HostToken) -> std::sync::Arc<UnlockCtx> {
+        std::sync::Arc::new(UnlockCtx { lockdown, token })
+    }
+}
+
+/// `GET /unlock` and `POST /unlock`, the only mutating route that keeps
+/// working while locked down (see [`ALLOWED_WHILE_LOCKED`]).
+///
+/// `GET` says what to do and nothing else: no form, because the thing that
+/// has to be submitted is a file only the host can read, and a browser form
+/// that asked for it would invite pasting it into one on a borrowed machine.
+/// `POST` takes the token and a recovery code as form fields, which is what
+/// `deckjack unlock --recovery-code` sends.
+pub fn unlock_router(ctx: std::sync::Arc<UnlockCtx>) -> axum::Router {
+    use axum::routing::get;
+    axum::Router::new()
+        .route("/unlock", get(unlock_page).post(unlock_submit))
+        .with_state(ctx)
+}
+
+const UNLOCK_INSTRUCTIONS: &str = "\
+<p>Unlocking needs two things: access to this node's working directory on the \
+host, and one of the offline recovery codes printed when they were issued.</p>\
+<p>On the host, run:</p>\
+<pre><code>deckjack unlock --recovery-code XXXX-XXXX-XXXX-XXXX-XXXX</code></pre>\
+<p>There is no form here on purpose. The host half of the proof is a file \
+inside the working directory, and a page that asked you to paste it would be \
+a page asking you to carry it onto whatever machine you are reading this on.</p>";
+
+async fn unlock_page(
+    axum::extract::State(ctx): axum::extract::State<std::sync::Arc<UnlockCtx>>,
+) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::{Html, IntoResponse as _};
+
+    let status = ctx.lockdown.status();
+    let (code, heading) = if status.locked {
+        (StatusCode::SERVICE_UNAVAILABLE, "Locked down")
+    } else {
+        (StatusCode::OK, "Not locked")
+    };
+    let body = if status.locked {
+        format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<meta name=\"robots\" content=\"noindex\"><title>Unlock</title>\
+<style>{LOCKED_STYLE}</style></head><body><main><h1>{heading}</h1>\
+{UNLOCK_INSTRUCTIONS}<dl><dt>Node</dt><dd><code>{}</code></dd>\
+<dt>Recovery codes</dt><dd>{} left</dd></dl></main></body></html>",
+            escape(&status.node_id),
+            status.recovery_codes_left,
+        )
+    } else {
+        format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<meta name=\"robots\" content=\"noindex\"><title>Unlock</title>\
+<style>{LOCKED_STYLE}</style></head><body><main><h1>{heading}</h1>\
+<p>This node is not locked down. There is nothing to unlock.</p>\
+<dl><dt>Node</dt><dd><code>{}</code></dd></dl></main></body></html>",
+            escape(&status.node_id),
+        )
+    };
+    (
+        code,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_SECURITY_POLICY, crate::auth::html::CSP),
+        ],
+        Html(body),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UnlockForm {
+    #[serde(default)]
+    pub token: String,
+    #[serde(default)]
+    pub recovery_code: String,
+}
+
+async fn unlock_submit(
+    axum::extract::State(ctx): axum::extract::State<std::sync::Arc<UnlockCtx>>,
+    axum::Form(form): axum::Form<UnlockForm>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse as _;
+
+    // The token is checked first and on its own, so a caller that cannot
+    // prove host access never gets to spend a recovery code — not even a
+    // wrong one, which `Lockdown::unlock` would otherwise count as a failed
+    // attempt against the set.
+    if !ctx.token.matches(&form.token) {
+        tracing::warn!("unlock refused: the host token did not match");
+        return (
+            StatusCode::FORBIDDEN,
+            "the host token did not match; run this from the host\n",
+        )
+            .into_response();
+    }
+
+    let request = UnlockRequest {
+        identity: Identity::HostConsole,
+        second: SecondFactor::RecoveryCode(form.recovery_code),
+    };
+    match ctx.lockdown.unlock(request) {
+        Ok(()) => (StatusCode::OK, "unlocked\n").into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "unlock refused");
+            let code = match e {
+                UnlockError::NotLocked => StatusCode::CONFLICT,
+                UnlockError::JournalWrite { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+                _ => StatusCode::FORBIDDEN,
+            };
+            (code, format!("{e}\n")).into_response()
+        }
+    }
 }

@@ -101,7 +101,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -115,7 +114,6 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -857,6 +855,23 @@ impl Registry {
         before - map.len()
     }
 
+    /// Drop exactly these commands, whoever else is in their namespace.
+    ///
+    /// What an app provider wants, and `remove_namespace` is not it: a
+    /// namespace is not owned by one registrant. The core registers
+    /// `files.list` itself, and an app named `files` unregistering "its"
+    /// namespace when it exits would take the core's file API with it — a
+    /// thing that happened, once, and showed up as the Files app working and
+    /// then every file command disappearing.
+    pub fn remove_all(&self, ids: &[CommandId]) -> usize {
+        let mut map = self.write();
+        let before = map.len();
+        for id in ids {
+            map.remove(id);
+        }
+        before - map.len()
+    }
+
     pub fn contains(&self, id: &CommandId) -> bool {
         self.read().contains_key(id)
     }
@@ -1075,7 +1090,23 @@ impl Grant {
 /// Where grants live. A trait because the real store is `state.db` and the
 /// routing rules must be decidable without one.
 pub trait Grants: Send + Sync {
-    fn grant(&self, session: &AgentSessionId) -> Option<Grant>;
+    /// Every grant this session holds, each to be evaluated **whole**.
+    ///
+    /// A list, not one merged grant, and that is the security-relevant part.
+    /// Merging the fields of several grants invents combinations nobody
+    /// issued: a grant of `terminal.*` on another machine, plus a grant of
+    /// `notes.list` on this one, unions into `terminal.*` on this one. The
+    /// bus admits a dispatch only when a SINGLE grant covers the command,
+    /// its risk and the node together.
+    fn grants_for(&self, session: &AgentSessionId) -> Vec<Grant>;
+
+    /// One of this session's grants, for a caller that only needs an example
+    /// — a display, a label, an attribution. Never an authorization answer:
+    /// a session with several grants has more scope than this reports, and
+    /// narrowing is the safe direction for a value nothing enforces with.
+    fn grant(&self, session: &AgentSessionId) -> Option<Grant> {
+        self.grants_for(session).into_iter().next()
+    }
 }
 
 /// Grants held in memory, for a server that has not loaded them from
@@ -1116,12 +1147,16 @@ impl MemoryGrants {
 }
 
 impl Grants for MemoryGrants {
-    fn grant(&self, session: &AgentSessionId) -> Option<Grant> {
+    fn grants_for(&self, session: &AgentSessionId) -> Vec<Grant> {
+        // One grant per session here: this map is keyed by session, so there
+        // is never more than one to evaluate.
         self.grants
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(session)
             .cloned()
+            .into_iter()
+            .collect()
     }
 }
 
@@ -1131,8 +1166,8 @@ impl Grants for MemoryGrants {
 pub struct NoGrants;
 
 impl Grants for NoGrants {
-    fn grant(&self, _session: &AgentSessionId) -> Option<Grant> {
-        None
+    fn grants_for(&self, _session: &AgentSessionId) -> Vec<Grant> {
+        Vec::new()
     }
 }
 
@@ -1158,6 +1193,9 @@ pub struct SessionTag(String);
 /// Bytes of digest kept. Eight leaves a one-in-2^64 chance that two sessions
 /// share a tag, which is far more than a log holding a handful of browsers
 /// needs, and short enough to read in a terminal.
+///
+/// A **prefix** of [`crate::auth::SessionHash`], not an independent digest —
+/// see [`BrowserSession::tag`] for why that is load-bearing.
 const SESSION_TAG_BYTES: usize = 8;
 
 impl SessionTag {
@@ -1210,17 +1248,23 @@ impl BrowserSession {
     /// log row and a dispatch happens on every terminal keystroke; hashing
     /// there would be work nobody asked for.
     pub fn tag(&self) -> SessionTag {
-        // `SessionId` keeps its bytes private and exposes only `encode`, so
-        // the digest is over that encoding. It is a bijection of the bytes,
-        // which is all the hash needs.
-        let digest = Sha256::digest(self.0.encode().as_bytes());
-        let mut out = String::with_capacity(SESSION_TAG_BYTES * 2);
-        for byte in &digest[..SESSION_TAG_BYTES] {
-            // Infallible for a `String`; discarded rather than unwrapped so a
-            // formatting bug cannot panic a dispatch, as in `lockdown::hex`.
-            let _ = write!(out, "{byte:02x}");
-        }
-        SessionTag(out)
+        // The first 16 hex of `SessionHash`, which is the digest the store
+        // keys `sessions` by and the one `auth::Event::SessionRevoked`
+        // carries. That agreement is the whole value of the tag.
+        //
+        // This used to be its own digest, over `SessionId::encode()` rather
+        // than over the id's bytes. Both were honestly described as "SHA-256
+        // of the session id" and the two were different numbers, so an audit
+        // row could not be matched to the session it came from, to a live
+        // row in `sessions`, or to a revocation — which is the one question
+        // anybody reads an audit log to answer. Nothing failed: each side
+        // was self-consistent and tested. It only came apart when the two
+        // were read side by side against a running node.
+        //
+        // A prefix rather than a second hash, so the join is `substr(hash,
+        // 1, 16) = issuer_session` and no second derivation can drift.
+        let hex = self.0.hash().hex();
+        SessionTag(hex[..SESSION_TAG_BYTES * 2].to_string())
     }
 }
 
@@ -1608,6 +1652,13 @@ impl Running {
 
     /// Take the progress channel and the work separately, so one task can
     /// forward progress to the browser while another awaits the result.
+    /// Split a running dispatch into its progress stream and its completion.
+    ///
+    /// **Nothing is spawned.** The command runs *inside* the returned future,
+    /// so a caller that waits on the progress receiver before polling that
+    /// future deadlocks: there is nothing driving the command that would
+    /// produce the progress. Poll the completion concurrently — spawn it, or
+    /// `select!` on both — as `wiring::BusDispatch` does.
     pub fn split(self) -> (mpsc::Receiver<Progress>, BoxFuture<'static, Completion>) {
         let Running {
             dispatch,
@@ -1923,6 +1974,42 @@ impl Approvals for NoInbox {
     }
 }
 
+/// Something outside this module that is holding agents, asked on every
+/// dispatch.
+///
+/// The kill switch, in the product. A port rather than a dependency on
+/// `crate::lockdown` so that `command` does not have to know the kill switch
+/// exists, and so that the two meet in exactly one place — `wiring::bus`,
+/// where every other adapter of this shape lives.
+///
+/// Asked, not told. A lockdown could instead push a flag in through
+/// [`Bus::pause_agents`], and that is the version that was designed and never
+/// wired: it needs a resume call on the unlock path, another on
+/// `Lockdown::sealed`, and another wherever a restart comes back locked, and a
+/// lockdown nobody can leave is worse than one that never engages. Reading
+/// the state means there is nothing to remember: the hold ends when
+/// `is_locked` goes false, and [`Bus::resume_agents`] cannot clear it.
+pub trait Halt: Send + Sync {
+    /// Whether agent-issued dispatches must be refused right now.
+    fn agents_halted(&self) -> bool;
+}
+
+/// Nothing is holding agents.
+///
+/// The honest default for a bus with no kill switch attached, which is every
+/// bus in a unit test. Deliberately NOT what [`crate::wiring::BusParts`]
+/// falls back to: there the field is required, so a product bus assembled
+/// without a hold is a compile error rather than an omission, and passing
+/// this reads as a decision in the source — the same bargain
+/// [`NoGrants`] and [`NoInbox`] make.
+pub struct NoHalt;
+
+impl Halt for NoHalt {
+    fn agents_halted(&self) -> bool {
+        false
+    }
+}
+
 /// The operator's approval of a queued command, from the Inbox.
 ///
 /// A separate type so releasing something from the Inbox is a distinct call
@@ -1993,10 +2080,19 @@ pub struct Bus {
     journal: Arc<dyn Journal>,
     grants: Arc<dyn Grants>,
     approvals: Arc<dyn Approvals>,
-    /// The lockdown lever: "pauses all agents". Separate from revoking grants
-    /// so pausing is reversible without rebuilding what each session was
-    /// allowed to do.
+    /// The operator's own lever: "pauses all agents". Separate from revoking
+    /// grants so pausing is reversible without rebuilding what each session
+    /// was allowed to do.
+    ///
+    /// NOT the lockdown's lever. A lockdown is asked about through [`Halt`]
+    /// instead of being mirrored in here, so that leaving a lockdown resumes
+    /// agents with nothing to remember to call, and so that
+    /// [`Bus::resume_agents`] cannot clear a lockdown. See
+    /// [`Bus::agents_paused`].
     agents_paused: AtomicBool,
+    /// Whatever else is holding agents, asked on every dispatch. The kill
+    /// switch, in the product; [`NoHalt`] by default.
+    halt: Arc<dyn Halt>,
     progress_buffer: usize,
 }
 
@@ -2012,6 +2108,7 @@ impl Bus {
             grants: Arc::new(NoGrants),
             approvals: Arc::new(NoInbox),
             agents_paused: AtomicBool::new(false),
+            halt: Arc::new(NoHalt),
             progress_buffer: PROGRESS_BUFFER,
         }
     }
@@ -2031,6 +2128,12 @@ impl Bus {
         self
     }
 
+    /// Attach whatever may hold agents — the kill switch. See [`Halt`].
+    pub fn with_halt(mut self, halt: Arc<dyn Halt>) -> Bus {
+        self.halt = halt;
+        self
+    }
+
     pub fn with_progress_buffer(mut self, updates: usize) -> Bus {
         self.progress_buffer = updates.max(1);
         self
@@ -2044,21 +2147,45 @@ impl Bus {
         &self.node
     }
 
-    /// Part of lockdown. Already-running commands are not touched: killing
-    /// child processes is the launcher's job, and this module should not
-    /// pretend to do it.
+    /// The operator's lever, on its own. A lockdown does not come through
+    /// here — see [`Halt`] and [`Bus::agents_paused`].
+    ///
+    /// Already-running commands are not touched: this is an ADMISSION gate,
+    /// so a command already past [`Bus::plan`] runs to completion. Killing
+    /// child processes is lockdown's step 2 (`Lockdown::engage` reaps them
+    /// through `Children`), and this module should not pretend to do it. What
+    /// neither covers is an in-process command already running; that is a
+    /// known gap and not one a flag can close.
     pub fn pause_agents(&self) {
         self.agents_paused.store(true, Ordering::SeqCst);
         tracing::warn!("agents paused: no agent command will be admitted");
     }
 
+    /// Undo [`Bus::pause_agents`], and only that.
+    ///
+    /// It cannot release a [`Halt`], which is deliberate: an operator lever
+    /// that could resume agents during a lockdown would be a way around the
+    /// kill switch that needs no recovery code. `Approvals::thaw` refuses
+    /// while locked for the same reason; here the refusal is structural,
+    /// because [`Bus::agents_paused`] reads both.
     pub fn resume_agents(&self) {
         self.agents_paused.store(false, Ordering::SeqCst);
         tracing::info!("agents resumed");
     }
 
+    /// Whether an agent-issued dispatch is refused right now, for either
+    /// reason: the operator paused them, or something is holding them.
+    ///
+    /// Both, because the two must not be able to clear each other, and
+    /// because the lockdown's hold has to end when the lockdown does rather
+    /// than when somebody remembers to say so.
+    ///
+    /// Read by the two admission gates ([`Bus::plan`] and
+    /// [`Bus::dispatch_approved`]) and by
+    /// [`crate::agentbridge::AgentBridge::tools`], which is what keeps the
+    /// offered list and the refusal from disagreeing.
     pub fn agents_paused(&self) -> bool {
-        self.agents_paused.load(Ordering::SeqCst)
+        self.agents_paused.load(Ordering::SeqCst) || self.halt.agents_halted()
     }
 
     /// What the palette should show. `None` for the operator, who sees
@@ -2069,12 +2196,24 @@ impl Bus {
 
     /// The MCP tool surface for one agent session.
     pub fn tools(&self, session: &AgentSessionId) -> Vec<ToolDefinition> {
-        match self.grants.grant(session) {
-            Some(grant) => self.registry.tools(&grant),
-            // No grant is no tools, rather than every tool followed by a
-            // refusal for each one.
-            None => Vec::new(),
+        // Offered if ANY ONE grant allows it, which is what the dispatch
+        // check will decide too. Asking per grant and merging the ANSWERS is
+        // not the same as merging the grants and asking once: the second
+        // offers tools no single grant covers, and every one of them is then
+        // refused on use.
+        //
+        // No grant is no tools, rather than every tool followed by a refusal
+        // for each one.
+        let mut out: Vec<ToolDefinition> = Vec::new();
+        for grant in self.grants.grants_for(session) {
+            for tool in self.registry.tools(&grant) {
+                if !out.iter().any(|t| t.name == tool.name) {
+                    out.push(tool);
+                }
+            }
         }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 
     /// Authorize a request and hand back the work.
@@ -2286,29 +2425,53 @@ impl Bus {
         spec: &CommandSpec,
         node: &NodeId,
     ) -> Result<(), Refused> {
-        let grant = self.grants.grant(session).ok_or_else(|| Refused::NoGrant {
-            session: session.clone(),
-        })?;
-        if !grant.covers(spec.id()) {
-            return Err(Refused::OutsideGrant {
+        let grants = self.grants.grants_for(session);
+        if grants.is_empty() {
+            return Err(Refused::NoGrant {
                 session: session.clone(),
-                command: spec.id().clone(),
             });
         }
-        if spec.risk() > grant.ceiling {
-            return Err(Refused::AboveCeiling {
+
+        // Each grant whole. One grant has to clear all three gates by
+        // itself; clearing them between two grants is a combination the
+        // operator never issued. For a session holding a single grant this
+        // is exactly the old sequence.
+        let mut covered = false;
+        let mut under_ceiling = false;
+        for grant in &grants {
+            if !grant.covers(spec.id()) {
+                continue;
+            }
+            covered = true;
+            if spec.risk() > grant.ceiling {
+                continue;
+            }
+            under_ceiling = true;
+            if grant.allows_node(node, &self.node) {
+                return Ok(());
+            }
+        }
+
+        // The refusal names the furthest gate any one grant reached, so the
+        // message tells the operator which part to widen rather than always
+        // blaming the first.
+        Err(if !covered {
+            Refused::OutsideGrant {
+                session: session.clone(),
+                command: spec.id().clone(),
+            }
+        } else if !under_ceiling {
+            Refused::AboveCeiling {
                 session: session.clone(),
                 command: spec.id().clone(),
                 risk: spec.risk(),
-            });
-        }
-        if !grant.allows_node(node, &self.node) {
-            return Err(Refused::NodeNotAllowed {
+            }
+        } else {
+            Refused::NodeNotAllowed {
                 session: session.clone(),
                 node: node.clone(),
-            });
-        }
-        Ok(())
+            }
+        })
     }
 
     /// Which node this dispatch lands on.

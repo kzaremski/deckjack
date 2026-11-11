@@ -1,9 +1,20 @@
 //! Login and locked pages: inline HTML and CSS, no JavaScript, no external
 //! assets (§9.3). Nothing user-supplied is ever interpolated.
+//!
+//! [`CSP`] has no `script-src`, so nothing can execute here even if a future
+//! edit did interpolate something — which is why the WebAuthn ceremony is
+//! NOT on this page. It needs script; this page collects the one-time code
+//! by hand. [`crate::passkeypage`] carries the ceremony under its own
+//! slightly wider policy, and this page reaches it with an ordinary link.
+//! A link costs no policy: navigation is not governed by `default-src`.
 
 pub const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'";
 
-const STYLE: &str = "\
+/// Shared with [`crate::passkeypage`], which is a sibling pre-authentication
+/// page and should not look like a different product. `pub(crate)` rather
+/// than public: it is this crate's house style for the pages it serves
+/// before a session exists, not an API.
+pub(crate) const STYLE: &str = "\
 *{box-sizing:border-box}\
 body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;\
 font:16px/1.5 system-ui,sans-serif;background:#f4f4f2;color:#1c1c1c}\
@@ -12,6 +23,8 @@ box-shadow:0 1px 3px rgba(0,0,0,.12)}\
 h1{margin:0 0 1rem;font-size:1.25rem}\
 p{margin:0 0 1rem}\
 .msg{color:#a12a1f}\
+.alt{margin:1rem 0 0;font-size:.875rem;text-align:center}\
+.alt a{color:inherit;opacity:.75}\
 input{width:100%;padding:.6rem .7rem;font:inherit;font-size:1.4rem;letter-spacing:.15em;\
 text-transform:uppercase;font-family:ui-monospace,monospace;border:1px solid #bbb;border-radius:8px}\
 button{margin-top:1rem;width:100%;padding:.6rem;font:inherit;border:0;border-radius:8px;\
@@ -44,7 +57,8 @@ pub fn login(message: Option<&str>) -> String {
 <input id=\"code\" name=\"code\" type=\"text\" inputmode=\"text\" autocomplete=\"off\" \
 autocapitalize=\"characters\" spellcheck=\"false\" maxlength=\"12\" required autofocus \
 placeholder=\"XXXX-XXXX\">\
-<button type=\"submit\">Log in</button></form>"
+<button type=\"submit\">Log in</button></form>\
+<p class=\"alt\"><a href=\"/passkey\">Use a passkey instead</a></p>"
         ),
     )
 }
@@ -69,11 +83,41 @@ mod tests {
 
     #[test]
     fn login_page_has_no_script_or_external_assets() {
+        // The login page gained a link to the passkey page, so the old
+        // blanket `!contains("href=")` had to go. What replaces it is the
+        // invariant that still holds and still matters: this page runs no
+        // script and fetches nothing, from anywhere. A link navigates; it
+        // loads no asset into this document and executes nothing in it.
         for html in [login(None), wrong_code(2), locked()] {
-            assert!(!html.contains("<script"));
-            assert!(!html.contains("src="));
-            assert!(!html.contains("href="));
+            assert!(
+                !html.contains("<script"),
+                "no script on a page with CSP {CSP}"
+            );
+            assert!(!html.contains("src="), "no asset reference: {html}");
+            // An inline handler is script by another name.
+            for attr in ["onclick", "onsubmit", "onload", "onfocus", "javascript:"] {
+                assert!(!html.contains(attr), "inline script via {attr}");
+            }
+            // Every reference is a path on this origin, so nothing here can
+            // be redirected by whoever controls another host.
+            for scheme in ["http://", "https://", "//", "data:"] {
+                assert!(
+                    !html.contains(scheme),
+                    "off-origin reference {scheme}: {html}"
+                );
+            }
         }
+        // And the policy that makes the above enforced rather than merely
+        // true today is still the narrow one.
+        assert!(
+            !CSP.contains("script-src"),
+            "the ceremony belongs on its own page"
+        );
+        assert!(CSP.contains("default-src 'none'"));
+        assert!(
+            login(None).contains("href=\"/passkey\""),
+            "no way to reach the ceremony"
+        );
         let l = login(None);
         for attr in [
             "autocomplete=\"off\"",

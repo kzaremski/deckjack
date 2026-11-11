@@ -676,9 +676,13 @@ pub enum PasskeyError {
         source: WebauthnError,
     },
 
+    // Names the path that exists. There is no CLI enrollment: the first
+    // credential is enrolled from a browser that has already signed in with
+    // the one-time code, which is the point — a passkey is approved by a
+    // session that was already trusted, never minted out of nothing.
     #[error(
-        "no passkey is enrolled, so there is nothing to sign in with; enroll one from the host \
-         with `deckjack passkey enroll`, or sign in with the one-time code"
+        "no passkey is enrolled, so there is nothing to sign in with; sign in with the \
+         one-time code first, then enroll this device from that session"
     )]
     NoCredentials,
 

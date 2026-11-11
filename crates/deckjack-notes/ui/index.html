@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Notes</title>
+    <!--
+      Both from the core's own bundle, on the core's origin. One copy of the
+      bus client and one copy of the kit, rather than one per app — and the
+      token stylesheet the shell injects into this frame is what makes the app
+      follow the desktop's theme without knowing a theme exists.
+    -->
+    <link rel="stylesheet" href="/kit/kit.css" />
+  </head>
+  <body>
+    <div class="dj-bar">
+      <h1 class="dj-title">Notes</h1>
+      <span class="dj-spacer"></span>
+      <button class="dj-button" id="new">New</button>
+      <button class="dj-button" id="rename" disabled>Rename</button>
+      <button class="dj-button" id="delete" disabled>Delete</button>
+    </div>
+
+    <div class="dj-body" id="body" data-pane="list">
+      <div class="dj-list" id="list"></div>
+      <div class="dj-main">
+        <textarea
+          class="dj-editor"
+          id="editor"
+          spellcheck="true"
+          placeholder="Pick a note, or make one."
+          disabled
+        ></textarea>
+      </div>
+    </div>
+
+    <p class="dj-status" id="status">Loading…</p>
+
+    <script type="module">
+      import { bus, failure, text } from "/kit/bus.js";
+
+      const list = document.getElementById("list");
+      const editor = document.getElementById("editor");
+      const status = document.getElementById("status");
+      const body = document.getElementById("body");
+
+      let notes = [];
+      let open = null;
+      /** Set on every keystroke, cleared once the save lands. */
+      let dirty = false;
+      let saving = false;
+
+      function say(message) {
+        status.textContent = message;
+      }
+
+      function draw() {
+        if (notes.length === 0) {
+          list.innerHTML = '<p class="dj-empty">No notes yet.</p>';
+          return;
+        }
+        list.innerHTML = notes
+          .map(
+            (n) => `
+            <button class="dj-row" data-name="${text(n.name)}"
+                    aria-current="${n.name === open ? "true" : "false"}">
+              <span class="dj-row-name">${text(n.title)}</span>
+              <span class="dj-row-meta">${when(n.modified)}</span>
+            </button>`,
+          )
+          .join("");
+        for (const row of list.querySelectorAll(".dj-row")) {
+          row.addEventListener("click", () => select(row.dataset.name));
+        }
+      }
+
+      /** Relative, because an exact timestamp on every row is noise. */
+      function when(seconds) {
+        if (!seconds) return "";
+        const ago = Math.max(0, Date.now() / 1000 - seconds);
+        if (ago < 90) return "now";
+        if (ago < 3600) return `${Math.round(ago / 60)}m`;
+        if (ago < 86400) return `${Math.round(ago / 3600)}h`;
+        return `${Math.round(ago / 86400)}d`;
+      }
+
+      async function refresh() {
+        const result = await bus.invoke("notes.list");
+        notes = result.notes ?? [];
+        draw();
+        say(notes.length === 1 ? "1 note" : `${notes.length} notes`);
+      }
+
+      async function select(name) {
+        // Saving first, because switching notes with unsaved text in the box
+        // is the most ordinary way to lose it.
+        await save();
+        const result = await bus.invoke("notes.read", { name });
+        open = name;
+        editor.value = result.text ?? "";
+        editor.disabled = false;
+        dirty = false;
+        document.getElementById("rename").disabled = false;
+        document.getElementById("delete").disabled = false;
+        body.dataset.pane = "main";
+        draw();
+        editor.focus();
+      }
+
+      async function save() {
+        if (!open || !dirty || saving) return;
+        saving = true;
+        try {
+          await bus.invoke("notes.write", { name: open, text: editor.value });
+          dirty = false;
+          say("Saved");
+        } finally {
+          saving = false;
+        }
+      }
+
+      // Autosave rather than a Save button: a note is a file, and a file
+      // editor that can lose a paragraph to a closed window is not one.
+      let timer = null;
+      editor.addEventListener("input", () => {
+        dirty = true;
+        say("Unsaved");
+        clearTimeout(timer);
+        timer = setTimeout(() => save().catch((e) => failure(status, e)), 600);
+      });
+      // The last chance before the window goes. `visibilitychange` fires where
+      // `beforeunload` is unreliable, which inside an iframe is most places.
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") void save();
+      });
+
+      document.getElementById("new").addEventListener("click", async () => {
+        const title = prompt("What is it about?");
+        if (!title) return;
+        try {
+          const note = await bus.invoke("notes.create", { title });
+          await refresh();
+          await select(note.name);
+        } catch (e) {
+          failure(status, e);
+        }
+      });
+
+      document.getElementById("rename").addEventListener("click", async () => {
+        if (!open) return;
+        const to = prompt("New name", open);
+        if (!to) return;
+        try {
+          const note = await bus.invoke("notes.rename", { name: open, to });
+          open = note.name;
+          await refresh();
+        } catch (e) {
+          failure(status, e);
+        }
+      });
+
+      document.getElementById("delete").addEventListener("click", async () => {
+        if (!open) return;
+        // No confirmation here on purpose. `notes.delete` is declared
+        // destructive in app.toml, so the shell asks — and the shell's
+        // sentence is the bus's, not one this app wrote about its own
+        // destructive command.
+        try {
+          await bus.invoke("notes.delete", { name: open });
+          open = null;
+          editor.value = "";
+          editor.disabled = true;
+          document.getElementById("rename").disabled = true;
+          document.getElementById("delete").disabled = true;
+          body.dataset.pane = "list";
+          await refresh();
+        } catch (e) {
+          failure(status, e);
+        }
+      });
+
+      refresh().catch((e) => failure(document.body, e));
+    </script>
+  </body>
+</html>

@@ -1282,10 +1282,11 @@ impl Server {
         };
         let state = AuthState::new(limits, test_code(), clock.auth_now());
         let auth = Arc::new(http::Ctx::new(
-            state,
+            Arc::new(std::sync::Mutex::new(state)),
             std::sync::Arc::new(std::sync::Mutex::new(Store::in_memory().unwrap())),
             Duration::ZERO,
             Vec::new(),
+            "ws-test-node".to_string(),
         ));
 
         let session = sign_in(&auth, &clock);

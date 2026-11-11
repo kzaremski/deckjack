@@ -73,7 +73,6 @@ use axum::extract::{Path as UrlPath, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -82,18 +81,6 @@ use crate::sandbox;
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// The app protocol this core speaks: handshake shape, frame shape and the
-/// meaning of a command declaration, all as one number.
-///
-/// It is a single integer rather than a semver range because the only
-/// question that matters at launch is "can these two talk". Additive changes
-/// that an older app survives raise [`MIN_PROTOCOL_VERSION`] not at all;
-/// anything an older app would misread raises both.
-pub const PROTOCOL_VERSION: u32 = 1;
-
-/// The oldest protocol this core still accepts.
-pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
 /// Apps live here, relative to the install directory (never the working
 /// directory: binaries are built for one machine and must not travel).
@@ -110,552 +97,52 @@ pub const RUN_SUBDIR: &str = "run";
 /// delete at any time is the honest home for the rest of it.
 pub const CACHE_SUBDIR: &str = "cache";
 
-/// The manifest file inside each app directory.
-pub const MANIFEST_FILE: &str = "app.toml";
-
-/// Every app binary is named this plus the app name, discovered the way git
-/// finds `git-*` subcommands.
-pub const BINARY_PREFIX: &str = "deckjack-";
-
 /// Where [`ui_router`] expects to be nested.
 pub const UI_MOUNT: &str = "/apps";
-
-/// What `/apps/<name>/` resolves to.
-pub const UI_INDEX: &str = "index.html";
-
-/// Longest line the core will accept from an app.
-///
-/// Frames are newline-delimited JSON, so one frame is one line. Apps are
-/// local, installed and approved rather than remote peers, which is the only
-/// reason the limit may be checked after the line has been read instead of
-/// while reading it.
-pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// This core's version, sent in [`Hello`] so an app can log what it is
 /// talking to. Never used to decide compatibility — [`PROTOCOL_VERSION`] is.
 pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The hidden directory no app may ever be granted a path into.
-const HIDDEN_DIR: &str = ".deckjack";
+/// The hidden directory no app may ever be granted a path into. Named in the
+/// protocol crate too, where a manifest asking for a path into it is refused
+/// as the file is read.
+use deckjack_protocol::HIDDEN_DIR;
 
 // ---------------------------------------------------------------------------
-// Manifest
+// The protocol
 // ---------------------------------------------------------------------------
+//
+// The manifest, the frames and the version numbers live in
+// `deckjack-protocol`, a permissively licensed crate with no dependencies
+// beyond serde. They are re-exported here so this module's API is unchanged
+// and so a reader of `apps.rs` still finds them by name.
+//
+// The split is not tidiness: an app binary depends on that crate and not on
+// this one. A core carries SQLite, axum, Landlock and a web shell, and nine
+// app binaries each linking all of it is how a desktop stops fitting on a
+// phone.
 
-/// `app.toml`: what an app is, what it provides and what it needs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Manifest {
-    pub app: AppInfo,
-    #[serde(default)]
-    pub needs: Needs,
-    #[serde(default)]
-    pub commands: Vec<CommandDecl>,
-}
+pub use deckjack_protocol::{
+    AppFrame, AppInfo, BINARY_PREFIX, CommandDecl, CoreFrame, DirNeed, Hello, Lifecycle,
+    MANIFEST_FILE, MAX_FRAME_BYTES, MIN_PROTOCOL_VERSION, Manifest, ManifestError, Needs,
+    PROTOCOL_VERSION, ProtocolError, RegisteredCommand, Registration, Risk, UI_INDEX, UiAsset,
+    WireAsset, check_protocol, decode_frame, encode_frame, valid_name,
+};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AppInfo {
-    /// Directory name, binary suffix, URL segment and command namespace, all
-    /// at once. Hence the narrow character set enforced in [`valid_name`].
-    pub name: String,
-    pub version: String,
-    /// The app protocol the binary was built against.
-    pub protocol: u32,
-    /// What the dock and the window chrome show. Defaults to the name.
-    #[serde(default)]
-    pub title: Option<String>,
-    /// Lifecycle lives here rather than under `[needs]` because it is not a
-    /// permission the operator grants: changing it does not invalidate an
-    /// approval, where changing `[needs]` does.
-    #[serde(default)]
-    pub lifecycle: Lifecycle,
-    /// Narrowest width the app's compact layout works at, per the window
-    /// manager's app contract.
-    #[serde(default)]
-    pub min_width: Option<u32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Lifecycle {
-    /// Started when a window opens, stopped when it has been idle.
-    #[default]
-    OnDemand,
-    /// Started at core startup and kept running: PIM sync, reminders, the
-    /// assistant. Stopping these on idle would stop the work they exist for.
-    Service,
-}
-
-/// What an app asked for. Approved as a whole, fingerprinted as a whole.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Needs {
-    pub gpu: bool,
-    /// Hosts the app may reach, as an allowlist and not a hint: empty means
-    /// no network at all, and [`LaunchPlan::build`] enforces that.
-    ///
-    /// The host *names* are a different matter. Landlock's network rules are
-    /// per-port, so an allowlist of names cannot be installed as written and
-    /// a non-empty list opens the network as a whole — reported at warn on
-    /// every launch, see [`Sandbox::network_is_coarse`].
-    pub network: Vec<String>,
-    /// Parts of the working directory the app may see.
-    pub working_dir: Vec<DirNeed>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DirNeed {
-    /// Relative to the working directory.
-    pub path: String,
-    #[serde(default)]
-    pub write: bool,
-}
-
-impl Needs {
-    /// Nothing beyond the bus. Such an app has nothing for the operator to
-    /// approve, so [`Host`] launches it without a grant rather than
-    /// manufacturing a consent dialog with an empty list in it.
-    pub fn is_empty(&self) -> bool {
-        !self.gpu && self.network.is_empty() && self.working_dir.is_empty()
-    }
-}
-
-/// A command as the manifest declares it. The authoritative parameter schema
-/// arrives at handshake; this is the surface the operator approved.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CommandDecl {
-    /// Must start with `<app>.`, so an app cannot declare `system.shutdown`
-    /// and have the palette offer it.
-    pub id: String,
-    pub summary: String,
-    pub risk: Risk,
-}
-
-/// Risk level, declared by the backend and never inferred by the UI, so an
-/// adapter bug cannot quietly downgrade a destructive command.
+/// Read and validate one `app.toml`.
 ///
-/// TODO: re-export the command bus's risk type once that module exists,
-/// rather than keeping two enums that must agree. This one is defined here
-/// because the app host has to parse `app.toml` whether or not the bus is
-/// wired yet; the integrator should swap it for an import, not translate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Risk {
-    /// Runs immediately, for anyone.
-    Read,
-    /// Runs under the caller's grant.
-    Write,
-    /// Waits in the Assistant's Inbox when an agent asks.
-    Destructive,
-    /// Leaves the machine; also Inbox-gated for agents.
-    Outbound,
-}
-
-impl Risk {
-    /// Whether an agent's call must wait for approval. The operator's own
-    /// calls get an ordinary confirmation instead.
-    pub fn needs_inbox(&self) -> bool {
-        matches!(self, Risk::Destructive | Risk::Outbound)
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum ManifestError {
-    #[error("cannot read {path}: {source}")]
-    Read {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-
-    #[error("{path} is not valid app.toml: {source}")]
-    Parse {
-        path: PathBuf,
-        #[source]
-        source: toml::de::Error,
-    },
-
-    #[error("{path}: {message}")]
-    Invalid { path: PathBuf, message: String },
-}
-
-impl Manifest {
-    /// Read and validate one `app.toml`.
-    pub fn load(path: &Path, env: &dyn Env) -> Result<Manifest, ManifestError> {
-        let text = env
-            .read_to_string(path)
-            .map_err(|source| ManifestError::Read {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        let manifest: Manifest = toml::from_str(&text).map_err(|source| ManifestError::Parse {
+/// The read goes through [`Env`], which is what lets every discovery rule be
+/// exercised without a filesystem; the parsing and validation are
+/// `Manifest::parse` in the protocol crate, where an app can reach them too.
+pub fn load_manifest(path: &Path, env: &dyn Env) -> Result<Manifest, ManifestError> {
+    let text = env
+        .read_to_string(path)
+        .map_err(|source| ManifestError::Read {
             path: path.to_path_buf(),
             source,
         })?;
-        manifest.validate(path)?;
-        Ok(manifest)
-    }
-
-    pub fn title(&self) -> &str {
-        self.app.title.as_deref().unwrap_or(&self.app.name)
-    }
-
-    /// Everything here is a rule the rest of the module then gets to assume.
-    fn validate(&self, path: &Path) -> Result<(), ManifestError> {
-        let bad = |message: String| ManifestError::Invalid {
-            path: path.to_path_buf(),
-            message,
-        };
-
-        if !valid_name(&self.app.name) {
-            return Err(bad(format!(
-                "app.name {:?} is not usable: a name is 1-32 characters of a-z, 0-9 and \
-                 '-', starting with a letter. It is the directory, the binary suffix, the \
-                 URL segment and the command namespace, so it cannot be anything else",
-                self.app.name
-            )));
-        }
-        if self.app.version.trim().is_empty() {
-            return Err(bad(
-                "app.version is empty; set it to the build's version".into()
-            ));
-        }
-
-        let mut seen: Vec<&str> = Vec::new();
-        for command in &self.commands {
-            let namespace = format!("{}.", self.app.name);
-            if !command.id.starts_with(&namespace) {
-                return Err(bad(format!(
-                    "command {:?} must be named {namespace}<something>: an app may only \
-                     declare commands in its own namespace, or installing it could shadow \
-                     another app's command",
-                    command.id
-                )));
-            }
-            if command.id.len() == namespace.len() {
-                return Err(bad(format!(
-                    "command id {:?} has no name after the namespace",
-                    command.id
-                )));
-            }
-            if seen.contains(&command.id.as_str()) {
-                return Err(bad(format!("command {:?} is declared twice", command.id)));
-            }
-            if command.summary.trim().is_empty() {
-                return Err(bad(format!(
-                    "command {:?} has no summary; it is what the palette shows",
-                    command.id
-                )));
-            }
-            seen.push(&command.id);
-        }
-
-        for need in &self.needs.working_dir {
-            let as_path = Path::new(&need.path);
-            if need.path.trim().is_empty() {
-                return Err(bad("needs.working_dir has an empty path".into()));
-            }
-            if as_path.is_absolute() {
-                return Err(bad(format!(
-                    "needs.working_dir path {:?} is absolute; paths are relative to the \
-                     working directory, which is the only thing an app may be granted",
-                    need.path
-                )));
-            }
-            if as_path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                return Err(bad(format!(
-                    "needs.working_dir path {:?} contains '..', which would reach outside \
-                     the working directory",
-                    need.path
-                )));
-            }
-            if as_path.components().any(|c| c.as_os_str() == HIDDEN_DIR) {
-                return Err(bad(format!(
-                    "needs.working_dir path {:?} reaches into {HIDDEN_DIR}/. No app ever \
-                     sees it: the core is the only process that opens state.db, and apps \
-                     reach state through the bus",
-                    need.path
-                )));
-            }
-            // `.` and `./.` have no parent component and no hidden component,
-            // so every check above passes while the grant is the whole
-            // working directory — including the hidden directory inside it,
-            // because Landlock grants the tree beneath a path. The launcher
-            // refuses this again at build time; it is rejected here as well so
-            // the operator is told while reading the manifest rather than
-            // while failing to open a window.
-            if !as_path
-                .components()
-                .any(|c| matches!(c, std::path::Component::Normal(_)))
-            {
-                return Err(bad(format!(
-                    "needs.working_dir path {:?} is the working directory itself, which \
-                     would grant its whole tree including {HIDDEN_DIR}/. Name the \
-                     subdirectories the app actually needs",
-                    need.path
-                )));
-            }
-        }
-
-        for host in &self.needs.network {
-            if host.trim().is_empty() || host.contains('/') {
-                return Err(bad(format!(
-                    "needs.network entry {host:?} is not a host name; list hosts, not URLs"
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// A stable digest of everything the operator approved: the `[needs]`
-    /// table and the command surface with its risk levels.
-    ///
-    /// An app that gains a network host or turns a read command into a
-    /// destructive one gets a different fingerprint and so needs approving
-    /// again. Version and lifecycle are deliberately excluded: a patch
-    /// release that asks for nothing new should not nag.
-    ///
-    /// Hashed with FNV-1a rather than [`std::hash::DefaultHasher`], whose
-    /// output is explicitly not stable between Rust releases — a fingerprint
-    /// that changed when the compiler did would revoke every grant on an
-    /// upgrade.
-    pub fn fingerprint(&self) -> String {
-        let mut commands: Vec<(&str, Risk)> = self
-            .commands
-            .iter()
-            .map(|c| (c.id.as_str(), c.risk))
-            .collect();
-        commands.sort();
-
-        // These types contain no maps, floats or non-string keys, so
-        // serialization cannot fail and the field order is the declaration
-        // order. That is what makes the digest reproducible.
-        let canonical = serde_json::json!({
-            "needs": &self.needs,
-            "commands": commands,
-        });
-        let text = serde_json::to_string(&canonical).unwrap_or_default();
-        format!("fnv1a64:{:016x}", fnv1a64(text.as_bytes()))
-    }
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// The one place the character set for an app name is decided.
-pub fn valid_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 32 {
-        return false;
-    }
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_lowercase() {
-        return false;
-    }
-    if name.ends_with('-') {
-        return false;
-    }
-    name.chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
-// ---------------------------------------------------------------------------
-// Protocol
-// ---------------------------------------------------------------------------
-
-/// Sent by the core as the first frame on a new connection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Hello {
-    pub protocol: u32,
-    pub core_version: String,
-    /// Which app the core thinks it is talking to. An app that finds its own
-    /// name wrong here is looking at someone else's socket.
-    pub app: String,
-}
-
-/// The app's answer: what it is and what it provides.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Registration {
-    pub protocol: u32,
-    pub app: String,
-    pub version: String,
-    pub commands: Vec<RegisteredCommand>,
-}
-
-/// A command as registered at handshake, with the JSON Schema the palette,
-/// the generated TypeScript types and the agent tools are all built from.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RegisteredCommand {
-    pub id: String,
-    pub summary: String,
-    pub risk: Risk,
-    /// JSON Schema for the parameters. Must be a schema object; an app that
-    /// sends a bare `true` or a string leaves the palette with nothing to
-    /// render and the bus with nothing to validate against.
-    pub params: serde_json::Value,
-}
-
-/// Core to app.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "frame", rename_all = "kebab-case")]
-pub enum CoreFrame {
-    Hello(Hello),
-    /// Dispatch a command. `id` correlates the [`AppFrame::Result`].
-    Call {
-        id: u64,
-        command: String,
-        params: serde_json::Value,
-    },
-    Cancel {
-        id: u64,
-    },
-    /// Fetch a UI asset. The browser's request for `/apps/<name>/<path>`
-    /// becomes this; the app answers from its embedded assets.
-    Ui {
-        id: u64,
-        path: String,
-    },
-    /// Shut down cleanly. Followed by SIGTERM if it is ignored.
-    Stop,
-}
-
-/// App to core.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "frame", rename_all = "kebab-case")]
-pub enum AppFrame {
-    Register(Registration),
-    Result {
-        id: u64,
-        #[serde(default)]
-        result: Option<serde_json::Value>,
-        #[serde(default)]
-        error: Option<String>,
-    },
-    Progress {
-        id: u64,
-        #[serde(default)]
-        fraction: Option<f32>,
-        message: String,
-    },
-    Ui {
-        id: u64,
-        /// Absent means the app has no such asset: a 404, not a failure.
-        #[serde(default)]
-        asset: Option<WireAsset>,
-    },
-    Log {
-        level: String,
-        message: String,
-    },
-}
-
-/// A UI asset on the wire. Frames are JSON, so the bytes are base64; the
-/// app, which knows its own build, states the content type rather than
-/// leaving the core to guess from an extension.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WireAsset {
-    pub content_type: String,
-    pub body: String,
-    /// True for build-hashed files, which may be cached forever. `index.html`
-    /// is never one of them.
-    #[serde(default)]
-    pub immutable: bool,
-}
-
-/// A UI asset once decoded, ready to be a response.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UiAsset {
-    pub content_type: String,
-    pub bytes: Vec<u8>,
-    pub immutable: bool,
-}
-
-impl WireAsset {
-    pub fn decode(&self) -> Result<UiAsset, ProtocolError> {
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(self.body.as_bytes())
-            .map_err(|e| ProtocolError::Malformed(format!("UI asset is not base64: {e}")))?;
-        Ok(UiAsset {
-            content_type: self.content_type.clone(),
-            bytes,
-            immutable: self.immutable,
-        })
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum ProtocolError {
-    #[error(
-        "app \"{app}\" was built against app protocol {found}, and this Deckjack speaks \
-         {min}..={max}. Run `deckjack install {app}` to fetch a build for this core, or \
-         upgrade Deckjack if the app is the newer half"
-    )]
-    Incompatible {
-        app: String,
-        found: u32,
-        min: u32,
-        max: u32,
-    },
-
-    #[error("a frame from the app was {size} bytes, over the {MAX_FRAME_BYTES}-byte limit")]
-    FrameTooLong { size: usize },
-
-    #[error("the app closed the connection")]
-    Closed,
-
-    #[error("the app sent something this core cannot read: {0}")]
-    Malformed(String),
-
-    #[error("socket error: {0}")]
-    Io(#[from] io::Error),
-}
-
-/// Whether an app's protocol number can be talked to at all.
-///
-/// Called at discovery, before anything is launched: refusing after a spawn
-/// would mean a process has already run with the operator's grants to learn
-/// what could have been read off disk.
-pub fn check_protocol(app: &str, found: u32) -> Result<(), ProtocolError> {
-    if (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&found) {
-        Ok(())
-    } else {
-        Err(ProtocolError::Incompatible {
-            app: app.to_string(),
-            found,
-            min: MIN_PROTOCOL_VERSION,
-            max: PROTOCOL_VERSION,
-        })
-    }
-}
-
-pub fn encode_frame<T: Serialize>(frame: &T) -> Result<String, ProtocolError> {
-    let mut line = serde_json::to_string(frame)
-        .map_err(|e| ProtocolError::Malformed(format!("cannot encode frame: {e}")))?;
-    line.push('\n');
-    Ok(line)
-}
-
-pub fn decode_frame<T: DeserializeOwned>(line: &str) -> Result<T, ProtocolError> {
-    if line.len() > MAX_FRAME_BYTES {
-        return Err(ProtocolError::FrameTooLong { size: line.len() });
-    }
-    serde_json::from_str(line).map_err(|e| ProtocolError::Malformed(e.to_string()))
+    Manifest::parse(path, &text)
 }
 
 #[derive(Debug, Error)]
@@ -861,7 +348,13 @@ pub async fn accept_handshake(
         };
 
         conn.send(&CoreFrame::Hello(Hello {
-            protocol: PROTOCOL_VERSION,
+            // The highest version this core speaks that the app can also
+            // speak, not simply the highest this core speaks. An app checks
+            // the number it is told against the window it was COMPILED
+            // with, so a binary built against protocol 1 exits at the
+            // handshake when a protocol-2 core announces 2 — a working app
+            // broken by an upgrade it is not even using.
+            protocol: deckjack_protocol::negotiated(manifest.app.protocol),
             core_version: CORE_VERSION.to_string(),
             app: app.clone(),
         }))
@@ -1298,6 +791,14 @@ pub struct Sandbox {
     /// a rule that gets installed anywhere — it is a rule about what may go
     /// into `policy`, checked in [`LaunchPlan::build`] against every path a
     /// manifest asked for.
+    ///
+    /// What that buys and what it does not, measured on a confined app: it
+    /// cannot open `.deckjack/state.db`, cannot list the working directory
+    /// and cannot write into it. It *can* still `stat` those paths, because
+    /// Landlock governs opening a file and not learning whether one exists —
+    /// there is no metadata right to take away through ABI 5. So an app can
+    /// discover that the state database is there. It cannot read a byte of
+    /// it.
     pub denied: Vec<PathBuf>,
     /// Paths this launcher wanted to grant and could not. See
     /// [`PENDING_FILE_GRANTS`]: it is a limit of [`sandbox::Policy`]'s shape,
@@ -1737,7 +1238,7 @@ pub fn discover(install_dir: &Path, env: &dyn Env) -> Discovery {
             continue;
         }
 
-        let manifest = match Manifest::load(&manifest_path, env) {
+        let manifest = match load_manifest(&manifest_path, env) {
             Ok(manifest) => manifest,
             Err(error) => {
                 found.problems.push(Problem {
@@ -2700,6 +2201,12 @@ pub fn summarize(needs: &Needs) -> String {
     let mut parts: Vec<String> = Vec::new();
     if needs.gpu {
         parts.push("the GPU".to_string());
+    }
+    // Named explicitly, because the fallback sentence for an app that needs
+    // only this one read "nothing beyond the command bus" — which is the
+    // opposite of the truth about the thing being approved.
+    if needs.invoke_commands {
+        parts.push("calling commands on the command bus".to_string());
     }
     if !needs.network.is_empty() {
         parts.push(format!("network access to {}", needs.network.join(", ")));

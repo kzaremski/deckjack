@@ -1,0 +1,188 @@
+/*
+ * The app UI kit's stylesheet.
+ *
+ * Every value here is a `--dj-*` custom property with a fallback. The shell
+ * injects the real token stylesheet into each app's iframe and re-injects it
+ * when the theme changes, so an app follows the desktop's theme without
+ * knowing the theme exists. The fallbacks are for the one case where nothing
+ * injected them: an app opened directly at `/apps/<name>/` in its own tab,
+ * which is useful while building one and should not be unreadable.
+ *
+ * Deliberately small. An app that wants a design system has the whole of its
+ * own bundle to put one in; what belongs here is only what every app needs in
+ * order to look like part of the same computer.
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--dj-color-surface, #16181d);
+  color: var(--dj-color-text, #e7e9ee);
+  font-family: var(--dj-font-sans, system-ui, sans-serif);
+  font-size: var(--dj-text-sm, 0.875rem);
+  line-height: 1.5;
+}
+
+a {
+  color: var(--dj-color-accent, #7aa2f7);
+}
+
+.dj-bar {
+  display: flex;
+  flex: none;
+  gap: var(--dj-space-2, 0.5rem);
+  align-items: center;
+  padding: var(--dj-space-2, 0.5rem) var(--dj-space-3, 0.75rem);
+  border-bottom: 1px solid var(--dj-color-border, #2a2e38);
+  background: var(--dj-color-surface-raised, #1b1e25);
+}
+
+.dj-title {
+  margin: 0;
+  font-size: var(--dj-text-sm, 0.875rem);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.dj-spacer {
+  flex: 1;
+}
+
+.dj-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+/* The two-pane shape most of these apps want: a list and a thing. Collapses
+ * to one pane under the window manager's compact width, because a 360px
+ * window showing two panes shows neither. */
+.dj-list {
+  flex: none;
+  width: 14rem;
+  overflow-y: auto;
+  border-right: 1px solid var(--dj-color-border, #2a2e38);
+}
+
+.dj-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+@media (width <= 32rem) {
+  .dj-body[data-pane="main"] .dj-list,
+  .dj-body[data-pane="list"] .dj-main {
+    display: none;
+  }
+  .dj-list {
+    width: 100%;
+    border-right: 0;
+  }
+}
+
+.dj-row {
+  display: flex;
+  gap: var(--dj-space-2, 0.5rem);
+  align-items: baseline;
+  width: 100%;
+  padding: var(--dj-space-2, 0.5rem) var(--dj-space-3, 0.75rem);
+  border: 0;
+  border-bottom: 1px solid var(--dj-color-border, #2a2e38);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.dj-row:hover,
+.dj-row:focus-visible {
+  background: var(--dj-color-surface-hover, #21242c);
+}
+
+.dj-row[aria-current="true"] {
+  background: var(--dj-color-selection, #2d3344);
+}
+
+.dj-row-name {
+  overflow: hidden;
+  flex: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dj-row-meta {
+  flex: none;
+  color: var(--dj-color-text-muted, #9aa0ad);
+  font-size: var(--dj-text-xs, 0.75rem);
+  font-variant-numeric: tabular-nums;
+}
+
+.dj-button {
+  padding: var(--dj-space-1, 0.25rem) var(--dj-space-2, 0.5rem);
+  border: 1px solid var(--dj-color-border, #2a2e38);
+  border-radius: var(--dj-radius-sm, 4px);
+  background: var(--dj-color-surface-raised, #1b1e25);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.dj-button:hover {
+  border-color: var(--dj-color-accent, #7aa2f7);
+}
+
+.dj-button[disabled] {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.dj-editor {
+  flex: 1;
+  width: 100%;
+  padding: var(--dj-space-3, 0.75rem);
+  border: 0;
+  background: var(--dj-color-surface, #16181d);
+  color: inherit;
+  font-family: var(--dj-font-mono, ui-monospace, monospace);
+  font-size: var(--dj-text-sm, 0.875rem);
+  line-height: 1.6;
+  resize: none;
+}
+
+.dj-editor:focus {
+  outline: none;
+}
+
+.dj-empty,
+.dj-error {
+  margin: 0;
+  padding: var(--dj-space-3, 0.75rem);
+  color: var(--dj-color-text-muted, #9aa0ad);
+}
+
+.dj-error {
+  background: var(--dj-color-danger-soft, #3a1d1d);
+  color: var(--dj-color-text-on-danger, #ffdede);
+}
+
+.dj-status {
+  flex: none;
+  padding: var(--dj-space-1, 0.25rem) var(--dj-space-3, 0.75rem);
+  border-top: 1px solid var(--dj-color-border, #2a2e38);
+  color: var(--dj-color-text-muted, #9aa0ad);
+  font-size: var(--dj-text-xs, 0.75rem);
+}

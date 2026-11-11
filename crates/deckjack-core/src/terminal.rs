@@ -74,7 +74,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::auth::code::os_random;
-use crate::auth::session::SessionId;
+use crate::auth::session::SessionHash;
 
 /// How much recent output is kept per session so a reconnecting browser has
 /// something to render.
@@ -158,13 +158,16 @@ impl std::fmt::Display for TerminalId {
 /// "revoke every session" and "kill all child processes" are one act, and
 /// without this the second half would have to kill every terminal including
 /// the one the operator is sitting at on the host.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opener {
     /// The host's own CLI or the server itself. Never revoked.
     Host,
-    /// A signed-in browser session. `Debug` on [`SessionId`] redacts, so this
-    /// is safe to include in a log line.
-    Client(SessionId),
+    /// A signed-in browser session, identified by the hash of its id rather
+    /// than the id itself. The registry outlives individual requests and is
+    /// dumped into logs and reports, and a session id is a bearer credential;
+    /// a digest identifies the session just as well for the one thing this is
+    /// for, which is matching it against a revocation.
+    Client(SessionHash),
 }
 
 /// Visible window size. Pixel dimensions are only consulted by programs that
@@ -1047,7 +1050,7 @@ impl Registry {
         let session = Arc::new(TerminalSession {
             id: id.clone(),
             label: spec.label(),
-            opened_by: spec.opened_by.clone(),
+            opened_by: spec.opened_by,
             opened_at: self.env.now(),
             env: Arc::clone(&self.env),
             pty,
@@ -1086,6 +1089,24 @@ impl Registry {
     /// Everything held, oldest first, so a client can rebuild its tab strip.
     pub fn list(&self) -> Vec<Info> {
         let mut out: Vec<Info> = lock(&self.live).values().map(|s| s.info()).collect();
+        out.sort_by_key(|i| (i.opened_at, i.id.0.clone()));
+        out
+    }
+
+    /// The terminals one opener owns.
+    ///
+    /// [`Self::list`] reports every terminal on the node, which is right for
+    /// an operator-facing report and wrong for answering a session that asked
+    /// what *it* has open: an [`Info`] carries the [`TerminalId`], and that
+    /// id is all it takes to reach a terminal through [`Self::attach`]. So
+    /// the unfiltered list handed any signed-in session the handle to every
+    /// other session's shell. Callers serving a session use this.
+    pub fn list_for(&self, owner: &Opener) -> Vec<Info> {
+        let mut out: Vec<Info> = lock(&self.live)
+            .values()
+            .filter(|s| &s.opened_by == owner)
+            .map(|s| s.info())
+            .collect();
         out.sort_by_key(|i| (i.opened_at, i.id.0.clone()));
         out
     }
@@ -1131,12 +1152,12 @@ impl Registry {
     /// Close the terminals a session opened, for sign-out and for revocation.
     /// Terminals opened on the host are left alone: the operator at the
     /// keyboard did not sign out.
-    pub fn close_for_session(&self, session: &SessionId) -> usize {
+    pub fn close_for_session(&self, session: &SessionHash) -> usize {
         let doomed: Vec<Arc<TerminalSession>> = {
             let mut live = lock(&self.live);
             let ids: Vec<TerminalId> = live
                 .values()
-                .filter(|s| s.opened_by == Opener::Client(session.clone()))
+                .filter(|s| s.opened_by == Opener::Client(*session))
                 .map(|s| s.id.clone())
                 .collect();
             ids.iter().filter_map(|id| live.remove(id)).collect()

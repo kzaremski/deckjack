@@ -9,9 +9,9 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant, SystemTime};
 
-use super::Event;
 use super::code::Code;
-use super::session::{Session, SessionId};
+use super::session::{Session, SessionHash, SessionId};
+use super::{Event, RevokeReason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
@@ -115,7 +115,14 @@ pub fn verify_response(
 pub struct AuthState {
     limits: Limits,
     code: CodeState,
-    sessions: HashMap<SessionId, Session>,
+    /// Keyed by [`SessionHash`], not by the id itself.
+    ///
+    /// The id is a bearer credential, and this map is what gets persisted and
+    /// restored, so holding the id here would put it on disk. Lookups hash
+    /// the presented cookie and compare digests. The entropy is 256 bits, so
+    /// the hash-map lookup needs no constant-time comparison: there is
+    /// nothing an attacker could narrow down by timing it.
+    sessions: HashMap<SessionHash, Session>,
     failures_by_ip: HashMap<IpAddr, u32>,
     blocked: HashSet<IpAddr>,
     failures_total: u32,
@@ -143,11 +150,109 @@ impl AuthState {
     /// happened — this is only remembering it.
     /// One session by id, as stored.
     pub fn session(&self, id: &SessionId) -> Option<Session> {
-        self.sessions.get(id).cloned()
+        self.sessions.get(&id.hash()).cloned()
     }
 
-    pub fn restore_session(&mut self, id: SessionId, session: Session) {
-        self.sessions.insert(id, session);
+    /// Put a session back from the store, which only ever had its hash.
+    pub fn restore_session(&mut self, hash: SessionHash, session: Session) {
+        self.sessions.insert(hash, session);
+    }
+
+    /// Mint a session for a credential that has already been proven
+    /// somewhere else — today, a passkey assertion — enforcing both of
+    /// [`AuthState::login`]'s rules: the address must not be refused, and
+    /// `max_sessions` is honored by evicting rather than by refusing.
+    ///
+    /// Deliberately not [`AuthState::restore_session`], which is for
+    /// remembering a session that already happened and so counts nothing and
+    /// evicts nothing. This is a new session, so the cap applies.
+    ///
+    /// That direction is the whole point. `passkeyhttp::PasskeyCtx::admit`
+    /// used to call `restore_session` and refuse with `SessionsFull`, which
+    /// the route turned into a 503, while the one-time code path quietly
+    /// evicted — two sign-in paths with two different answers to "the node
+    /// is full", and no test could see the disagreement because neither
+    /// path's tests knew the other existed. Refusing is also the worse
+    /// answer on its own: a passkey is the credential the operator actually
+    /// holds, and four forgotten tabs would lock them out for up to
+    /// `session_max`, 24 hours by default.
+    ///
+    /// The [`AuthState::refusal`] check is here and not only at the route,
+    /// because the route checks it before spending the ceremony and this is
+    /// what makes the check and the eviction one step. Without it, an
+    /// address blocked during the ceremony would not merely slip one extra
+    /// session past the gate — it would destroy a live one on the way in.
+    ///
+    /// Consumes no code and counts no attempt: the proof happened elsewhere.
+    /// Every eviction is announced as [`Event::SessionRevoked`] for the same
+    /// reason `login`'s are — the caller owes the dropped session a deleted
+    /// row, a reaped pty and an audit entry.
+    pub fn admit(
+        &mut self,
+        ip: IpAddr,
+        new_session: &SessionId,
+        now: Now,
+        events: &mut Vec<Event>,
+    ) -> Result<Session, Refusal> {
+        if let Some(r) = self.refusal(ip) {
+            return Err(r);
+        }
+        self.prune(now.wall);
+        self.evict_to_fit(RevokeReason::SessionsFull, events);
+        let session = Session::new(ip, now.wall, now.wall + self.limits.session_max);
+        self.sessions.insert(new_session.hash(), session.clone());
+        // Signing in with a passkey is a person at a keyboard, so it marks
+        // activity exactly as `login` does. The path this replaced went
+        // through `restore_session` and touched nothing, which left
+        // `last_activity` reading as though the node had been idle since the
+        // previous sign-in — and `idle()` is what the auto-lockdown policy
+        // reads, so a passkey sign-in could be followed by a lockdown for
+        // inactivity while somebody was using the node.
+        self.last_activity = now.mono;
+        Ok(session)
+    }
+
+    /// Drop sessions until one more fits under `max_sessions`, announcing
+    /// each as [`Event::SessionRevoked`]. Returns how many went.
+    ///
+    /// ONE copy of this rule, called by both [`AuthState::login`] and
+    /// [`AuthState::admit`]. A second copy is precisely how the two sign-in
+    /// paths came to disagree.
+    ///
+    /// The victim is the session seen least recently, **not** the one
+    /// created first. `created` would evict the desktop session that has
+    /// been open and in use all day in favor of a phone tab opened a minute
+    /// ago — and it is the desktop session that owns the ptys
+    /// `http::Ctx::session_ended` reaps, so keying on `created` kills running
+    /// shells to seat a browser nobody is at. `last_seen` is refreshed by
+    /// every [`AuthState::verify`], and `ws::WsCtx::session_ok` re-verifies
+    /// an open socket every `session_recheck`, so a live connection is never
+    /// the victim and an abandoned cookie always is. `created` breaks ties,
+    /// so the choice is deterministic.
+    fn evict_to_fit(&mut self, reason: RevokeReason, events: &mut Vec<Event>) -> usize {
+        let mut revoked = 0;
+        while self.sessions.len() >= self.limits.max_sessions {
+            let victim = self
+                .sessions
+                .iter()
+                .min_by_key(|(_, s)| (s.last_seen, s.created))
+                .map(|(hash, s)| (*hash, s.ip));
+            match victim {
+                Some((hash, ip)) => {
+                    self.sessions.remove(&hash);
+                    revoked += 1;
+                    // Announced, not just counted. The caller has to delete
+                    // the persisted row and reap what the session owned;
+                    // without this it could only learn how many sessions
+                    // went, never which, so a revoked session came back at
+                    // the next restart and its shell kept running in the
+                    // meantime.
+                    events.push(Event::SessionRevoked { hash, ip, reason });
+                }
+                None => break,
+            }
+        }
+        revoked
     }
 
     pub fn limits(&self) -> &Limits {
@@ -179,6 +284,10 @@ impl AuthState {
     }
 
     /// Unexpired sessions, oldest first.
+    ///
+    /// Ordered by `created`, for an operator looking at a list of devices.
+    /// This is **not** the eviction order — that is `last_seen` — so do not
+    /// read the head of this list as "the one that goes next".
     pub fn sessions(&self, now: SystemTime) -> Vec<&Session> {
         let mut v: Vec<_> = self.sessions.values().filter(|s| now < s.expires).collect();
         v.sort_by_key(|s| s.created);
@@ -216,28 +325,10 @@ impl AuthState {
             self.code = CodeState::Consumed;
             self.failures_by_ip.remove(&ip);
             self.prune(now.wall);
-            let mut revoked = 0;
-            while self.sessions.len() >= self.limits.max_sessions {
-                let oldest = self
-                    .sessions
-                    .iter()
-                    .min_by_key(|(_, s)| s.created)
-                    .map(|(id, _)| id.clone());
-                match oldest {
-                    Some(id) => {
-                        self.sessions.remove(&id);
-                        revoked += 1;
-                    }
-                    None => break,
-                }
-            }
+            let revoked = self.evict_to_fit(RevokeReason::SessionsFull, events);
             self.sessions.insert(
-                new_session,
-                Session {
-                    ip,
-                    created: now.wall,
-                    expires: now.wall + self.limits.session_max,
-                },
+                new_session.hash(),
+                Session::new(ip, now.wall, now.wall + self.limits.session_max),
             );
             self.last_activity = now.mono;
             events.push(Event::Login { ip });
@@ -253,8 +344,27 @@ impl AuthState {
         let global_lock = self.failures_total >= self.limits.global_attempts;
         if ip_blocked {
             self.blocked.insert(ip);
-            self.sessions.retain(|_, s| s.ip != ip);
             events.push(Event::IpBlocked { ip });
+            // Same reason as the `max_sessions` path above, and this is the
+            // one that fires while something hostile is happening: the
+            // address is blocked, so its sessions go, so the caller must be
+            // told which ones in order to reap their shells.
+            let doomed: Vec<SessionHash> = self
+                .sessions
+                .iter()
+                .filter(|(_, s)| s.ip == ip)
+                .map(|(hash, _)| *hash)
+                .collect();
+            for hash in doomed {
+                self.sessions.remove(&hash);
+                // `ip` is both the blocked address and the revoked session's
+                // own, because that is what the filter above selected on.
+                events.push(Event::SessionRevoked {
+                    hash,
+                    ip,
+                    reason: RevokeReason::AddressBlocked,
+                });
+            }
         }
         if global_lock && !self.global_lock {
             self.global_lock = true;
@@ -277,9 +387,17 @@ impl AuthState {
         if self.blocked.contains(&ip) {
             return VerifyOutcome::Blocked;
         }
+        // `get_mut`, because using a session is what makes it recently seen,
+        // and `last_seen` is what `evict_to_fit` picks its victim by. Every
+        // authenticated path funnels through here — `require_session`,
+        // `/auth/verify`, the passkey routes' own session check and
+        // `ws::WsCtx::session_ok`'s recheck of an open socket — so this one
+        // line is what keeps a live connection off the chopping block.
         let valid = session
-            .and_then(|id| self.sessions.get(id))
-            .is_some_and(|s| s.is_valid_for(ip, now.wall));
+            .and_then(|id| self.sessions.get_mut(&id.hash()))
+            .filter(|s| s.is_valid_for(ip, now.wall))
+            .map(|s| s.last_seen = now.wall)
+            .is_some();
         if valid {
             self.last_activity = now.mono;
             VerifyOutcome::Ok
@@ -290,7 +408,7 @@ impl AuthState {
 
     /// Revoke one session. Returns whether it existed.
     pub fn logout(&mut self, session: &SessionId) -> bool {
-        self.sessions.remove(session).is_some()
+        self.sessions.remove(&session.hash()).is_some()
     }
 
     /// Replace the code (`code --new`).
@@ -308,11 +426,15 @@ impl AuthState {
         self.code = CodeState::Active(code);
     }
 
-    /// Revoke every session. Returns how many there were.
-    pub fn kick(&mut self) -> usize {
-        let n = self.sessions.len();
-        self.sessions.clear();
-        n
+    /// Revoke every session. Returns the hashes of the ones that went, so
+    /// the caller can delete the persisted rows and reap what each owned.
+    ///
+    /// This is lockdown's step 1. Returning the list rather than a count is
+    /// what lets the kill switch be sure: a count would leave the rows in
+    /// `state.db`, and the next start would restore every session the
+    /// lockdown had just revoked.
+    pub fn kick(&mut self) -> Vec<SessionHash> {
+        self.sessions.drain().map(|(hash, _)| hash).collect()
     }
 
     pub fn idle(&self, now: Now) -> Duration {
@@ -627,7 +749,13 @@ mod tests {
     }
 
     #[test]
-    fn max_sessions_revokes_oldest() {
+    fn max_sessions_revokes_the_session_seen_least_recently() {
+        // Was `max_sessions_revokes_oldest`, and it no longer described the
+        // code: nothing called `verify` between the sign-ins, so every
+        // session's `last_seen` equalled its `created` and the test could not
+        // tell creation order from staleness. It would have gone on passing
+        // under either rule. The `verify` below is what makes the two
+        // orderings disagree, so this test now pins the one the code uses.
         let mut lim = limits();
         lim.max_sessions = 2;
         let mut s = AuthState::new(lim, Code::parse(CODE).unwrap(), t0());
@@ -635,17 +763,192 @@ mod tests {
         s.rotate_code(Code::parse(CODE).unwrap());
         login(&mut s, ip(2), CODE, 2, later(t0(), 10));
         s.rotate_code(Code::parse(CODE).unwrap());
+
+        // Session 1 was created first but is used last, so session 2 is the
+        // stale one — the opposite of what creation order would pick.
+        assert_eq!(
+            s.verify(ip(2), Some(&sid(1)), later(t0(), 15)),
+            VerifyOutcome::Ok
+        );
+
         assert_eq!(
             login(&mut s, ip(2), CODE, 3, later(t0(), 20)),
             LoginOutcome::Success { revoked: 1 }
         );
         let now = later(t0(), 30);
         assert_eq!(
-            s.verify(ip(2), Some(&sid(1)), now),
-            VerifyOutcome::NoSession
+            s.verify(ip(2), Some(&sid(2)), now),
+            VerifyOutcome::NoSession,
+            "the abandoned session is what should have gone"
         );
-        assert_eq!(s.verify(ip(2), Some(&sid(2)), now), VerifyOutcome::Ok);
+        assert_eq!(
+            s.verify(ip(2), Some(&sid(1)), now),
+            VerifyOutcome::Ok,
+            "the session that was in use got evicted"
+        );
         assert_eq!(s.verify(ip(2), Some(&sid(3)), now), VerifyOutcome::Ok);
+    }
+
+    #[test]
+    fn eviction_takes_the_least_recently_seen_session_not_the_oldest() {
+        // The desktop signs in first and stays in use; the phone tab signs in
+        // later and is abandoned. Keying on `created` evicts the desktop —
+        // and `http::Ctx::session_ended` reaps its ptys, so that choice kills
+        // running shells to seat a browser nobody is at.
+        let mut s = AuthState::new(
+            Limits {
+                max_sessions: 2,
+                ..limits()
+            },
+            Code::parse(CODE).unwrap(),
+            t0(),
+        );
+
+        let desktop = sid(1);
+        assert_eq!(
+            s.login(ip(2), "k7qm3xwd", desktop.clone(), t0(), &mut Vec::new()),
+            LoginOutcome::Success { revoked: 0 }
+        );
+
+        let phone = sid(2);
+        s.admit(ip(3), &phone, later(t0(), 10), &mut Vec::new())
+            .expect("a node that is not blocked admits a proven credential");
+
+        // The desktop is used again; the phone tab is never touched.
+        assert_eq!(
+            s.verify(ip(2), Some(&desktop), later(t0(), 20)),
+            VerifyOutcome::Ok
+        );
+
+        let mut ev = Vec::new();
+        let laptop = sid(3);
+        s.admit(ip(4), &laptop, later(t0(), 30), &mut ev)
+            .expect("a full node evicts instead of refusing");
+
+        assert_eq!(
+            ev,
+            vec![Event::SessionRevoked {
+                hash: phone.hash(),
+                ip: ip(3),
+                reason: RevokeReason::SessionsFull,
+            }],
+            "the abandoned tab is what should have gone"
+        );
+        assert!(
+            s.session(&desktop).is_some(),
+            "the session that was in use got evicted"
+        );
+        assert!(s.session(&phone).is_none());
+        assert!(s.session(&laptop).is_some());
+    }
+
+    #[test]
+    fn admitting_on_a_full_node_evicts_exactly_one_instead_of_refusing() {
+        // The defect this closes: `passkeyhttp::PasskeyCtx::admit` answered
+        // `SessionsFull` here, which the route turned into a 503, while the
+        // one-time code path evicted. Two sign-ins, two answers to "the node
+        // is full", and neither path's tests knew the other existed.
+        let mut s = state(); // max_sessions: 1
+        let first = sid(1);
+        s.admit(ip(2), &first, t0(), &mut Vec::new())
+            .expect("a fresh node admits");
+
+        let mut ev = Vec::new();
+        let second = sid(2);
+        let session = s
+            .admit(ip(3), &second, later(t0(), 5), &mut ev)
+            .expect("a proven credential was refused a session on a full node");
+
+        assert_eq!(ev.len(), 1, "exactly one session should have been evicted");
+        assert!(matches!(
+            ev[0],
+            Event::SessionRevoked {
+                reason: RevokeReason::SessionsFull,
+                ..
+            }
+        ));
+        assert!(s.session(&first).is_none(), "nothing was evicted");
+        assert_eq!(s.session(&second).map(|s| s.ip), Some(ip(3)));
+        assert_eq!(
+            session.last_seen, session.created,
+            "a session is seen at the moment it is minted"
+        );
+        assert_eq!(
+            s.sessions(later(t0(), 5).wall).len(),
+            1,
+            "the cap was exceeded rather than honored"
+        );
+    }
+
+    #[test]
+    fn admitting_from_a_blocked_address_is_refused_and_evicts_nothing() {
+        // `admit` applies `refusal` for the same reason `login` does, and
+        // the eviction is what makes it matter: the route checks `refusal`
+        // before it spends the ceremony, so without a second check inside
+        // the lock an address blocked in between would not merely slip one
+        // session past the cap — it would destroy a live one on the way in.
+        //
+        // A passkey assertion is not a guessable secret, so the per-address
+        // block is not here to slow down guessing. It is here because the
+        // route already refuses a blocked address, and a state machine that
+        // disagrees with its own caller is how the 503 came about in the
+        // first place. Loosening that policy — letting a passkey be the way
+        // back in from a blocked address — is a deliberate change to make
+        // somewhere it can be argued, not a side effect of this one.
+        let mut s = state(); // max_sessions: 1, per_ip_attempts: 3
+        let live = sid(1);
+        s.admit(ip(3), &live, t0(), &mut Vec::new())
+            .expect("a fresh node admits");
+
+        for n in 1..=3 {
+            login(&mut s, ip(2), "wrong", 9, later(t0(), n));
+        }
+        assert!(s.is_blocked(ip(2)));
+
+        let mut ev = Vec::new();
+        assert_eq!(
+            s.admit(ip(2), &sid(2), later(t0(), 10), &mut ev),
+            Err(Refusal::IpBlocked)
+        );
+        assert!(ev.is_empty(), "a refused admission revoked something");
+        assert!(
+            s.session(&live).is_some(),
+            "a refused admission evicted a live session"
+        );
+        assert!(s.session(&sid(2)).is_none());
+    }
+
+    #[test]
+    fn admitting_marks_activity() {
+        // The path this replaced went through `restore_session`, which
+        // touched nothing, so `last_activity` still read as of the previous
+        // sign-in. `idle()` is what the auto-lockdown policy reads, so a
+        // passkey sign-in could be followed by a lockdown for inactivity
+        // while somebody was sitting at the node.
+        let mut s = state();
+        s.admit(ip(2), &sid(1), later(t0(), 50), &mut Vec::new())
+            .expect("a fresh node admits");
+        assert_eq!(s.idle(later(t0(), 100)), Duration::from_secs(50));
+    }
+
+    #[test]
+    fn restoring_sessions_at_startup_evicts_nothing() {
+        // `restore_session` is remembering, not admitting: the session already
+        // happened, so it consumes no code, counts no attempt and revokes
+        // nothing. If it ever starts enforcing the cap, a restart silently
+        // signs people out and `Ctx::apply` deletes the rows behind them.
+        let mut s = state(); // max_sessions: 1
+        for n in 1..=3u8 {
+            s.restore_session(
+                sid(n).hash(),
+                Session::new(ip(n), t0().wall, t0().wall + Duration::from_secs(3600)),
+            );
+        }
+        assert_eq!(
+            s.sessions(t0().wall).len(),
+            3,
+            "restoring state at startup must not throw sessions away"
+        );
     }
 
     #[test]
@@ -674,7 +977,7 @@ mod tests {
         login(&mut s, ip(2), CODE, 2, t0());
         assert!(s.logout(&sid(1)));
         assert!(!s.logout(&sid(1)));
-        assert_eq!(s.kick(), 1);
+        assert_eq!(s.kick(), vec![sid(2).hash()]);
         assert_eq!(
             s.verify(ip(2), Some(&sid(2)), t0()),
             VerifyOutcome::NoSession

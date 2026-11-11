@@ -1,0 +1,20 @@
+[package]
+name = "deckjack-app"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+authors.workspace = true
+repository.workspace = true
+description = "Write a Deckjack app: the socket, the handshake and the frame loop, done"
+
+[dependencies]
+deckjack-protocol.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+mime_guess.workspace = true
+rust-embed.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
