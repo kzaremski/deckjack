@@ -239,6 +239,52 @@ export function createBus(env: BusEnv): Bus {
   }
 
   /**
+   * Answer everything still waiting. A caller that is never answered awaits
+   * forever, so the UI shows a command running against a node that is gone.
+   */
+  function failPending(message: string) {
+    for (const [key, resolve] of pending) {
+      resolve({ id: key, status: "error", message });
+    }
+    pending.clear();
+    progressHandlers.clear();
+  }
+
+  /**
+   * Abandon this connection and start trying for a new one.
+   *
+   * Everything here has to happen whether or not the socket cooperates. A
+   * socket the heartbeat condemned is, by definition, one that is not
+   * reporting what happens to it — so waiting for its `onclose` to answer
+   * in-flight calls would leave them hanging exactly when the node is gone.
+   * Its handlers are detached first for the same reason in reverse: if it
+   * *does* fire `onclose` afterwards, the close path must not run twice and
+   * advance the reconnect backoff a second time, which would turn the first
+   * prompt retry into a longer wait nobody earned.
+   */
+  function giveUp(message: string) {
+    const dead = socket;
+    socket = null;
+    stopHeartbeat();
+    rtt.value = null;
+    lastError.value = message;
+    if (dead) {
+      dead.onopen = null;
+      dead.onclose = null;
+      dead.onerror = null;
+      dead.onmessage = null;
+      try {
+        dead.close();
+      } catch {
+        // Already gone. Nothing here depends on the close succeeding.
+      }
+    }
+    failPending("connection to the shell node closed");
+    status.value = "connecting";
+    scheduleReconnect();
+  }
+
+  /**
    * One beat: declare the connection dead if nothing has arrived for too
    * long, otherwise probe and schedule the next.
    *
@@ -250,24 +296,11 @@ export function createBus(env: BusEnv): Bus {
       stopHeartbeat();
       return;
     }
-    const since = lastSeenAt.value === null ? 0 : env.now() - lastSeenAt.value;
-    if (since > SILENCE_IS_DEAD_MS) {
-      lastError.value = online.value
-        ? "the shell node stopped answering"
-        : "this device is offline";
-      // Close it rather than waiting for TCP. `onclose` does the rest —
-      // failing in-flight calls, reconnecting — so a dead connection and a
-      // closed one follow exactly one path.
-      stopHeartbeat();
-      const dead = socket;
-      socket = null;
-      status.value = "connecting";
-      try {
-        dead.close();
-      } catch {
-        // Already gone; `onclose` may or may not fire, so reconnect anyway.
-      }
-      scheduleReconnect();
+    const seenAt = lastSeenAt.value ?? env.now();
+    if (env.now() - seenAt > SILENCE_IS_DEAD_MS) {
+      giveUp(
+        online.value ? "the shell node stopped answering" : "this device is offline",
+      );
       return;
     }
     pingSeq += 1;
@@ -280,7 +313,14 @@ export function createBus(env: BusEnv): Bus {
       if (oldest !== undefined) sentAt.delete(oldest);
     }
     send({ type: "ping", token });
-    cancelBeat = env.delay(HEARTBEAT_MS, beat);
+    // Never sleep past the deadline. Beating on a fixed interval meant the
+    // death check only ran when a probe happened to come due, so silence that
+    // began just after a beat went unnoticed for a further HEARTBEAT_MS — a
+    // node could be gone for 34s while the shell still claimed it was there.
+    // Landing the next beat exactly on the deadline makes the promise the one
+    // SILENCE_IS_DEAD_MS actually states.
+    const untilDeadline = seenAt + SILENCE_IS_DEAD_MS - env.now();
+    cancelBeat = env.delay(Math.max(250, Math.min(HEARTBEAT_MS, untilDeadline)), beat);
   }
 
   function startHeartbeat() {
@@ -390,12 +430,7 @@ export function createBus(env: BusEnv): Bus {
       socket = null;
       stopHeartbeat();
       rtt.value = null;
-      // Every in-flight call has to be answered or callers hang forever.
-      for (const [key, resolve] of pending) {
-        resolve({ id: key, status: "error", message: "connection to the shell node closed" });
-      }
-      pending.clear();
-      progressHandlers.clear();
+      failPending("connection to the shell node closed");
       status.value = status.value === "open" ? "connecting" : "detached";
       scheduleReconnect();
     };
