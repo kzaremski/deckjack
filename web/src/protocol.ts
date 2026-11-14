@@ -47,7 +47,22 @@ export interface Cancel {
   id: CorrelationId;
 }
 
-export type ClientFrame = Hello | Invoke | Cancel;
+/**
+ * Liveness probe. The node answers with `pong`, echoing `token`.
+ *
+ * WebSocket already has ping/pong at the protocol level, and it is no use
+ * here: the browser answers those itself in the network stack and never tells
+ * the page. So a node that vanished without a FIN leaves the socket `OPEN` to
+ * JavaScript until TCP gives up — minutes — and the shell spends every one of
+ * them claiming it is connected. This frame is the only way a page can learn
+ * that a whole round trip still completes.
+ */
+export interface Ping {
+  type: "ping";
+  token?: string;
+}
+
+export type ClientFrame = Hello | Invoke | Cancel | Ping;
 
 // --- server -> client -------------------------------------------------------
 
@@ -104,10 +119,19 @@ export interface EventFrame {
   at_ms: number;
 }
 
-export type ServerFrame = Welcome | ProgressFrame | ResponseFrame | EventFrame;
+/** The answer to `ping`, echoing its token. Carries no state by design. */
+export interface PongFrame {
+  type: "pong";
+  token?: string;
+}
+
+export type ServerFrame = Welcome | ProgressFrame | ResponseFrame | EventFrame | PongFrame;
 
 export function isWelcome(f: ServerFrame): f is Welcome {
   return f.type === "welcome";
+}
+export function isPong(f: ServerFrame): f is PongFrame {
+  return f.type === "pong";
 }
 export function isProgress(f: ServerFrame): f is ProgressFrame {
   return f.type === "progress";

@@ -4,9 +4,10 @@ import { onBeforeUnmount, onMounted, watch } from "vue";
 import CommandPalette from "./components/CommandPalette.vue";
 import CompactShell from "./components/CompactShell.vue";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
+import ConnectionCard from "./components/ConnectionCard.vue";
 import DesktopShell from "./components/DesktopShell.vue";
-import Dock from "./components/Dock.vue";
 import NoticeStack from "./components/NoticeStack.vue";
+import TopBar from "./components/TopBar.vue";
 import WindowSwitcher from "./components/WindowSwitcher.vue";
 import { provideShell, type Shell } from "./shell/context.ts";
 
@@ -92,14 +93,24 @@ watch(
 
 <template>
   <div class="shell" :data-mode="shell.viewport.mode.value">
+    <!--
+      The bar is first in the flow, so it sits at the top in both modes. It is
+      one bar for both: compact used to carry its own header as well, which
+      meant a phone spent two rows of a short screen saying where it was.
+    -->
+    <TopBar />
     <DesktopShell v-if="shell.viewport.mode.value === 'desktop'" />
     <CompactShell v-else />
-    <Dock />
 
     <CommandPalette />
     <WindowSwitcher />
     <NoticeStack />
     <ConfirmDialog />
+    <!--
+      Last, so it covers everything above it. While it is up the shell cannot
+      be operated at all, which is the honest state: the node holds the work.
+    -->
+    <ConnectionCard />
   </div>
 </template>
 

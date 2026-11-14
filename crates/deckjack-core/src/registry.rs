@@ -867,9 +867,21 @@ pub trait NodeStore: Send + Sync {
 
 /// A registry that forgets its nodes when the process ends.
 ///
-/// Stopgap: the `nodes` table and the three `Store` methods behind it do not
-/// exist yet (see this module's integration notes). Everything works with
-/// this; the only loss is that a node is unknown until it next registers.
+/// Stopgap, though not for the reason this said until now. It claimed the
+/// `nodes` table did not exist; it does — `store.rs` creates it in
+/// `MIGRATIONS[1]` and it is in every live database. The missing half is the
+/// other one: `Store` does not implement [`NodeStore`], no SQL anywhere reads
+/// or writes that table, and the only implementors are this type and the test
+/// file's `MemStore`.
+///
+/// Correct for now rather than a defect. Nothing registers a node because no
+/// node daemon exists, and `Bus::resolve_node` refuses a non-local node
+/// instead of consulting a registry — see Phase 2 in `docs/DESIGN.md`, where
+/// the inter-node transport is still an open question. Wiring persistence
+/// today would store exactly one node that nothing queries.
+///
+/// The pointer to "this module's integration notes" is gone with it: there is
+/// no such section in this file.
 pub struct NoPersistence;
 
 impl NodeStore for NoPersistence {

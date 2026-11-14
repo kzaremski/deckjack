@@ -3,6 +3,7 @@ import { computed, ref, shallowRef, type ComputedRef, type Ref } from "vue";
 import {
   PROTOCOL_VERSION,
   isEvent,
+  isPong,
   isProgress,
   isResponse,
   isWelcome,
@@ -25,12 +26,18 @@ import {
  * command, so there is no path through the UI that does something the bus
  * cannot describe.
  *
- * The server side does not exist yet (there is sign-in and nothing behind
- * it), so the bus starts `detached`: calls resolve locally as `ok` and the
- * stores keep their optimistic state. That is a scaffold, not a mock — when
- * `/ws` answers, nothing in the components changes. The one thing it must
- * never do is pretend a *destructive* command succeeded, so those are
- * refused while detached.
+ * The bus is the only thing that decides whether the shell is working. When
+ * it is not `open`, *nothing* is: every call is refused and says so.
+ *
+ * It used to resolve `shell.*` calls locally as `ok` while disconnected, on
+ * the grounds that the server side did not exist yet. It does now, and that
+ * scaffold had become a lie with a specific shape: every window the operator
+ * opened, moved or closed reported success to a node that never heard about
+ * it, so the shell looked alive and lost the work. A disconnected workspace
+ * that refuses is honest; one that accepts is a workspace you cannot trust
+ * when it reconnects.
+ *
+ * Liveness is measured, not assumed — see `HEARTBEAT_MS`.
  */
 
 export type BusStatus = "connecting" | "open" | "detached" | "closed";
@@ -59,6 +66,18 @@ export interface BusEnv {
   now(): number;
   /** Schedules a reconnect; injected so backoff is testable without waiting. */
   delay(ms: number, fn: () => void): () => void;
+  /**
+   * Whether the device has a network at all.
+   *
+   * Separate from the bus's own status because the two failures want
+   * different words: "this device is offline" is the operator's wifi, while
+   * "the node is unreachable" with a network present means the machine their
+   * work lives on is down. Telling them to check the wrong one wastes their
+   * time.
+   */
+  online(): boolean;
+  /** Subscribes to network up/down; returns an unsubscribe. */
+  watchOnline(fn: (online: boolean) => void): () => void;
 }
 
 export function browserBusEnv(path = "/ws"): BusEnv {
@@ -71,15 +90,39 @@ export function browserBusEnv(path = "/ws"): BusEnv {
       const handle = window.setTimeout(fn, ms);
       return () => window.clearTimeout(handle);
     },
+    // `navigator.onLine` is only trustworthy when it says false: a captive
+    // portal reports true. So it is used to explain a failure the bus already
+    // detected, never to decide that one happened.
+    online: () => navigator.onLine,
+    watchOnline(fn) {
+      const up = () => fn(true);
+      const down = () => fn(false);
+      window.addEventListener("online", up);
+      window.addEventListener("offline", down);
+      return () => {
+        window.removeEventListener("online", up);
+        window.removeEventListener("offline", down);
+      };
+    },
   };
 }
 
 export interface Bus {
   status: Ref<BusStatus>;
-  /** True while the shell is running without a server behind it. */
+  /** True whenever the shell is not connected to its node. */
   detached: ComputedRef<boolean>;
   node: Ref<{ name: string; generation: number } | null>;
   lastError: Ref<string | null>;
+  /** When a frame last arrived, by `env.now()`. Null before the first one. */
+  lastSeenAt: Ref<number | null>;
+  /** Last measured round trip in ms, or null if no pong has come back yet. */
+  rtt: Ref<number | null>;
+  /** The device's network, as distinct from whether the node answers. */
+  online: Ref<boolean>;
+  /** When the next automatic attempt is due, by `env.now()`. */
+  retryAt: Ref<number | null>;
+  /** Try again now, instead of waiting out the backoff. */
+  reconnectNow(): void;
   call(
     id: string,
     params?: Record<string, unknown>,
@@ -150,6 +193,23 @@ function topicToEvent(topic: string, payload: unknown): ServerEvent {
 /** Reconnect backoff, capped: a laptop that sleeps should not hammer the node. */
 const BACKOFF_MS = [250, 500, 1000, 2000, 5000, 10000];
 
+/**
+ * How often to prove the connection is alive, and how long silence is allowed
+ * to last before it is declared dead.
+ *
+ * `readyState === OPEN` only means TCP has not given up. A node that was
+ * killed, a laptop lid that closed, a phone that changed networks: none send
+ * a FIN, so the socket stays "open" for minutes while every command sent into
+ * it disappears. The only reliable evidence is a round trip that completed.
+ *
+ * The timeout is deliberately more than two beats. One missed pong on a phone
+ * handing off between cells is normal and must not tear down a working
+ * session; three missed in a row is a connection that is not coming back on
+ * its own.
+ */
+const HEARTBEAT_MS = 8000;
+const SILENCE_IS_DEAD_MS = 26000;
+
 export function createBus(env: BusEnv): Bus {
   const status = ref<BusStatus>("connecting");
   const node = shallowRef<{ name: string; generation: number } | null>(null);
@@ -158,11 +218,76 @@ export function createBus(env: BusEnv): Bus {
   const pending = new Map<CorrelationId, (outcome: CommandOutcome) => void>();
   const progressHandlers = new Map<CorrelationId, (p: Progress, seq: number) => void>();
 
+  const lastSeenAt = ref<number | null>(null);
+  const rtt = ref<number | null>(null);
+  const online = ref(env.online());
+  const retryAt = ref<number | null>(null);
+
   let socket: SocketLike | null = null;
   let askToConfirm: ConfirmAsker | null = null;
   let seq = 0;
   let attempt = 0;
   let cancelRetry: (() => void) | null = null;
+  let cancelBeat: (() => void) | null = null;
+  let pingSeq = 0;
+  let sentAt = new Map<string, number>();
+
+  function stopHeartbeat() {
+    cancelBeat?.();
+    cancelBeat = null;
+    sentAt = new Map();
+  }
+
+  /**
+   * One beat: declare the connection dead if nothing has arrived for too
+   * long, otherwise probe and schedule the next.
+   *
+   * The check runs *before* the probe so a socket that went silent is caught
+   * on the next beat rather than one beat later.
+   */
+  function beat() {
+    if (status.value !== "open" || !socket) {
+      stopHeartbeat();
+      return;
+    }
+    const since = lastSeenAt.value === null ? 0 : env.now() - lastSeenAt.value;
+    if (since > SILENCE_IS_DEAD_MS) {
+      lastError.value = online.value
+        ? "the shell node stopped answering"
+        : "this device is offline";
+      // Close it rather than waiting for TCP. `onclose` does the rest —
+      // failing in-flight calls, reconnecting — so a dead connection and a
+      // closed one follow exactly one path.
+      stopHeartbeat();
+      const dead = socket;
+      socket = null;
+      status.value = "connecting";
+      try {
+        dead.close();
+      } catch {
+        // Already gone; `onclose` may or may not fire, so reconnect anyway.
+      }
+      scheduleReconnect();
+      return;
+    }
+    pingSeq += 1;
+    const token = `p${pingSeq}`;
+    sentAt.set(token, env.now());
+    // Only the last few round trips are of interest, and an unanswered ping
+    // must not accumulate for the life of the connection.
+    if (sentAt.size > 8) {
+      const oldest = sentAt.keys().next().value;
+      if (oldest !== undefined) sentAt.delete(oldest);
+    }
+    send({ type: "ping", token });
+    cancelBeat = env.delay(HEARTBEAT_MS, beat);
+  }
+
+  function startHeartbeat() {
+    stopHeartbeat();
+    lastSeenAt.value = env.now();
+    cancelBeat = env.delay(HEARTBEAT_MS, beat);
+  }
 
   function emit(event: ServerEvent) {
     if (event.kind === "node") node.value = { name: event.name, generation: event.generation };
@@ -177,6 +302,7 @@ export function createBus(env: BusEnv): Bus {
     const wait = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)]!;
     attempt += 1;
     cancelRetry?.();
+    retryAt.value = env.now() + wait;
     cancelRetry = env.delay(wait, connect);
   }
 
@@ -199,10 +325,15 @@ export function createBus(env: BusEnv): Bus {
       attempt = 0;
       status.value = "open";
       lastError.value = null;
+      retryAt.value = null;
       send({ type: "hello", protocol: PROTOCOL_VERSION, client: "deckjack-shell" });
+      startHeartbeat();
     };
 
     sock.onmessage = (ev) => {
+      // Any frame is proof of life, whatever it turns out to be — including
+      // one that fails to parse, which still reached us from a live node.
+      lastSeenAt.value = env.now();
       if (typeof ev.data !== "string") return;
       let frame: ServerFrame;
       try {
@@ -218,6 +349,20 @@ export function createBus(env: BusEnv): Bus {
         // The node identifies itself in the handshake, so the shell can show
         // which machine is hosting without a second round trip.
         emit({ kind: "node", name: frame.host_name, generation: frame.connection });
+        return;
+      }
+
+      if (isPong(frame)) {
+        // Matched by token so a pong that arrives after its beat does not get
+        // credited to a later, faster one and flatter the measured latency.
+        const token = frame.token;
+        if (token !== undefined) {
+          const at = sentAt.get(token);
+          if (at !== undefined) {
+            rtt.value = env.now() - at;
+            sentAt.delete(token);
+          }
+        }
         return;
       }
 
@@ -243,6 +388,8 @@ export function createBus(env: BusEnv): Bus {
 
     sock.onclose = () => {
       socket = null;
+      stopHeartbeat();
+      rtt.value = null;
       // Every in-flight call has to be answered or callers hang forever.
       for (const [key, resolve] of pending) {
         resolve({ id: key, status: "error", message: "connection to the shell node closed" });
@@ -254,25 +401,50 @@ export function createBus(env: BusEnv): Bus {
     };
   }
 
+  // A network that just came back is worth one immediate attempt: the backoff
+  // may be sitting on a ten second wait for a node that is reachable again.
+  env.watchOnline((up) => {
+    online.value = up;
+    if (up && status.value !== "open" && status.value !== "closed") {
+      attempt = 0;
+      connect();
+    }
+  });
+
   return {
     status,
     detached: computed(() => status.value !== "open"),
     node,
     lastError,
+    lastSeenAt,
+    rtt,
+    online,
+    retryAt,
+    reconnectNow() {
+      if (status.value === "open") return;
+      attempt = 0;
+      cancelRetry?.();
+      cancelRetry = null;
+      retryAt.value = null;
+      connect();
+    },
     async call(id, params, _target, onProgress) {
       seq += 1;
       const correlation = `c${seq}`;
 
       if (status.value !== "open" || !socket) {
-        // Optimistic UI for local shell state is the point: window moves,
-        // theme changes and layout changes are the operator's own and are
-        // allowed to proceed. Anything that would touch a real machine is
-        // not, and says why instead of lying.
-        if (id.startsWith("shell.")) return { id: correlation, status: "ok" };
+        // No exception for `shell.*`. Those are exactly the window opens,
+        // moves and closes whose record lives on the node, so resolving them
+        // `ok` here is the shell telling the operator it did something it did
+        // not do. Commands that are genuinely client-only — the palette, the
+        // theme, the density, the layout mode — never reach the bus at all,
+        // so refusing everything here costs them nothing.
         return {
           id: correlation,
           status: "error",
-          message: `no command bus: ${id} needs the shell node, which is not connected yet`,
+          message: online.value
+            ? `not connected to ${env.url.replace(/^wss?:\/\//, "").replace(/\/ws$/, "")}: ${id} was not run`
+            : `this device is offline: ${id} was not run`,
         };
       }
 
@@ -331,6 +503,8 @@ export function createBus(env: BusEnv): Bus {
     connect,
     close() {
       cancelRetry?.();
+      stopHeartbeat();
+      retryAt.value = null;
       status.value = "closed";
       socket?.close();
       socket = null;

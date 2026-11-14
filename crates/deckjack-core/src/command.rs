@@ -1816,7 +1816,21 @@ pub enum Refused {
         node: NodeId,
     },
 
-    #[error("agents are paused; resume them from the menu or run `deckjack unlock`")]
+    // Names no affordance that does not exist. The previous wording sent the
+    // operator to "the menu", and there is no menu: the shell dispatches from
+    // a command palette, and nothing anywhere can resume agents —
+    // `Bus::resume_agents` has no non-test caller and no command id reaches
+    // it. Bare `deckjack unlock` was wrong too; it bails asking for
+    // `--recovery-code`.
+    //
+    // One variant has to cover both causes, because it carries no field saying
+    // which: `agents_paused()` reads the operator's lever and the lockdown's
+    // hold together.
+    #[error(
+        "agents are paused on this node, by the operator's lever or by a lockdown; \
+         nothing an agent sends can lift it — a lockdown ends only with \
+         `deckjack unlock --recovery-code CODE` on the host"
+    )]
     AgentsPaused,
 
     #[error(
@@ -2181,9 +2195,10 @@ impl Bus {
     /// than when somebody remembers to say so.
     ///
     /// Read by the two admission gates ([`Bus::plan`] and
-    /// [`Bus::dispatch_approved`]) and by
-    /// [`crate::agentbridge::AgentBridge::tools`], which is what keeps the
-    /// offered list and the refusal from disagreeing.
+    /// [`Bus::dispatch_approved`]) and by both tool-list paths —
+    /// [`crate::agentbridge::AgentBridge::tools`], which is the live one, and
+    /// [`Bus::tools`], its lower-level twin — which is what keeps the offered
+    /// list and the refusal from disagreeing.
     pub fn agents_paused(&self) -> bool {
         self.agents_paused.load(Ordering::SeqCst) || self.halt.agents_halted()
     }
@@ -2196,6 +2211,22 @@ impl Bus {
 
     /// The MCP tool surface for one agent session.
     pub fn tools(&self, session: &AgentSessionId) -> Vec<ToolDefinition> {
+        // A held agent is offered nothing, which is the same read `plan` and
+        // `dispatch_approved` refuse by.
+        //
+        // `AgentBridge::tools` is the live list path and gates there already,
+        // so this is not closing a reachable hole — it is closing the gap
+        // between two methods that look interchangeable. This one is public on
+        // a public type and reads like THE tool surface, so the first caller
+        // to pick it (the Phase 2 node daemon is the obvious candidate) would
+        // serve a full tool list during a pause or a lockdown without ever
+        // touching this file.
+        //
+        // `Registry::tools` deliberately stays pause-agnostic: a registry
+        // cannot see a hold, and `Bus` is the only layer that sees both.
+        if self.agents_paused() {
+            return Vec::new();
+        }
         // Offered if ANY ONE grant allows it, which is what the dispatch
         // check will decide too. Asking per grant and merging the ANSWERS is
         // not the same as merging the grants and asking once: the second

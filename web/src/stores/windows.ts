@@ -4,11 +4,13 @@ import {
   cascade,
   clampToWorkArea,
   rectForZone,
+  tileMasterStack,
   tileRow,
   type Rect,
   type Size,
   type SnapZone,
 } from "../shell/geometry.ts";
+import { safeStorage } from "../tokens/runtime.ts";
 import type { WireWindow } from "../protocol.ts";
 import { apps, isAppId, unknownApp, type AppContract, type AppId } from "./apps.ts";
 import type { Bus } from "./bus.ts";
@@ -47,9 +49,28 @@ export interface ShellWindow {
   minSize: Size;
 }
 
+/**
+ * How the desktop arranges windows.
+ *
+ * Floating is the default, and deliberately: this is a workspace people drag
+ * windows around in, and a shell that tiles the moment a second window opens
+ * takes that away without being asked. Tiling is a mode you turn on, the way
+ * you choose a layout in i3 rather than the way a tiling WM imposes one.
+ */
+export type LayoutMode = "floating" | "tiling";
+
+/** Where the chosen mode is remembered, per device, like the theme. */
+const LAYOUT_KEY = "deckjack.layout";
+
 export interface WindowsEnv {
   /** A fresh window id. Injected so ids are predictable outside a browser. */
   id(): string;
+  /**
+   * Per-device preference storage. Injected rather than read ambiently for the
+   * reason `runtime.ts` gives: `localStorage` is not merely missing in a
+   * private window, reading it throws.
+   */
+  storage: { read(key: string): string | null; write(key: string, value: string): void };
 }
 
 export function browserWindowsEnv(): WindowsEnv {
@@ -58,6 +79,7 @@ export function browserWindowsEnv(): WindowsEnv {
       typeof crypto.randomUUID === "function"
         ? crypto.randomUUID()
         : `w${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+    storage: safeStorage(),
   };
 }
 
@@ -80,6 +102,8 @@ export interface WindowsStore {
   workArea: Ref<Size>;
   titlebar: Ref<number>;
   lastError: Ref<string | null>;
+  /** Floating or tiling. Read it to decide whether a drag is allowed. */
+  layout: Ref<LayoutMode>;
   contract(window: ShellWindow): AppContract;
 
   open(app: AppId): Promise<string>;
@@ -95,6 +119,15 @@ export interface WindowsStore {
   snap(id: string, zone: SnapZone): Promise<void>;
   unsnap(id: string): void;
   tile(): Promise<void>;
+  setLayout(mode: LayoutMode): void;
+  /** Flips between floating and tiling, applying the new one at once. */
+  toggleLayout(): void;
+  /**
+   * Re-applies tiling after the work area changed. A no-op while floating, so
+   * the caller does not have to know the mode — a resize handler that had to
+   * check first is a resize handler that will forget.
+   */
+  relayout(): void;
   cycle(direction: 1 | -1): void;
   setSplit(left: string, right: string): void;
   clearSplit(): void;
@@ -115,6 +148,10 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
   const workArea = ref<Size>({ w: 1280, h: 800 });
   const titlebar = ref(34);
   const lastError = ref<string | null>(null);
+  // Anything that is not exactly "tiling" means floating, so a corrupted or
+  // half-written value lands on the default rather than on a mode the
+  // operator never chose.
+  const layout = ref<LayoutMode>(env.storage.read(LAYOUT_KEY) === "tiling" ? "tiling" : "floating");
 
   function list(): ShellWindow[] {
     return order.value.flatMap((id) => {
@@ -153,6 +190,27 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
         : outcome.message;
   }
 
+  /**
+   * Refuses, and says so, when there is no node to record the change.
+   *
+   * Every window here is an app instance the *server* holds. Applying a change
+   * locally while disconnected does not give the operator a working shell, it
+   * gives them a shell that disagrees with the node and silently loses the
+   * difference at the next `windows` event. So the mutation never happens.
+   *
+   * Focus and the layout mode are deliberately not guarded: both are this
+   * device's own view of the same windows, neither is recorded, and a shell
+   * you cannot even look around while it reconnects would be worse than one
+   * that is honest about what it cannot change.
+   */
+  function noNode(verb: string): boolean {
+    if (!bus.detached.value) return false;
+    lastError.value = bus.online.value
+      ? `not connected to the node, so nothing was ${verb}`
+      : `this device is offline, so nothing was ${verb}`;
+    return true;
+  }
+
   /** Raising, remembering and focusing in one place: a window that is raised
    * without being remembered breaks the compact switcher's order. */
   function focusWindow(id: string) {
@@ -166,6 +224,62 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
 
   function contract(window: ShellWindow): AppContract {
     return isAppId(window.appId) ? apps[window.appId] : unknownApp(window.appId);
+  }
+
+  /**
+   * Lays the visible windows out as master-and-stack. A no-op while floating,
+   * so every caller can invoke it unconditionally.
+   *
+   * `record` exists because a window's rect is *server* state: a re-tile that
+   * is only local gets overwritten the next time the server sends `windows`,
+   * and the windows visibly jump back to where they were floating. So the
+   * arrangement is recorded whenever it was caused by something the operator
+   * did — turning the mode on, opening, closing, minimizing — and not when it
+   * was caused by the work area changing, where the rects are re-derived from
+   * the new size anyway and recording would mean a command per resize frame.
+   */
+  function arrange(record_: boolean) {
+    if (layout.value !== "tiling") return;
+    const vis = list().filter((w) => !w.minimized);
+    if (vis.length === 0) return;
+    const rects = tileMasterStack(vis.length, workArea.value, SNAP_GAP);
+    vis.forEach((w, i) => {
+      const rect = rects[i];
+      if (!rect) return;
+      // The pre-tiling rect is kept once, so leaving tiling mode can put the
+      // windows back rather than stranding them in their tiled slots.
+      w.restore = w.restore ?? { ...w.rect };
+      w.rect = rect;
+      w.maximized = false;
+      w.snap = null;
+    });
+    if (record_) void record("shell.windows.tile", { ids: vis.map((w) => w.id) });
+  }
+
+  /**
+   * A standalone function rather than a method on the returned store, so
+   * `toggleLayout` can call it without `this` — a store whose methods break
+   * when it is destructured is a trap for every later caller.
+   */
+  function setLayoutMode(mode: LayoutMode) {
+    if (layout.value === mode) return;
+    layout.value = mode;
+    env.storage.write(LAYOUT_KEY, mode);
+    if (mode === "tiling") {
+      arrange(true);
+      return;
+    }
+    // Leaving tiling puts each window back where it floated, which is what
+    // `arrange` saved on the way in. A window with nothing saved keeps its
+    // tiled rect rather than being moved somewhere invented.
+    for (const w of list()) {
+      if (!w.restore) continue;
+      w.rect = w.restore;
+      w.restore = null;
+      w.snap = null;
+      w.maximized = false;
+      void record("shell.window.place", { id: w.id, ...w.rect });
+    }
   }
 
   return {
@@ -183,9 +297,11 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
     workArea,
     titlebar,
     lastError,
+    layout,
     contract,
 
     async open(app) {
+      if (noNode("opened")) return "";
       const spec = apps[app];
       const id = env.id();
       const rect = cascade(byId.size, workArea.value, spec.defaultSize);
@@ -206,7 +322,11 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
         minSize: spec.minSize,
       });
       focusWindow(id);
+      // The cascade position above is still computed and still recorded: it is
+      // what the window goes back to when tiling is turned off, and it is what
+      // the other device class uses, which does not share this mode.
       await record("shell.window.open", { app, id, ...rect });
+      arrange(true);
       // Until an app backend exists there is nothing to wait for, so the
       // skeleton would never clear. The server's `windows` event is what will
       // clear it for real.
@@ -216,6 +336,7 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
     },
 
     async close(id) {
+      if (noNode("closed")) return;
       const existed = byId.delete(id);
       order.value = order.value.filter((x) => x !== id);
       focusHistory.value = focusHistory.value.filter((x) => x !== id);
@@ -224,6 +345,9 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
       }
       if (focusedId.value === id) focusedId.value = focusHistory.value[0] ?? null;
       if (existed) await record("shell.window.close", { id });
+      // The survivors grow into the freed slot, which is the whole point of a
+      // tiling mode: a gap where a window used to be is a floating layout.
+      arrange(true);
     },
 
     // Focus is cheap, frequent and per device. Recording it on the server
@@ -232,6 +356,7 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
     focus: focusWindow,
 
     minimize(id) {
+      if (noNode("minimized")) return;
       const w = byId.get(id);
       if (!w) return;
       w.minimized = true;
@@ -239,15 +364,19 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
         focusedId.value = focusHistory.value.find((x) => x !== id && !byId.get(x)?.minimized) ?? null;
       }
       void record("shell.window.minimize", { id });
+      arrange(true);
     },
 
     restore(id) {
+      if (noNode("restored")) return;
       if (!byId.has(id)) return;
       focusWindow(id);
       void record("shell.window.restore", { id });
+      arrange(true);
     },
 
     toggleMaximize(id) {
+      if (noNode("resized")) return;
       const w = byId.get(id);
       if (!w) return;
       if (w.maximized) {
@@ -264,20 +393,31 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
     },
 
     place(id, rect) {
+      // Silent, unlike the others: this runs once per pointer frame, so a
+      // message here would be written hundreds of times for one gesture.
+      // `WindowFrame` refuses to start the drag at all while disconnected.
+      if (bus.detached.value) return;
       const w = byId.get(id);
       if (!w) return;
+      // Tiled windows do not move. Dragging one would leave a hole in the
+      // layout and a window overlapping its neighbour, which is neither
+      // tiling nor floating. `WindowFrame` also hides the drag affordance in
+      // this mode; this is the guard that holds when something else calls in.
+      if (layout.value === "tiling") return;
       w.rect = clampToWorkArea(rect, workArea.value, titlebar.value);
       w.maximized = false;
       w.snap = null;
     },
 
     async commitPlacement(id) {
+      if (noNode("moved")) return;
       const w = byId.get(id);
       if (!w) return;
       await record("shell.window.place", { id, ...w.rect });
     },
 
     async snap(id, zone) {
+      if (noNode("snapped")) return;
       const w = byId.get(id);
       if (!w) return;
       if (!w.snap && !w.maximized) w.restore = { ...w.rect };
@@ -298,6 +438,7 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
     },
 
     async tile() {
+      if (noNode("tiled")) return;
       const vis = list().filter((w) => !w.minimized);
       const rects = tileRow(vis.length, workArea.value, SNAP_GAP);
       vis.forEach((w, i) => {
@@ -311,6 +452,12 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
       await record("shell.windows.tile", { ids: vis.map((w) => w.id) });
     },
 
+    setLayout: setLayoutMode,
+
+    toggleLayout: () => setLayoutMode(layout.value === "tiling" ? "floating" : "tiling"),
+
+    relayout: () => arrange(false),
+
     cycle(direction) {
       const vis = list().filter((w) => !w.minimized);
       if (vis.length === 0) return;
@@ -320,6 +467,7 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
     },
 
     setSplit(left, right) {
+      if (noNode("split")) return;
       if (left === right) return;
       split.value = { left, right, fraction: split.value?.fraction ?? 0.5 };
       void record("shell.split.set", { left, right });

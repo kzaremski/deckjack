@@ -198,6 +198,7 @@ fn main() -> anyhow::Result<()> {
             Arc::clone(&state),
             Arc::clone(&store),
             Arc::clone(&terminals),
+            node_id.clone(),
         )),
         children: Box::new(wiring::TerminalChildren::new(Arc::clone(&terminals))),
         signals: Box::new(lockdown::OsSignals::new()),

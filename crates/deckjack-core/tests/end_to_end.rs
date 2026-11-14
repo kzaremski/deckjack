@@ -145,6 +145,7 @@ async fn start() -> Harness {
             Arc::clone(&state),
             Arc::clone(&store),
             Arc::clone(&terminals),
+            node_id.clone(),
         )),
         children: Box::new(wiring::TerminalChildren::new(Arc::clone(&terminals))),
         signals: Box::new(lockdown::OsSignals::new()),
@@ -1242,6 +1243,51 @@ async fn a_revoked_session_leaves_an_audit_row() {
     );
 }
 
+/// The kill switch has to leave a trace of whose sessions it took.
+///
+/// Lockdown revoked sessions, deleted their rows and killed their shells while
+/// writing nothing at all to the audit log, so afterwards there was no record
+/// that anyone had been signed in — the one event most worth being able to
+/// reconstruct. The row is written by `wiring::AuthSessions::revoke_all`, not
+/// by `AuthState::kick`, which is a pure state machine with no journal and no
+/// business acquiring one.
+#[tokio::test]
+async fn a_lockdown_leaves_an_audit_row_for_every_session_it_revoked() {
+    let h = start().await;
+    let cookie = h.sign_in().await;
+    assert!(!cookie.is_empty(), "the sign-in produced no cookie");
+
+    h.lockdown.engage(lockdown::Trigger::Operator {
+        surface: lockdown::Surface::Palette,
+    });
+
+    let rows = deckjack_core::audit::StoreSink::new(Arc::clone(&h.store))
+        .timeline(&deckjack_core::events::Query::default())
+        .expect("the timeline reads");
+    let revoked: Vec<_> = rows
+        .iter()
+        .filter(|r| r.entry.command == "auth.session.revoked")
+        .collect();
+
+    assert_eq!(
+        revoked.len(),
+        1,
+        "a lockdown revoked a session and the audit log does not say so"
+    );
+    assert_eq!(
+        revoked[0].entry.target_node, "e2e-node",
+        "the row names the wrong node"
+    );
+    // Distinct from the blocked-address path's own reason, which the test
+    // above pins. If the two ever collapse into one string, a lockdown and a
+    // lockout become indistinguishable afterwards.
+    assert!(
+        revoked[0].entry.params.as_str().contains("lockdown"),
+        "the row has to say the lockdown took it: {}",
+        revoked[0].entry.params
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The kill switch, in the assembled server
 // ---------------------------------------------------------------------------
@@ -1658,7 +1704,12 @@ fn with_auto_policy(
             lockdown::Deps {
                 clock: Box::new(lockdown::OsClock),
                 random: Box::new(lockdown::OsRandom),
-                sessions: Box::new(wiring::AuthSessions::new(state, store, terminals)),
+                sessions: Box::new(wiring::AuthSessions::new(
+                    state,
+                    store,
+                    terminals,
+                    "auto-node".to_string(),
+                )),
                 children: Box::new(lockdown::NoChildren),
                 signals: Box::new(lockdown::OsSignals::new()),
                 outbound: Box::new(lockdown::NoOutbound),

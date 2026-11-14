@@ -357,15 +357,40 @@ async fn index(
     crate::shell::index()
 }
 
+/// The few assets that must be readable before a session exists.
+///
+/// iOS fetches the manifest and the home-screen icon at the moment "Add to
+/// Home Screen" is pressed, and the launch image when the installed app opens.
+/// At every one of those moments there is no session — the page in front of
+/// the operator is `/login` — so behind the gate they 303 to the sign-in page
+/// and iOS installs a screenshot icon with no standalone mode. That failure is
+/// silent: nothing errors, the installed app simply comes out wrong.
+///
+/// Deliberately a closed list rather than a prefix like `/static/`. Each entry
+/// is a generated branding file that says nothing the login page does not
+/// already say out loud, and `..` is refused so the list cannot be walked out
+/// of. The shell document, its JavaScript and its CSS stay behind the gate,
+/// which is the property this module's doc describes.
+fn is_public_install_asset(path: &str) -> bool {
+    if path.contains("..") {
+        return false;
+    }
+    path == "/manifest.webmanifest" || path.starts_with("/icons/") || path.starts_with("/splash/")
+}
+
 /// Everything else behind the gate: embedded assets, and client-side routes
 /// that resolve to the shell document. Unauthenticated requests are sent to
-/// sign in rather than served, so the build is not readable without a session.
+/// sign in rather than served, so the build is not readable without a session
+/// — except for [`is_public_install_asset`], which has to be.
 async fn shell_asset(
     State(ctx): State<Arc<Ctx>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     uri: axum::http::Uri,
 ) -> Response {
+    if is_public_install_asset(uri.path()) {
+        return crate::shell::serve(uri.path());
+    }
     let ip = ctx.client_ip(peer, &headers);
     let id = cookie_session(&headers);
     let signed_in = {
@@ -682,5 +707,52 @@ mod tests {
             ("origin", "https://evil.example"),
             ("host", "pocket.example.ts.net"),
         ])));
+    }
+
+    /// The pre-auth carve-out is a hole in the session gate, so its edges are
+    /// pinned here. The half that matters is the second list: if this test is
+    /// ever made to pass by widening the predicate, the shell build becomes
+    /// readable without signing in.
+    #[test]
+    fn only_the_install_assets_are_readable_without_a_session() {
+        for path in [
+            "/manifest.webmanifest",
+            "/icons/deckjack-180.png",
+            "/icons/deckjack.svg",
+            "/splash/splash-1320x2868.png",
+        ] {
+            assert!(is_public_install_asset(path), "iOS cannot install: {path}");
+        }
+
+        for path in [
+            "/",
+            "/index.html",
+            "/assets/index-abc123.js",
+            "/assets/index-abc123.css",
+            "/sw.js",
+            "/kit/bus.js",
+            "/api/anything",
+            "/ws",
+            // A near-miss on each allowed prefix: the match is on the path
+            // segment, not on the string appearing anywhere in it.
+            "/not/icons/x.png",
+            "/iconsy/x.png",
+            "/manifest.webmanifest.map",
+        ] {
+            assert!(
+                !is_public_install_asset(path),
+                "reachable without a session: {path}"
+            );
+        }
+
+        // Traversal out of an allowed prefix, which would otherwise reach the
+        // whole embedded build through `/icons/`.
+        for path in [
+            "/icons/../index.html",
+            "/icons/../assets/index-abc123.js",
+            "/splash/../../etc/passwd",
+        ] {
+            assert!(!is_public_install_asset(path), "traversal allowed: {path}");
+        }
     }
 }

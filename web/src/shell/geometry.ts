@@ -221,3 +221,52 @@ export function tileRow(count: number, area: Size, gap = 8): Rect[] {
     h: area.h - gap * 2,
   }));
 }
+
+/**
+ * Master and stack, the way i3 and Hyprland open into a split: the first
+ * window takes half, the rest divide the other half between them.
+ *
+ * `tileRow` stays for the one-shot "tile side by side" command, where a single
+ * row is exactly what was asked for. It is the wrong shape for a *persistent*
+ * tiling mode: the columns shrink without bound while the height never
+ * changes, so six windows become six unusable slivers.
+ *
+ * One window takes the whole area rather than half, because a master with an
+ * empty stack beside it is just a window wasting half the screen.
+ */
+export function tileMasterStack(count: number, area: Size, gap = 8): Rect[] {
+  if (count <= 0) return [];
+  if (count === 1) {
+    return [{ x: gap, y: gap, w: area.w - gap * 2, h: area.h - gap * 2 }];
+  }
+
+  const stack = count - 1;
+  // Split along the long axis, so a portrait panel — the Fold unfolded, this
+  // machine's rotated LCD — stacks top-and-bottom instead of producing two
+  // tall ribbons.
+  if (area.h > area.w) {
+    const masterH = Math.floor((area.h - gap * 3) / 2);
+    const cell = Math.floor((area.w - gap * (stack + 1)) / stack);
+    return [
+      { x: gap, y: gap, w: area.w - gap * 2, h: masterH },
+      ...Array.from({ length: stack }, (_, i) => ({
+        x: gap + i * (cell + gap),
+        y: gap * 2 + masterH,
+        w: cell,
+        h: area.h - masterH - gap * 3,
+      })),
+    ];
+  }
+
+  const masterW = Math.floor((area.w - gap * 3) / 2);
+  const cell = Math.floor((area.h - gap * (stack + 1)) / stack);
+  return [
+    { x: gap, y: gap, w: masterW, h: area.h - gap * 2 },
+    ...Array.from({ length: stack }, (_, i) => ({
+      x: gap * 2 + masterW,
+      y: gap + i * (cell + gap),
+      w: area.w - masterW - gap * 3,
+      h: cell,
+    })),
+  ];
+}

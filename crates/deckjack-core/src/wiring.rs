@@ -945,10 +945,21 @@ pub fn register_windows(
 ///     the lockdown just revoked;
 ///  3. kill the shells, because a pty is a process running as the host user
 ///     and the session that asked for it is gone.
+///  4. write one audit row per revoked session, because a kill switch that
+///     leaves no trace of whose sessions it took is a kill switch nobody can
+///     audit afterwards.
 pub struct AuthSessions {
     auth: Arc<std::sync::Mutex<crate::auth::state::AuthState>>,
     store: Arc<std::sync::Mutex<crate::store::Store>>,
     terminals: Arc<terminal::Registry>,
+    /// Which node the revocation rows name. A required field rather than a
+    /// builder call, for the reason `http.rs` gives about registrations that
+    /// can be left out of `main.rs`: an unread field compiles, so a `with_`
+    /// setter here would let the audit row silently lose its node.
+    node_id: String,
+    /// Built inside [`AuthSessions::new`] from the store it is already handed,
+    /// so there is nothing for `main.rs` to pass and nothing to forget.
+    audit: Arc<crate::audit::StoreSink>,
 }
 
 impl AuthSessions {
@@ -956,11 +967,15 @@ impl AuthSessions {
         auth: Arc<std::sync::Mutex<crate::auth::state::AuthState>>,
         store: Arc<std::sync::Mutex<crate::store::Store>>,
         terminals: Arc<terminal::Registry>,
+        node_id: String,
     ) -> Arc<AuthSessions> {
+        let audit = crate::audit::StoreSink::new(Arc::clone(&store));
         Arc::new(AuthSessions {
             auth,
             store,
             terminals,
+            node_id,
+            audit,
         })
     }
 }
@@ -1008,6 +1023,43 @@ impl crate::lockdown::Sessions for Arc<AuthSessions> {
         let killed = self.terminals.kill_all();
         if killed > 0 {
             tracing::warn!(killed, "shells killed by lockdown");
+        }
+
+        // Last, and deliberately outside the `store` guard above: this writes
+        // through `StoreSink`, which locks the same mutex, so doing it inside
+        // that block deadlocks on a re-entrant lock rather than failing.
+        //
+        // Written after the rows are gone and the ptys are dead, by the rule
+        // in `http.rs`: the log must never claim a revocation that did not
+        // finish.
+        //
+        // Same command id and same field names as `http::Ctx::record_revocation`,
+        // so one query answers "when did this session end" however it ended.
+        // `tag` rather than anything containing "session", because
+        // `ParamsSummary` blanks those. No `.from(ip)`: `kick` returns hashes
+        // only, and under lockdown every session goes, so no single address is
+        // evidence — an unset column reads as "not recorded" rather than as a
+        // claim about where it came from.
+        for hash in &hashes {
+            let record = crate::events::Record::new(
+                crate::events::Issuer::System,
+                "auth.session.revoked",
+                self.node_id.clone(),
+                crate::events::Outcome::Ok,
+            )
+            .params(crate::events::ParamsSummary::from_json(
+                &serde_json::json!({ "reason": "lockdown", "tag": hash.tag() }),
+            ));
+            if let Err(e) = self.audit.append_dispatch(
+                std::time::SystemTime::now(),
+                &record,
+                &crate::audit::DispatchFacts::none(),
+            ) {
+                // Logged and swallowed, as in `http.rs`: the session is
+                // already gone, and failing a lockdown because its log could
+                // not be written would leave sessions alive that must not be.
+                tracing::warn!(error = %e, "cannot record a lockdown revocation in the audit log");
+            }
         }
 
         hashes.len()

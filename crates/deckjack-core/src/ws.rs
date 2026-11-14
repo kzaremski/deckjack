@@ -319,6 +319,24 @@ pub enum ClientFrame {
     /// Ask a running command to stop. Cooperative: the command sees the
     /// signal and unwinds, so a `response` still arrives for `id`.
     Cancel { id: CorrelationId },
+
+    /// Liveness probe, answered immediately with [`ServerFrame::Pong`].
+    ///
+    /// This exists because the WebSocket-level ping this server already sends
+    /// is useless to the party that needs it most. A browser answers those
+    /// pings itself, in the network stack, and never tells the page — so the
+    /// server can tell a dead client, and the client cannot tell a dead
+    /// server. A socket whose peer vanished without a FIN stays `open` to
+    /// JavaScript until TCP gives up, which is minutes, and the shell spends
+    /// those minutes claiming it is connected.
+    ///
+    /// `token` is echoed back so the client can measure a round trip and
+    /// ignore a stale answer, rather than merely knowing that *something*
+    /// arrived.
+    Ping {
+        #[serde(default)]
+        token: Option<String>,
+    },
 }
 
 /// Server to browser.
@@ -356,6 +374,15 @@ pub enum ServerFrame {
         topic: String,
         payload: Value,
         at_ms: u64,
+    },
+    /// The answer to [`ClientFrame::Ping`], echoing its `token`.
+    ///
+    /// Deliberately carries no state. Its only job is to prove that a whole
+    /// round trip still completes — socket, task, and this process — which is
+    /// strictly more than TCP staying up tells anyone.
+    Pong {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
     },
 }
 
@@ -1456,6 +1483,16 @@ fn handle(
         ClientFrame::Hello { .. } => Some(Ending::BadFrame(
             "hello was already exchanged; open a new connection to change protocol".into(),
         )),
+
+        // Answered inline rather than queued behind command work, because a
+        // pong that waits for a slow command would report the connection dead
+        // exactly when the node is busiest. `try_send` for the same reason: if
+        // the outbound queue is full the connection has a real problem and a
+        // dropped pong is the correct signal, not something to block on.
+        ClientFrame::Ping { token } => {
+            let _ = out.try_send(Outbound::Frame(ServerFrame::Pong { token }));
+            None
+        }
 
         ClientFrame::Cancel { id } => {
             if registry.cancel(&id) {

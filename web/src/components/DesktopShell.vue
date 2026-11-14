@@ -26,6 +26,10 @@ onMounted(() => {
     const box = entries[0]?.contentRect;
     if (!box) return;
     shell.windows.workArea.value = { w: Math.round(box.width), h: Math.round(box.height) };
+    // Tiled windows are sized from the work area, so they have to be re-laid
+    // out when it changes or they keep the old screen's geometry. A no-op
+    // while floating, so there is nothing to check here.
+    shell.windows.relayout();
   });
   observer.observe(el);
   const box = el.getBoundingClientRect();

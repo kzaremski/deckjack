@@ -49,9 +49,23 @@ interface Drag {
 const drag = ref<Drag | null>(null);
 const zone = ref<SnapZone | null>(null);
 
+/** Tiled windows are placed by the layout, not by the hand. */
+const tiling = computed(() => shell.windows.layout.value === "tiling");
+
+/** A window's position lives on the node. With no node, it cannot move. */
+const offline = computed(() => shell.bus.detached.value);
+
 function begin(event: PointerEvent, handle: Handle | null) {
   if (event.button !== 0) return;
   shell.windows.focus(props.window.id);
+  // Refused before the drag starts rather than at the end: letting the window
+  // follow the pointer and then snapping back when the commit fails is the
+  // shell lying for the length of the gesture.
+  if (offline.value) return;
+  // Focus still happens above — clicking a tiled window's title bar should
+  // raise it — but nothing moves. The grips are hidden in this mode too; this
+  // is the guard that holds for the title bar and for a stray pointer event.
+  if (tiling.value) return;
   // A maximized window is dragged loose rather than dragged around at full
   // size, which is what every window manager does and what the hand expects.
   // `toggleMaximize` restores the rectangle synchronously, so reading it
@@ -165,7 +179,7 @@ const style = computed(() => ({
 <template>
   <section
     class="window"
-    :class="{ focused, dragging: drag !== null }"
+    :class="{ focused, dragging: drag !== null, tiled: tiling || offline }"
     :style="style"
     :aria-label="`${props.window.title} window`"
     @pointerdown="shell.windows.focus(props.window.id)"
@@ -223,18 +237,24 @@ const style = computed(() => ({
       so a corner grab never lands on the app's content. They are 10px, which
       is thin for a finger; on a touchscreen windows are resized by snapping
       and compact mode does not have them at all.
+
+      Gone entirely in tiling mode, rather than left in place and ignored: a
+      grip that shows a resize cursor and then does nothing is worse than no
+      grip, because it says the window can be resized when it cannot.
     -->
-    <div
-      v-for="handle in handles"
-      :key="handle"
-      class="grip"
-      :data-handle="handle"
-      :style="{ cursor: cursorFor(handle) }"
-      @pointerdown="begin($event, handle)"
-      @pointermove="move"
-      @pointerup="end"
-      @pointercancel="end"
-    />
+    <template v-if="!tiling && !offline">
+      <div
+        v-for="handle in handles"
+        :key="handle"
+        class="grip"
+        :data-handle="handle"
+        :style="{ cursor: cursorFor(handle) }"
+        @pointerdown="begin($event, handle)"
+        @pointermove="move"
+        @pointerup="end"
+        @pointercancel="end"
+      />
+    </template>
   </section>
 </template>
 
@@ -280,10 +300,21 @@ const style = computed(() => ({
   cursor: grab;
   touch-action: none;
   user-select: none;
+  /* Same reason as the bar's: a long press on a title should not raise iOS's
+     copy/share sheet over a window you were trying to move. */
+  -webkit-touch-callout: none;
 }
 
 .bar:active {
   cursor: grabbing;
+}
+
+/* A grab cursor on a window that cannot be moved is a promise the layout does
+   not keep. The buttons in the bar still work, and double-click still
+   maximizes, so the bar is not inert — only the dragging is gone. */
+.window.tiled .bar,
+.window.tiled .bar:active {
+  cursor: default;
 }
 
 .tag {

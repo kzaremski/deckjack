@@ -72,10 +72,21 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(
       fetch(request)
         .then((response) => {
-          const copy = response.clone();
-          caches.open(VERSION).then((cache) => cache.put("/", copy));
+          // Only a real shell document is worth keeping. Without this guard
+          // the cache takes whatever came back, and when the session has
+          // expired that is the *login page*, served after a redirect. It
+          // then becomes what a cold offline launch shows: a sign-in form
+          // that cannot possibly reach the node to check the code.
+          if (response.ok && !response.redirected) {
+            const copy = response.clone();
+            caches.open(VERSION).then((cache) => cache.put("/", copy));
+          }
           return response;
         })
+        // Offline, the cached shell is served deliberately. It boots knowing
+        // it has no bus and says so — see `ConnectionCard` — which beats the
+        // browser's error page and is honest: the shell is a view of a node,
+        // so with no node there is nothing here to operate.
         .catch(() => caches.match("/").then((hit) => hit || Response.error())),
     );
   }

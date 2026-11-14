@@ -1267,10 +1267,17 @@ pub struct DenyParams {
 pub struct IssueParams {
     /// Operator-facing name for the grant: "Assistant", "coding on r620".
     pub label: String,
-    /// Who holds it: the agent session's name, exactly as the bus knows it
-    /// ([`AgentSessionId`]). This is what the grant is looked up by, so a typo
-    /// here is a grant that authorizes nobody rather than one that authorizes
-    /// everybody.
+    /// Who holds it: the agent session **id**, exactly as the bus knows it
+    /// ([`AgentSessionId`]) — the id listed under `[agents] sessions` and
+    /// passed to `deckjack agent <session>`, or `app:<name>` for an app.
+    ///
+    /// NOT the operator-facing `label` above, and not the name the timeline
+    /// shows. The Assistant's label is "Assistant" while its id is whatever
+    /// the config calls it, and nothing resolves one into the other: an
+    /// `Issuer::Agent` carries the session id alone, so a label never reaches
+    /// a dispatch to be matched against. This id is the only string a grant is
+    /// looked up by, so a name here is a grant that authorizes nobody rather
+    /// than one that authorizes everybody.
     pub agent: String,
     /// Patterns, as written: `git.*`, `files.read.status`.
     pub namespaces: Vec<String>,
@@ -1556,9 +1563,16 @@ impl Command for IssueGrant {
                 &owner,
                 GrantSpec {
                     label: p.label,
-                    // Not the agent's name: that column is a browser or agent
-                    // *session id*, and this is a name. The holder goes in
-                    // `owner`, the column this subsystem looks grants up by.
+                    // Nothing to do with names: `p.agent` IS a session id, and
+                    // the earlier comment here claimed the opposite.
+                    //
+                    // The real reason it goes in `owner` is lifetime. A grant
+                    // carrying a `session` dies with that session; this
+                    // command issues a standing one, so the holder is recorded
+                    // as the owner instead. `GrantRows::held_by` matches
+                    // `session = ?1 OR owner = ?1` against the same agent
+                    // session id either way, so the column chooses how long
+                    // the grant lives, not who it is for.
                     session: None,
                     project: p.project,
                     namespaces: p.namespaces,
