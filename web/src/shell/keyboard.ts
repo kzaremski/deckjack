@@ -189,6 +189,22 @@ export function createKeyboard(env: KeyboardEnv): Keyboard {
       // Every previous chord goes, aliases included: the operator asked for
       // one chord, not for theirs plus whatever happened to ship.
       forget(commandId);
+      // And take the chord off whoever held it, so the table never carries two
+      // claims on one key. Without this the loser went on reporting the chord
+      // through `chordFor`/`labelFor` -- the shell advertised a key that now
+      // belonged to something else -- and rebinding the loser later unbound
+      // the winner's shortcut while still advertising it.
+      const loser = table.get(chord)?.commandId;
+      if (loser && loser !== commandId) {
+        const left = (live.get(loser) ?? []).filter((c) => c !== chord);
+        if (left.length > 0) {
+          live.set(loser, left);
+          if (primary.get(loser) === chord) primary.set(loser, left[0]!);
+        } else {
+          live.delete(loser);
+          primary.delete(loser);
+        }
+      }
       table.set(chord, { commandId, chord, whileTyping: existing?.whileTyping });
       live.set(commandId, [chord]);
       primary.set(commandId, chord);
@@ -203,7 +219,12 @@ export function createKeyboard(env: KeyboardEnv): Keyboard {
       const chord = chordOf(event, env.apple);
       const hit = table.get(chord);
       if (!hit) return null;
-      const hasModifier = chord.includes("+");
+      // Shift alone does not count. It is how a capital letter is typed, so
+      // treating it as a modifier let a shift-only chord fire inside a text
+      // field -- `chord.includes("+")` was true for "shift+n", and typing an
+      // N dispatched a command. Nothing shipped is shift-only, which is
+      // exactly why this was a trap for the first one that is.
+      const hasModifier = /(^|\+)(mod|ctrl|meta|alt)\+/.test(chord);
       const allowed = hit.whileTyping ?? hasModifier;
       if (!allowed && isTypingTarget(event.target)) return null;
       return hit.commandId;

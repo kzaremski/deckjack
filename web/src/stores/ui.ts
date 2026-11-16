@@ -83,6 +83,17 @@ export function createUi(env: UiEnv): UiStore {
     dismiss,
     confirm(input) {
       return new Promise<boolean>((resolve) => {
+        // Answer whatever is already on screen before replacing it. This used
+        // to assign straight over the top, so the displaced question's
+        // `resolve` was never called and the command awaiting it never
+        // settled -- a spinner that ran forever, on a confirmation the
+        // operator had already answered, with nothing in any log.
+        //
+        // `false` is the only safe answer. Carrying the operator's "yes" over
+        // to a question they were never shown would run a destructive command
+        // on the strength of a different dialog, and declining a command
+        // nobody saw costs them one retry.
+        confirmation.value?.resolve(false);
         confirmation.value = {
           ...input,
           resolve(ok) {

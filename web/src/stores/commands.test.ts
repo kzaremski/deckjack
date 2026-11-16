@@ -412,3 +412,80 @@ describe("the shell an operator actually gets", () => {
     expect(rig.shell.commands.lastError.value, "an unbound chord was dispatched anyway").toBeNull();
   });
 });
+
+describe("modifiers, and what counts as one", () => {
+  it("does not treat Shift alone as a modifier", () => {
+    // Found by mutation testing. `resolve()` decides a chord may fire inside a
+    // text field when it "has a modifier", and asks `chord.includes("+")`.
+    // A shift-only chord contains a "+", so holding Shift to type a capital
+    // letter would dispatch a command instead. Latent today -- nothing in
+    // DEFAULT_SHORTCUTS is shift-only -- and a trap for the first one that is.
+    const keyboard = createKeyboard({ apple: false, storage: memoryStorage().env });
+    keyboard.bind([{ commandId: "x.shifted", chord: "shift+n" }]);
+
+    const typing = document.createElement("input");
+    document.body.appendChild(typing);
+    const event = new KeyboardEvent("keydown", { key: "N", shiftKey: true });
+    Object.defineProperty(event, "target", { value: typing });
+
+    expect(
+      keyboard.resolve(event),
+      "a capital letter typed into a field dispatched a command",
+    ).toBeNull();
+  });
+
+  it("still lets a real modifier chord through while typing", () => {
+    // The pair. Narrowing "has a modifier" must not take Ctrl+W with it.
+    const keyboard = createKeyboard({ apple: false, storage: memoryStorage().env });
+    keyboard.bind([{ commandId: "x.close", chord: "mod+w" }]);
+
+    const typing = document.createElement("input");
+    document.body.appendChild(typing);
+    const event = new KeyboardEvent("keydown", { key: "w", ctrlKey: true });
+    Object.defineProperty(event, "target", { value: typing });
+
+    expect(keyboard.resolve(event)).toBe("x.close");
+  });
+});
+
+describe("rebinding a shortcut", () => {
+  it("keeps its permission to fire while typing", () => {
+    // Found by mutation testing: `rebind` rebuilt the shortcut without
+    // carrying `whileTyping`, so customizing a chord silently revoked the one
+    // thing that made it usable in a text field.
+    const keyboard = createKeyboard({ apple: false, storage: memoryStorage().env });
+    keyboard.bind([{ commandId: "x.find", chord: "f3", whileTyping: true }]);
+
+    keyboard.rebind("x.find", "f4");
+
+    const typing = document.createElement("input");
+    document.body.appendChild(typing);
+    const event = new KeyboardEvent("keydown", { key: "F4" });
+    Object.defineProperty(event, "target", { value: typing });
+    expect(
+      keyboard.resolve(event),
+      "rebinding took away the shortcut's permission to work while typing",
+    ).toBe("x.find");
+  });
+
+  it("takes the chord off whoever held it before", () => {
+    // Found by mutation testing. Moving a command onto a chord another command
+    // already owns left the table with two claims on it: the loser still
+    // reported the chord through chordFor/labelFor, and rebinding the loser
+    // afterwards unbound the winner's key while still advertising it.
+    const keyboard = createKeyboard({ apple: false, storage: memoryStorage().env });
+    keyboard.bind([
+      { commandId: "x.first", chord: "mod+1" },
+      { commandId: "x.second", chord: "mod+2" },
+    ]);
+
+    keyboard.rebind("x.second", "mod+1");
+
+    const event = new KeyboardEvent("keydown", { key: "1", ctrlKey: true });
+    expect(keyboard.resolve(event), "the chord did not move").toBe("x.second");
+    expect(
+      keyboard.chordFor("x.first"),
+      "the command that lost the chord still claims it",
+    ).not.toBe("mod+1");
+  });
+});

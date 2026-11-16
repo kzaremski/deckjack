@@ -228,3 +228,48 @@ describe("the layout the operator chose", () => {
     expect(covered, "the survivor did not grow into the freed space").toBeGreaterThan(0.85);
   });
 });
+
+describe("a tiled window the operator did not drag", () => {
+  // `place()` refuses to move a tiled window, and its comment calls itself
+  // "the guard that holds when something else calls in". These are the other
+  // ways in, found by mutation testing: both bypassed it entirely.
+  async function twoTiled() {
+    const { bus } = stubBus("open");
+    const windows = createWindows(bus, env());
+    windows.workArea.value = { w: 1600, h: 900 };
+    const first = await windows.open("terminal");
+    const second = await windows.open("files");
+    windows.setLayout("tiling");
+    return { windows, first, second };
+  }
+
+  function overlapping(windows: ReturnType<typeof createWindows>): boolean {
+    const [a, b] = windows.visible.value;
+    if (!a || !b) return false;
+    const r = a.rect;
+    const s = b.rect;
+    return r.x < s.x + s.w && s.x < r.x + r.w && r.y < s.y + s.h && s.y < r.y + r.h;
+  }
+
+  it("is not maximized out of its slot by a double-click", async () => {
+    const { windows, first } = await twoTiled();
+
+    windows.toggleMaximize(first);
+
+    expect(
+      overlapping(windows),
+      "a tiled window was maximized over its neighbour, leaving a hole in the layout",
+    ).toBe(false);
+  });
+
+  it("is not snapped out of its slot by the keyboard", async () => {
+    const { windows, first } = await twoTiled();
+
+    await windows.snap(first, "right");
+
+    expect(
+      overlapping(windows),
+      "a tiled window was snapped over its neighbour, leaving a hole in the layout",
+    ).toBe(false);
+  });
+});

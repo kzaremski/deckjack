@@ -116,17 +116,19 @@ export function createViewport(env: ViewportEnv): Viewport {
 
   const coarse = env.media("(pointer: coarse)");
   const coarsePointer = ref(coarse.matches);
-  coarse.addEventListener("change", (e) => {
+  const onCoarse = (e: MediaQueryListEvent) => {
     coarsePointer.value = e.matches;
-  });
+  };
+  coarse.addEventListener("change", onCoarse);
 
   const display = env.media("(display-mode: standalone), (display-mode: window-controls-overlay)");
   const standalone = ref(display.matches);
-  display.addEventListener("change", (e) => {
+  const onDisplay = (e: MediaQueryListEvent) => {
     standalone.value = e.matches;
-  });
+  };
+  display.addEventListener("change", onDisplay);
 
-  const stop = env.onResize(() => {
+  const stopResize = env.onResize(() => {
     const s = env.size();
     width.value = s.w;
     height.value = s.h;
@@ -134,6 +136,20 @@ export function createViewport(env: ViewportEnv): Viewport {
     // resize is the only event that reliably fires for it.
     hinge.value = env.hingeFraction();
   });
+
+  /**
+   * Releases everything, not just the resize subscription.
+   *
+   * The media-query listeners used to be left attached, so a stopped viewport
+   * went on mutating its own state and every shell rebuild -- a hot reload in
+   * development, a reconnect that rebuilds the stores -- left another pair of
+   * them behind, each holding its closure alive.
+   */
+  const stop = () => {
+    stopResize();
+    coarse.removeEventListener("change", onCoarse);
+    display.removeEventListener("change", onDisplay);
+  };
 
   const suggestedMode = computed<ShellMode>(() =>
     width.value >= foundation.breakpoint.tablet && !coarsePointer.value

@@ -541,3 +541,79 @@ describe("the shell as the operator sees it", () => {
     expect(wrapper.attributes("data-mode")).toBe("desktop");
   });
 });
+
+// ---------------------------------------------------------------------------
+// defects the mutation pass turned up
+// ---------------------------------------------------------------------------
+
+describe("a second question while one is already on screen", () => {
+  it("does not leave the first one waiting forever", async () => {
+    // Found by mutation testing. `confirm()` assigns `confirmation.value`
+    // unconditionally, so a second command's question replaces the first
+    // one's and the first `resolve` is never called -- that promise never
+    // settles. The caller is an `await` inside a command, so the command
+    // hangs: a spinner that never stops, on a confirmation the operator
+    // already answered, with nothing in any log.
+    const { ui } = uiRig();
+
+    const first = ui.confirm({ command: "a.destroy", title: "Confirm", detail: "first", risk: "destructive" });
+    const second = ui.confirm({ command: "b.destroy", title: "Confirm", detail: "second", risk: "destructive" });
+
+    // Answer whatever is on screen. Whichever question that is, the one it
+    // displaced must not be left pending.
+    ui.confirmation.value?.resolve(true);
+
+    const settled = await Promise.race([
+      Promise.all([first, second]).then(() => "both settled"),
+      new Promise((r) => setTimeout(() => r("HUNG"), 30)),
+    ]);
+    expect(settled, "a displaced confirmation never settled").toBe("both settled");
+  });
+
+  it("does not answer a question the operator was never shown", async () => {
+    // The other half: resolving the displaced one as `true` would be worse
+    // than hanging. A destructive command must never be treated as confirmed
+    // because a second dialog happened to open.
+    const { ui } = uiRig();
+
+    const first = ui.confirm({ command: "a.destroy", title: "Confirm", detail: "first", risk: "destructive" });
+    void ui.confirm({ command: "b.destroy", title: "Confirm", detail: "second", risk: "destructive" });
+    ui.confirmation.value?.resolve(true);
+
+    expect(await first, "a command nobody confirmed was reported as confirmed").toBe(false);
+  });
+});
+
+describe("a viewport that has been stopped", () => {
+  it("lets go of every listener, not just the resize one", () => {
+    // Found by mutation testing. `stop()` detaches the resize subscription
+    // and leaves the `pointer: coarse` and `display-mode` change listeners
+    // attached, so a disposed viewport keeps mutating its own state -- and
+    // every hot reload or shell rebuild leaves another pair behind.
+    const attached: string[] = [];
+    const removed: string[] = [];
+    const env: ViewportEnv = {
+      media(query) {
+        return {
+          matches: false,
+          media: query,
+          onchange: null,
+          addEventListener: () => void attached.push(query),
+          removeEventListener: () => void removed.push(query),
+          addListener: () => {},
+          removeListener: () => {},
+          dispatchEvent: () => false,
+        } as unknown as MediaQueryList;
+      },
+      size: () => ({ w: 1600, h: 900 }),
+      onResize: () => () => {},
+      hingeFraction: () => null,
+    };
+
+    const viewport = createViewport(env);
+    viewport.stop();
+
+    expect(attached.length, "nothing was listening to begin with").toBeGreaterThan(0);
+    expect(removed.sort(), "a stopped viewport is still listening").toEqual(attached.sort());
+  });
+});

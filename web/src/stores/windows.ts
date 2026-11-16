@@ -377,6 +377,15 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
 
     toggleMaximize(id) {
       if (noNode("resized")) return;
+      // Tiling owns the geometry, so maximizing out of a slot leaves a hole in
+      // the layout and a window over its neighbour. `place()` has refused this
+      // all along and its comment calls itself "the guard that holds when
+      // something else calls in" -- this was one of the ways in: the title
+      // bar's double-click and its Maximize button are both live while tiled.
+      if (layout.value === "tiling") {
+        lastError.value = "tiling is on, so nothing was resized";
+        return;
+      }
       const w = byId.get(id);
       if (!w) return;
       if (w.maximized) {
@@ -418,6 +427,13 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
 
     async snap(id, zone) {
       if (noNode("snapped")) return;
+      // The other way in: the palette's tiling commands and Ctrl+arrow reach
+      // this directly, so a keyboard snap used to move a tiled window to the
+      // right half and overlap its neighbour.
+      if (layout.value === "tiling") {
+        lastError.value = "tiling is on, so nothing was snapped";
+        return;
+      }
       const w = byId.get(id);
       if (!w) return;
       if (!w.snap && !w.maximized) w.restore = { ...w.rect };
