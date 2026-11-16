@@ -57,6 +57,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use deckjack_core::agentbridge::AgentBridge;
 use deckjack_core::apphost::AppHost;
+use deckjack_core::approvals::Approvals;
 use deckjack_core::apps;
 use deckjack_core::auth::Code;
 use deckjack_core::auth::session::{SessionHash, SessionId};
@@ -67,6 +68,7 @@ use deckjack_core::command::{
 use deckjack_core::http::Ctx;
 use deckjack_core::lockdown::{self, HostToken, Lockdown, Watchdog};
 use deckjack_core::store::Store;
+use deckjack_core::terminal::{self, SessionSpec};
 use deckjack_core::wiring::{self, BusDispatch};
 use deckjack_core::{node, ws};
 
@@ -75,6 +77,12 @@ const NODE: &str = "wiring-node";
 /// An agent session with a grant, shaped the way `agentbridge` shapes an
 /// app's: the reserved `app:<name>` identity.
 const AGENT: &str = "app:notes";
+
+/// A second agent session, granted the `system.*` namespace so that something
+/// an agent may ask for actually routes to the approval Inbox. `AGENT`'s
+/// `terminal.*` grant covers nothing above `Write`, and only
+/// `RiskLevel::CrossProject` and up are queued.
+const INBOX_AGENT: &str = "app:assistant";
 
 // ---------------------------------------------------------------------------
 // The node, assembled through `wiring::bus` and `wiring::app`
@@ -90,11 +98,25 @@ struct Node {
     /// The live tool-list path, over the same bus and the same grants.
     bridge: Arc<AgentBridge>,
     lockdown: Arc<Lockdown>,
+    /// The one the host built and handed to `BusParts`, so a test can ask
+    /// whether the bus queues into *this* inbox or into one of its own.
+    approvals: Arc<Approvals>,
     /// Keeps the working directory alive for as long as the server runs.
     _dir: tempfile::TempDir,
 }
 
 async fn start() -> Node {
+    start_with(lockdown::AutoPolicy::default()).await
+}
+
+/// The same node with the automatic-trigger thresholds chosen.
+///
+/// Only the thresholds: everything else is the product's assembly, because
+/// the point of the file is that the assembly is what answers. The shipped
+/// `AutoPolicy` needs ten refusals inside a minute and then only alerts, so a
+/// test of the watchdog path has to be able to say "three, and engage" —
+/// waiting out the real numbers would be pacing, which nothing here does.
+async fn start_with(auto: lockdown::AutoPolicy) -> Node {
     let dir = tempfile::tempdir().expect("a working directory");
     let node_id = NODE.to_string();
 
@@ -149,6 +171,7 @@ async fn start() -> Node {
             lockdown::Policy {
                 grace: Duration::from_millis(10),
                 grace_checks: 2,
+                auto,
                 ..lockdown::Policy::default()
             },
             node_id.clone(),
@@ -170,6 +193,13 @@ async fn start() -> Node {
         AgentSessionId::new(AGENT),
         Grant::new(
             vec![Pattern::new("terminal.*").expect("a valid pattern")],
+            NodeScope::ThisNode,
+        ),
+    );
+    grants.put(
+        AgentSessionId::new(INBOX_AGENT),
+        Grant::new(
+            vec![Pattern::new("system.*").expect("a valid pattern")],
             NodeScope::ThisNode,
         ),
     );
@@ -272,6 +302,7 @@ async fn start() -> Node {
         bus,
         bridge,
         lockdown,
+        approvals,
         _dir: dir,
     }
 }
@@ -311,6 +342,24 @@ impl Node {
             surface: lockdown::Surface::Palette,
         });
         assert!(self.lockdown.is_locked(), "the lockdown did not engage");
+    }
+
+    /// Whether the node locks itself within `deadline`.
+    ///
+    /// A failure deadline, not pacing. The watchdog's verdict is carried out
+    /// on a thread — `wiring::act_on` spawns one because engaging blocks for
+    /// the grace period and the verdict arrives on the dispatch path — so
+    /// there is nothing to await and the only honest question is whether it
+    /// happened at all.
+    fn locked_within(&self, deadline: Duration) -> bool {
+        let until = std::time::Instant::now() + deadline;
+        while std::time::Instant::now() < until {
+            if self.lockdown.is_locked() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.lockdown.is_locked()
     }
 
     /// Every command id the palette would show the operator.
@@ -674,6 +723,213 @@ async fn every_command_the_wiring_registers_is_on_the_bus_and_answers_over_the_s
 }
 
 // ---------------------------------------------------------------------------
+// Every router the assembly merges, reached through its own handler
+// ---------------------------------------------------------------------------
+
+/// One route `wiring::app` claims to mount, and a mark only the handler
+/// behind it leaves on the answer.
+struct Mounted {
+    method: &'static str,
+    path: &'static str,
+    /// A body for the routes that read one. The passkey module parses the
+    /// body before it checks anything else, so asking with none gets an
+    /// answer about the body that says nothing about being mounted.
+    body: &'static str,
+    /// Whether the request carries a session cookie.
+    signed_in: bool,
+    status: u16,
+    /// Something only this route's own answer carries, in the body or in the
+    /// content type.
+    mark: &'static str,
+}
+
+/// Whether a response carries a route's mark.
+///
+/// Body or content type, because for the two scripts the thing that proves
+/// the handler answered is the type the browser needs — a page served as
+/// `text/html` where `text/javascript` was promised does not run.
+fn carries(r: &Response, mark: &str) -> bool {
+    r.body.contains(mark) || r.header("content-type").is_some_and(|c| c.contains(mark))
+}
+
+fn is(r: &Response, route: &Mounted) -> bool {
+    r.status == route.status && carries(r, route.mark)
+}
+
+async fn ask(h: &Node, route: &Mounted, headers: &[(&str, &str)], path: &str) -> Response {
+    match route.method {
+        // The declared content type is this client's `x-www-form-urlencoded`
+        // and the passkey routes read the bytes as JSON regardless, which is
+        // the module's own choice — `parse` runs on the raw body so that the
+        // `Origin` check happens before anything is parsed at all.
+        "POST" => h.post(path, headers, route.body).await,
+        _ => h.get(path, headers).await,
+    }
+}
+
+/// Every route the wiring claims to mount is answered by its own handler.
+///
+/// This is the test `the_passkey_sign_in_routes_...` first tried to be and
+/// could not: `http::router` ends in a catch-all shell fallback, so **no**
+/// path in this composed router ever answers 404 — an unmatched GET is a 303
+/// to `/login` and an unmatched POST is a 405. Whole `.merge()` calls can be
+/// deleted from `wiring::app` and every path still "exists", which is the
+/// built-but-never-constructed defect this module exists to close, wearing a
+/// green test as cover.
+///
+/// So each row names a mark only the handler behind it produces. The loop
+/// then measures what a path nothing mounts answers for the same method with
+/// the same session, and refuses any row that measurement already satisfies.
+/// That guard is the part worth having when a seventh subsystem is merged: a
+/// row that cannot fail fails here, instead of passing forever.
+#[tokio::test]
+async fn every_route_the_wiring_mounts_is_answered_by_its_own_handler() {
+    // No dot in it, so a signed-in request falls through to the shell
+    // document rather than to the embedded build's 404 — the fallback's
+    // widest answer, and therefore the hardest one to be distinct from.
+    const UNMOUNTED: &str = "/wiring-mounts-nothing-here";
+
+    let h = start().await;
+    let cookie = h.sign_in().await;
+
+    for route in [
+        // http::router
+        Mounted {
+            method: "GET",
+            path: "/login",
+            body: "",
+            signed_in: false,
+            status: 200,
+            mark: "action=\"/login\"",
+        },
+        // the health router, which spent its first life carved out of the
+        // lockdown gate with nothing behind it
+        Mounted {
+            method: "GET",
+            path: "/healthz",
+            body: "",
+            signed_in: false,
+            status: 200,
+            mark: "key_generation",
+        },
+        // lockdown::unlock_router
+        Mounted {
+            method: "GET",
+            path: "/unlock",
+            body: "",
+            signed_in: false,
+            status: 200,
+            mark: "Not locked",
+        },
+        // passkeyhttp::passkey_router: the ceremony itself. A phone that
+        // cannot reach this cannot sign in with a passkey at all.
+        Mounted {
+            method: "POST",
+            path: "/passkey/sign-in/begin",
+            body: "",
+            signed_in: false,
+            // Nothing is enrolled on a fresh node, and the module says so in
+            // its own words. That answer is the proof: a ceremony nobody
+            // mounted could not have an opinion about enrollment.
+            status: 409,
+            mark: "no passkey is enrolled",
+        },
+        Mounted {
+            method: "POST",
+            path: "/passkey/sign-in/finish",
+            body: "{}",
+            signed_in: false,
+            status: 400,
+            mark: "ceremony",
+        },
+        Mounted {
+            method: "POST",
+            path: "/passkey/step-up/begin",
+            body: "{\"access\":\"terminal\"}",
+            signed_in: false,
+            status: 401,
+            mark: "sign in first",
+        },
+        // passkeypage::page_router, with `passkeys.is_some()` really read:
+        // the ceremony page and its script, not the "passkeys are off" page
+        // that a hard-coded `false` would serve forever.
+        Mounted {
+            method: "GET",
+            path: "/passkey",
+            body: "",
+            signed_in: false,
+            status: 200,
+            mark: "/passkey/ceremony.js",
+        },
+        Mounted {
+            method: "GET",
+            path: "/passkey/ceremony.js",
+            body: "",
+            signed_in: false,
+            status: 200,
+            mark: "text/javascript",
+        },
+        Mounted {
+            method: "GET",
+            path: "/passkey/enroll",
+            body: "",
+            signed_in: false,
+            status: 200,
+            mark: "/passkey/enroll.js",
+        },
+        Mounted {
+            method: "GET",
+            path: "/passkey/enroll.js",
+            body: "",
+            signed_in: false,
+            status: 200,
+            mark: "text/javascript",
+        },
+        // apps::ui_router, behind `require_session` — signed in here because
+        // the gate is what `an_apps_own_ui_...` pins.
+        Mounted {
+            method: "GET",
+            path: "/apps/notes/",
+            body: "",
+            signed_in: true,
+            status: 404,
+            mark: "no such app asset",
+        },
+    ] {
+        let headers: Vec<(&str, &str)> = if route.signed_in {
+            vec![("cookie", cookie.as_str())]
+        } else {
+            Vec::new()
+        };
+
+        let unmounted = ask(&h, &route, &headers, UNMOUNTED).await;
+        assert!(
+            !is(&unmounted, &route),
+            "{} {} expects {} and {:?}, which is what this build already answers for \
+             a path nothing mounts: the row proves nothing and would stay green with \
+             the router deleted",
+            route.method,
+            route.path,
+            route.status,
+            route.mark,
+        );
+
+        let answered = ask(&h, &route, &headers, route.path).await;
+        assert!(
+            is(&answered, &route),
+            "{} {} is not reached by the handler the wiring merges for it: expected \
+             {} carrying {:?}, got {} carrying {:?}",
+            route.method,
+            route.path,
+            route.status,
+            route.mark,
+            answered.status,
+            answered.body,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The pre-auth carve-out, at the composed router
 // ---------------------------------------------------------------------------
 
@@ -726,6 +982,21 @@ async fn the_install_assets_are_readable_before_sign_in_and_the_shell_build_is_n
         );
     }
 
+    // And the carve-out cannot be walked out of. `is_public_install_asset`
+    // matches `/icons/` and `/splash/` by prefix, so without its `..` guard
+    // those two prefixes reach the whole embedded build with no session.
+    // `http.rs` pins the predicate against traversal; this pins it over the
+    // socket, where the path arrives exactly as a client wrote it.
+    for path in ["/icons/../index.html", "/splash/../kit/bus.js"] {
+        let r = h.get(path, &[]).await;
+        assert_eq!(
+            r.status, 303,
+            "the pre-auth carve-out can be walked out of, so the shell build is \
+             readable with no session: {path} answered {}",
+            r.status
+        );
+    }
+
     // The carve-out is inside the gate, not outside it: a locked node hands
     // out nothing, branding included.
     h.engage();
@@ -753,19 +1024,37 @@ async fn the_install_assets_are_readable_before_sign_in_and_the_shell_build_is_n
 async fn the_passkey_sign_in_routes_are_mounted_above_the_lockdown_gate() {
     let h = start().await;
 
-    // Mounted at all — otherwise "refused while locked" would be true of a
-    // path that is refused always, and the test would be vacuous.
-    for (method, path) in [
-        ("POST", "/passkey/sign-in/begin"),
-        ("GET", "/passkey"),
-        ("GET", "/passkey/ceremony.js"),
-    ] {
-        let r = match method {
-            "POST" => h.post(path, &[], "").await,
-            _ => h.get(path, &[]).await,
-        };
-        assert_ne!(r.status, 404, "{path} is not mounted: {}", r.body);
-    }
+    // Reached at all — otherwise "refused while locked" would be true of a
+    // path that is refused always, and the test would be vacuous. This used
+    // to be `assert_ne!(r.status, 404)`, which could not fail: `http::router`
+    // ends in a catch-all fallback, so an unmounted path in this build is a
+    // 303, never a 404. Deleting the whole ceremony merge kept it green.
+    // `every_route_the_wiring_mounts_is_answered_by_its_own_handler` does
+    // this for every router the assembly merges; the three paths below are
+    // the ones this test goes on to lock out.
+    let begin = h.post("/passkey/sign-in/begin", &[], "").await;
+    assert!(
+        begin.body.contains("no passkey is enrolled"),
+        "the ceremony did not answer for itself, so what gets refused below is a \
+         path that is refused always: {}",
+        begin.body
+    );
+    let page = h.get("/passkey", &[]).await;
+    assert!(
+        page.body.contains("/passkey/ceremony.js"),
+        "the sign-in page the operator's /login link points at is not being \
+         served: {}",
+        page.body
+    );
+    let script = h.get("/passkey/ceremony.js", &[]).await;
+    assert!(
+        script
+            .header("content-type")
+            .is_some_and(|t| t.starts_with("text/javascript")),
+        "the ceremony script is not served as script, so the page cannot run it: \
+         {:?}",
+        script.header("content-type")
+    );
 
     h.engage();
 
@@ -1013,6 +1302,127 @@ async fn holding_agents_empties_both_tool_lists_and_the_dispatch_that_follows() 
     );
 }
 
+/// A burst of refused agent commands reaches the watchdog, and the watchdog
+/// can still lock the node.
+///
+/// `Watchdog` has every counting rule in it and no way to be told anything:
+/// the only thing that calls `observe` is `WatchJournal`, and the only thing
+/// that constructs a `WatchJournal` is `wiring::bus`. Unwrap the journal there
+/// and the watchdog is handed to the bus, held, and never fed — the
+/// subsystem-built-and-never-constructed defect exactly, and one that
+/// `BusParts`' required fields cannot catch, because `watchdog` and
+/// `lockdown` are still passed in.
+///
+/// Asserted through the kill switch rather than by reading a counter: what the
+/// operator is owed is that a burst of refusals can still lock the node, and a
+/// count nothing acts on is worth nothing.
+#[tokio::test]
+async fn a_burst_of_refused_agent_commands_still_reaches_the_kill_switch() {
+    use deckjack_core::command::{CommandId, Issuer, Request};
+
+    let h = start_with(lockdown::AutoPolicy {
+        refused_agent_commands: lockdown::Burst {
+            count: 3,
+            within: Duration::from_secs(60),
+            response: lockdown::Response::Engage,
+        },
+        ..lockdown::AutoPolicy::default()
+    })
+    .await;
+
+    assert!(
+        !h.lockdown.is_locked(),
+        "a fresh node starts unlocked, or everything below is true of nothing"
+    );
+
+    // Granted `terminal.*` and asking for something else, which is the shape
+    // of the burst the trigger is named for: an agent probing outside what it
+    // was given. Each one is refused by the bus and so written to the journal
+    // as `Decision::Refused` by an `Issuer::Agent` — the entry `WatchJournal`
+    // is there to count.
+    for i in 0..3 {
+        let refused = h.bus.dispatch(Request::new(
+            CommandId::new("system.status".to_string()).expect("a valid command id"),
+            json!({}),
+            Issuer::agent(AGENT),
+        ));
+        assert!(
+            refused.is_err(),
+            "probe {i} was admitted, so this is not a burst of refusals at all"
+        );
+    }
+
+    assert!(
+        h.locked_within(Duration::from_secs(10)),
+        "three refused agent commands against a policy that says engage left the \
+         node unlocked: the bus's refusals never reach the watchdog, so no \
+         automatic trigger can fire however the policy is configured"
+    );
+}
+
+/// An agent's command that needs approval waits in the inbox the host built,
+/// and the approval the operator gives there is the one the bus honors.
+///
+/// `BusParts` can only make the inbox be *passed*. Drop the
+/// `.with_approvals(..)` call inside `wiring::bus` and the bus keeps its
+/// default `NoInbox`, which refuses everything that would have been queued:
+/// the operator's Inbox stays empty while the agent is told its command was
+/// refused, and nothing about either half looks broken on its own. The second
+/// half here is the stronger claim — `Approvals::approve` and the bus have to
+/// be talking about the same item, or the node takes an approval and then
+/// refuses the command it approved.
+#[tokio::test]
+async fn an_agents_queued_command_waits_in_the_inbox_the_host_built() {
+    use deckjack_core::command::{Admitted, Approval, CommandId, Issuer, Request};
+    use deckjack_core::grants::{Confirmation, ItemId};
+
+    let h = start().await;
+    let asked = || {
+        Request::new(
+            CommandId::new("system.app.approve".to_string()).expect("a valid command id"),
+            json!({ "app": "notes" }),
+            Issuer::agent(INBOX_AGENT),
+        )
+    };
+
+    let admitted = h
+        .bus
+        .dispatch(asked())
+        .expect("a granted cross-project command is queued, not refused");
+    let Admitted::Queued { pending, risk, .. } = admitted else {
+        panic!("an agent's cross-project command ran or was only confirmed: {admitted:?}");
+    };
+    assert_eq!(risk, RiskLevel::CrossProject, "got {risk:?}");
+
+    // The same inbox, asked through the handle the host holds. This is what
+    // "the approval lands where the bus looks" means: an item the operator
+    // cannot see is an agent waiting forever.
+    let waiting = h.approvals.pending().expect("the inbox reads");
+    assert_eq!(
+        waiting.len(),
+        1,
+        "the bus queued into an inbox the host cannot see; the operator's own \
+         inbox holds {waiting:?}"
+    );
+    assert_eq!(waiting[0].id.as_str(), pending.as_str(), "got {waiting:?}");
+    assert_eq!(waiting[0].command, "system.app.approve", "got {waiting:?}");
+
+    // Approved there, the bus runs it. A bus reading a different inbox gets
+    // this far and then refuses, which is the failure `BusParts` documents.
+    h.approvals
+        .approve(
+            &ItemId::from_text(pending.as_str()),
+            // A bus dispatch cannot report how much it touches, so the item's
+            // scale is `Unknown` and the operator accepts the unbounded case
+            // explicitly. See `approvals::Facts`.
+            Confirmation::UnknownAccepted,
+        )
+        .expect("the operator can approve what the bus queued");
+    h.bus
+        .dispatch_approved(asked(), Approval::granted(pending))
+        .expect("the command the operator approved is the command the bus runs");
+}
+
 // ---------------------------------------------------------------------------
 // Step 1, over the real auth state and the real store
 // ---------------------------------------------------------------------------
@@ -1029,7 +1439,10 @@ struct Revoking {
     sessions: Arc<wiring::AuthSessions>,
     auth: Arc<std::sync::Mutex<AuthState>>,
     store: Arc<std::sync::Mutex<Store>>,
-    _dir: tempfile::TempDir,
+    /// The same registry `AuthSessions` holds, so a test can open a real pty
+    /// and then ask whether the kill switch took it.
+    terminals: Arc<terminal::Registry>,
+    dir: tempfile::TempDir,
 }
 
 fn revoking() -> Revoking {
@@ -1055,12 +1468,13 @@ fn revoking() -> Revoking {
         sessions: wiring::AuthSessions::new(
             Arc::clone(&auth),
             Arc::clone(&store),
-            terminals,
+            Arc::clone(&terminals),
             NODE.to_string(),
         ),
         auth,
         store,
-        _dir: dir,
+        terminals,
+        dir,
     }
 }
 
@@ -1105,6 +1519,13 @@ impl Revoking {
                  re-entrant lock rather than failing"
             )
         })
+    }
+
+    /// What lockdown's step 2 would find still running — over the production
+    /// `Children` implementation, which is the only report an operator gets
+    /// about what the kill switch left behind.
+    fn children_still_running(&self) -> Vec<deckjack_core::lockdown::Child> {
+        lockdown::Children::running(&wiring::TerminalChildren::new(Arc::clone(&self.terminals)))
     }
 
     fn revocation_rows(&self) -> Vec<deckjack_core::events::Entry> {
@@ -1173,6 +1594,61 @@ async fn the_kill_switch_leaves_one_audit_row_for_every_session_it_took() {
             .expect("the session rows read")
             .is_empty(),
         "a revoked session is still in the state database and would come back"
+    );
+}
+
+/// The kill switch takes the shells, not only the sessions.
+///
+/// Step 1 kills the ptys itself, and the comment there says why it cannot be
+/// left to lockdown's own step 2: `Registry::kill_all` `SIGKILL`s the process
+/// *group*, so a build the shell started dies with it, and it drops the
+/// sessions, which closes the pty masters and hangs up anything still
+/// attached. Signaling a bare pid does neither.
+///
+/// Without that call every pty keeps running as the host user after the kill
+/// switch fires, with its master still open for whoever is attached — and the
+/// sessions being gone is what makes it invisible, because nothing is left
+/// that would list them to the operator. So this asks the two questions the
+/// operator would: does step 2 still see a child, and is the old pty still
+/// reachable.
+#[tokio::test]
+async fn the_kill_switch_takes_the_shells_the_revoked_sessions_left_running() {
+    let r = revoking();
+    r.seat("127.0.0.1");
+
+    let shell = r
+        .terminals
+        .open(SessionSpec::login_shell(r.dir.path()))
+        .expect("a login shell starts");
+    let id = shell.id().clone();
+    assert_eq!(
+        r.children_still_running().len(),
+        1,
+        "no live child was started, so this test cannot tell a kill from a shell \
+         that was never there"
+    );
+    // The handle is dropped here on purpose: the registry's copy is the one
+    // that keeps the pty open, and holding a second would make "the master is
+    // closed" a claim about this test rather than about the node.
+    drop(shell);
+
+    assert_eq!(
+        r.revoke_all_before(Duration::from_secs(20)),
+        1,
+        "step 1 did not report the session it dropped"
+    );
+
+    assert!(
+        r.children_still_running().is_empty(),
+        "a shell survived the kill switch: it is still running as the host user \
+         with the session that asked for it gone, and {:?} is what step 2 would \
+         have to report",
+        r.children_still_running()
+    );
+    assert!(
+        r.terminals.attach(&id).is_err(),
+        "the revoked session's pty is still reachable by id, so anything holding \
+         that id keeps reading and writing a shell after the lockdown"
     );
 }
 

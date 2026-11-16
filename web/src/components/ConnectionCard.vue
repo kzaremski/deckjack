@@ -41,20 +41,48 @@ const show = computed(() => status.value !== "open");
 /** "closed" is the one disconnected state nothing is retrying. */
 const stopped = computed(() => status.value === "closed");
 
+const retryIn = computed(() => {
+  const at = shell.bus.retryAt.value;
+  if (at === null || stopped.value) return null;
+  return Math.max(0, Math.ceil((at - now.value) / 1000));
+});
+
+/**
+ * Whether an attempt is happening right now, as opposed to being waited for.
+ *
+ * The bus's status is "connecting" for both: after it condemns a silent node
+ * it sets "connecting" and *then* schedules the retry, so for the length of
+ * the backoff the status says an attempt is in flight while no socket exists.
+ * A pending countdown is the evidence that it is not — so the heading agrees
+ * with the "Next try" beside it instead of contradicting it.
+ */
+const attempting = computed(
+  () => status.value === "connecting" && (retryIn.value === null || retryIn.value === 0),
+);
+
 const heading = computed(() => {
+  // "Disconnected" wins over "this device is offline" because it is the more
+  // final of the two: see `detail`.
   if (stopped.value) return "Disconnected";
   if (offline.value) return "This device is offline";
-  return status.value === "connecting" ? "Reconnecting" : "Node not answering";
+  return attempting.value ? "Reconnecting" : "Node not answering";
 });
 
 const nodeName = computed(() => shell.bus.node.value?.name ?? null);
 
 const detail = computed(() => {
-  if (offline.value) {
-    return "The shell is waiting for a network. Nothing can change until this device is back online — your windows and files are on the node, not here.";
-  }
+  // Closed is checked before offline, and the heading checks them in the same
+  // order, because the two sentences disagree about what happens next and
+  // only one of them can be true. "Waiting for a network" promises the shell
+  // resumes when wifi returns; a connection the shell closed does not — the
+  // bus deliberately leaves "closed" alone when the network comes back. So a
+  // device that is offline *and* closed is told the more final thing, which
+  // is the one that will still be true after the wifi is fixed.
   if (stopped.value) {
     return "The connection was closed and nothing is retrying it.";
+  }
+  if (offline.value) {
+    return "The shell is waiting for a network. Nothing can change until this device is back online — your windows and files are on the node, not here.";
   }
   const who = nodeName.value ? `${nodeName.value}` : "the shell node";
   return `The shell cannot reach ${who}. Your windows, terminals and files live there, so nothing can be opened or changed until it answers.`;
@@ -66,12 +94,6 @@ const silentFor = computed(() => {
   if (at === null) return null;
   const seconds = Math.floor((now.value - at) / 1000);
   return seconds >= 5 ? seconds : null;
-});
-
-const retryIn = computed(() => {
-  const at = shell.bus.retryAt.value;
-  if (at === null || stopped.value) return null;
-  return Math.max(0, Math.ceil((at - now.value) / 1000));
 });
 </script>
 

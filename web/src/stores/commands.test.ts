@@ -1,10 +1,10 @@
 // @vitest-environment happy-dom
 import { describe, expect, it } from "vitest";
 
-import { createCommands, type CommandEntry, type CommandsEnv } from "./commands.ts";
+import { createCommands, riskLabel, type CommandEntry, type CommandsEnv } from "./commands.ts";
 import { chordOf, createKeyboard, DEFAULT_SHORTCUTS } from "../shell/keyboard.ts";
 import { harness } from "../testing/shell-harness.ts";
-import type { CommandSpec } from "../protocol.ts";
+import type { CommandSpec, Risk } from "../protocol.ts";
 
 /**
  * One promise, two modules: the operator asked for something, and the right
@@ -48,6 +48,23 @@ function titles(scored: Array<{ entry: CommandEntry }>): string[] {
 /** A keyboard event as the browser would deliver it for a chord. */
 function press(init: KeyboardEventInit): KeyboardEvent {
   return new KeyboardEvent("keydown", init);
+}
+
+/** A focused text field: an input unless a different tag is asked for. */
+function textField(tag: "input" | "textarea" = "input"): HTMLElement {
+  const field = document.createElement(tag);
+  document.body.appendChild(field);
+  return field;
+}
+
+/**
+ * The same keystroke, but delivered to a text field. `target` is read-only on
+ * a constructed event, so it is defined rather than assigned.
+ */
+function pressInto(field: HTMLElement, init: KeyboardEventInit): KeyboardEvent {
+  const event = press(init);
+  Object.defineProperty(event, "target", { value: field });
+  return event;
 }
 
 describe("the palette finding what the operator half-remembers", () => {
@@ -277,13 +294,54 @@ describe("a chord as the operator typed it", () => {
   it("means Command on an Apple keyboard and Control on every other one", () => {
     expect(chordOf(press({ key: "k", metaKey: true }), true)).toBe("mod+k");
     expect(chordOf(press({ key: "k", ctrlKey: true }), false)).toBe("mod+k");
-    // And the other one is not quietly treated as the same key.
-    expect(chordOf(press({ key: "k", metaKey: true }), false), "Win+K was read as Ctrl+K").not.toBe(
-      "mod+k",
+    // And the other one is not quietly treated as the same key. Asserted as
+    // the exact spelling rather than as "not mod+k": a negation is satisfied
+    // by every wrong answer as readily as by the right one, and two separate
+    // ways of getting `mod` wrong hid behind it.
+    expect(chordOf(press({ key: "k", metaKey: true }), false), "Win+K was not spelled as Meta").toBe(
+      "meta+k",
     );
-    expect(chordOf(press({ key: "k", ctrlKey: true }), true), "Ctrl+K was read as Cmd+K").not.toBe(
-      "mod+k",
-    );
+    expect(
+      chordOf(press({ key: "k", ctrlKey: true }), true),
+      "Ctrl+K on an Apple keyboard was not spelled as Ctrl",
+    ).toBe("ctrl+k");
+  });
+
+  it("names the second modifier after the keyboard it is actually on", () => {
+    // `mod` takes one of Command and Control, and the other stays reportable
+    // so that mod+ctrl remains expressible. Name the leftover after the wrong
+    // platform and the chord the event produces can never match the chord the
+    // table stores: the key does nothing and the palette advertises it anyway.
+    expect(
+      chordOf(press({ key: "x", metaKey: true, ctrlKey: true }), true),
+      "the second modifier on an Apple keyboard is Control",
+    ).toBe("mod+ctrl+x");
+    expect(
+      chordOf(press({ key: "x", ctrlKey: true, metaKey: true }), false),
+      "the second modifier on every other keyboard is Meta",
+    ).toBe("mod+meta+x");
+  });
+
+  it("puts the modifiers in the one order the chord table is written in", () => {
+    // The spelling *is* the lookup key, so Alt before Shift is not cosmetic.
+    // Nothing shipped uses both today, which is why a swap here would surface
+    // as the first operator to rebind onto such a chord finding a dead key.
+    expect(
+      chordOf(press({ key: "x", ctrlKey: true, altKey: true, shiftKey: true }), false),
+      "modifier order is part of the chord spelling",
+    ).toBe("mod+alt+shift+x");
+  });
+
+  it("reaches a command bound to a chord that uses both Alt and Shift", () => {
+    // The round trip: the table is keyed by the table's spelling and looked up
+    // by the event's, so this fails if the two ever disagree.
+    const keyboard = createKeyboard({ apple: false, storage: memoryStorage().env });
+    keyboard.bind([{ commandId: "x.windows.tile", chord: "mod+alt+shift+t" }]);
+
+    expect(
+      keyboard.resolve(press({ key: "t", ctrlKey: true, altKey: true, shiftKey: true })),
+      "a chord using both Alt and Shift was unreachable",
+    ).toBe("x.windows.tile");
   });
 
   it("reaches the command an Apple operator expects from Command, not Control", () => {
@@ -487,5 +545,212 @@ describe("rebinding a shortcut", () => {
       keyboard.chordFor("x.first"),
       "the command that lost the chord still claims it",
     ).not.toBe("mod+1");
+  });
+});
+
+describe("a keystroke the operator meant as text", () => {
+  it("belongs to the field they typed it into, not to a bare-key shortcut", () => {
+    const keyboard = createKeyboard({ apple: false, storage: memoryStorage().env });
+    keyboard.bind([
+      { commandId: "x.window.new", chord: "n" },
+      { commandId: "x.cancel", chord: "escape" },
+    ]);
+    const input = textField();
+    const area = textField("textarea");
+
+    expect(
+      keyboard.resolve(pressInto(input, { key: "n" })),
+      "typing an n in a field opened a new window",
+    ).toBeNull();
+    expect(
+      keyboard.resolve(pressInto(area, { key: "n" })),
+      "a textarea is a place to type too",
+    ).toBeNull();
+    expect(
+      keyboard.resolve(pressInto(input, { key: "Escape" })),
+      "a bare Escape fired from inside a text field",
+    ).toBeNull();
+    // Nothing is wrong with the chord itself -- the same key still works when
+    // the operator is not typing, which is the whole point of the guard.
+    expect(keyboard.resolve(press({ key: "n" })), "the bare chord stopped working entirely").toBe(
+      "x.window.new",
+    );
+  });
+
+  it("does not take a real chord, or one that asked for the exception, with it", () => {
+    // The pair to the test above: the guard exists to protect text entry, and
+    // it has done too much if Ctrl+K no longer opens the palette from the
+    // palette's own search box, or if whileTyping stops meaning anything.
+    const keyboard = createKeyboard({ apple: false, storage: memoryStorage().env });
+    keyboard.bind([
+      { commandId: "x.palette.open", chord: "mod+k" },
+      { commandId: "x.find", chord: "f", whileTyping: true },
+    ]);
+    const input = textField();
+
+    expect(
+      keyboard.resolve(pressInto(input, { key: "k", ctrlKey: true })),
+      "Ctrl+K must open the palette from a text field",
+    ).toBe("x.palette.open");
+    expect(
+      keyboard.resolve(pressInto(input, { key: "f" })),
+      "whileTyping was ignored",
+    ).toBe("x.find");
+  });
+
+  it("is left to the IME while a composition is still open", () => {
+    // Composing Japanese, Chinese or Korean, candidate selection uses keys
+    // that are also chords. Stealing them makes text entry impossible for an
+    // operator an ASCII-only test run never models.
+    const keyboard = createKeyboard({ apple: false, storage: memoryStorage().env });
+    keyboard.bind([{ commandId: "x.palette.open", chord: "mod+k" }]);
+
+    expect(
+      keyboard.resolve(press({ key: "k", ctrlKey: true, isComposing: true })),
+      "a shortcut fired in the middle of an IME composition",
+    ).toBeNull();
+  });
+});
+
+describe("asking the browser for the keys it normally keeps for itself", () => {
+  it("asks for the chords the shell needs back", async () => {
+    const asked: Array<string[] | undefined> = [];
+    const keyboard = createKeyboard({
+      apple: false,
+      storage: memoryStorage().env,
+      keyboard: { lock: async (keys) => void asked.push(keys), unlock: () => {} },
+    });
+
+    expect(await keyboard.requestLock()).toBe("locked");
+    // Spelled out rather than compared against LOCKED_KEYS: a test that reads
+    // the same list the code does would agree with an empty one, and an empty
+    // request is a lock the status claims and the browser never granted.
+    expect(asked[0], "the lock request did not name the keys the shell needs").toEqual([
+      "KeyW",
+      "KeyT",
+      "Tab",
+      "Escape",
+    ]);
+  });
+
+  it("tells the operator when the browser refused", async () => {
+    // Chromium refuses outside an installed window or fullscreen. Reporting
+    // that as success is worse than not asking: the operator presses Ctrl+W
+    // expecting a Deckjack window to close and closes the whole shell.
+    const keyboard = createKeyboard({
+      apple: false,
+      storage: memoryStorage().env,
+      keyboard: { lock: () => Promise.reject(new Error("not fullscreen")), unlock: () => {} },
+    });
+
+    expect(await keyboard.requestLock(), "a refused lock was reported as locked").toBe("refused");
+    expect(keyboard.lockStatus.value).toBe("refused");
+  });
+
+  it("says so in a browser that has no keyboard lock at all", async () => {
+    const keyboard = createKeyboard({ apple: false, storage: memoryStorage().env });
+
+    expect(await keyboard.requestLock()).toBe("unsupported");
+    expect(keyboard.lockStatus.value).toBe("unsupported");
+  });
+
+  it("hands the keys back when the lock is released", async () => {
+    let unlocked = 0;
+    const keyboard = createKeyboard({
+      apple: false,
+      storage: memoryStorage().env,
+      keyboard: {
+        lock: async () => {},
+        unlock: () => {
+          unlocked += 1;
+        },
+      },
+    });
+
+    await keyboard.requestLock();
+    keyboard.releaseLock();
+
+    expect(unlocked, "the browser's keys were still captured after releasing the lock").toBe(1);
+    expect(keyboard.lockStatus.value).toBe("idle");
+  });
+});
+
+describe("dispatching a command that says it cannot run right now", () => {
+  it("does not run it, whichever way the operator asked", async () => {
+    // The palette hides an unavailable command, so the hole only shows on the
+    // other paths: a shortcut, the CLI, an agent. Without this check Ctrl+W on
+    // an empty workspace closes a window that is not there.
+    let ran = 0;
+    const commands = createCommands({ storage: memoryStorage().env });
+    commands.register([
+      entry("shell.window.close", "Close window", {
+        available: () => false,
+        run: () => {
+          ran += 1;
+        },
+      }),
+    ]);
+
+    await commands.dispatch("shell.window.close");
+
+    expect(ran, "a command that said it cannot run was run anyway").toBe(0);
+    // And it is not a wiring bug: nothing is broken, the command simply has
+    // nothing to act on, so the shell must not report an error for it.
+    expect(commands.lastError.value, "an unavailable command looked like a wiring bug").toBeNull();
+  });
+});
+
+describe("how much the palette remembers", () => {
+  it("keeps the whole run of recent commands, not just the last one", async () => {
+    const commands = createCommands({ storage: memoryStorage().env });
+    commands.register([
+      entry("app.open.files", "Open Files"),
+      entry("app.open.notes", "Open Notes"),
+      entry("app.open.mail", "Open Mail"),
+    ]);
+
+    await commands.dispatch("app.open.files");
+    await commands.dispatch("app.open.notes");
+    await commands.dispatch("app.open.mail");
+
+    // The empty palette is the view the operator opens most, and its promise
+    // is a history in most-recent-first order -- not one remembered command
+    // followed by registration order.
+    expect(titles(commands.search("")), "the palette remembered only the last command").toEqual([
+      "app.open.mail",
+      "app.open.notes",
+      "app.open.files",
+    ]);
+  });
+
+  it("offers a dozen rows when the caller does not say how many", () => {
+    // The palette relies on the default, so a default of "all of them" makes
+    // an unscrollable wall on a node with many adapter commands -- and on the
+    // Pocket's screen the first row is the only one the operator can reach.
+    const commands = createCommands({ storage: memoryStorage().env });
+    commands.register(
+      Array.from({ length: 20 }, (_, i) => entry(`app.open.${i}`, `Open thing ${i}`)),
+    );
+
+    expect(commands.search("open").length, "the default page size for a query").toBe(12);
+    expect(commands.search("").length, "the default page size for an empty palette").toBe(12);
+  });
+});
+
+describe("what the operator is told a command will do", () => {
+  it("never describes a command as gentler than it is", () => {
+    // This label is what the confirmation dialog shows, so a destructive
+    // command labeled "reads" is the operator confirming something they were
+    // told was harmless. Every level is asserted at once, so collapsing them
+    // all onto one answer cannot pass.
+    const risks: Risk[] = ["read_only", "write", "cross_project", "outbound", "destructive"];
+
+    expect(risks.map(riskLabel)).toEqual([
+      "reads",
+      "writes",
+      "touches another project",
+      "sends something out",
+      "destructive",
+    ]);
   });
 });

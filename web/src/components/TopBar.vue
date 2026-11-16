@@ -96,13 +96,21 @@ const latency = computed(() => {
 const items = computed(() =>
   dockOrder.map((id) => {
     const open = shell.windows.all.value.filter((w) => w.app === id);
-    const active = open.some((w) => !w.minimized && w.id === shell.windows.focusedId.value);
+    const focused = open.find((w) => !w.minimized && w.id === shell.windows.focusedId.value);
     return {
       app: apps[id],
       running: open.length > 0,
-      active,
+      active: focused !== undefined,
       badge: apps[id].badge === "inbox" ? shell.inboxPending.value : 0,
-      windowId: open[0]?.id ?? null,
+      // The window a click acts on has to be the same window the lit state is
+      // about. This used to hand over `open[0]`, the *bottom* of the app's
+      // z-order, while `active` was true if any of the app's windows had
+      // focus: pressing the lit button minimized something in the background,
+      // left the focused window up, and stayed lit, so the operator could
+      // press it forever and never put away what they were looking at.
+      // With nothing of the app focused, the front-most window is the one to
+      // bring forward.
+      windowId: focused?.id ?? open.at(-1)?.id ?? null,
     };
   }),
 );

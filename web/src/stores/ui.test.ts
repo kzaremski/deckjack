@@ -2,7 +2,13 @@
 import { describe, expect, it } from "vitest";
 
 import { createUi, type UiEnv, type UiStore } from "./ui.ts";
-import { breakpointFor, createViewport, type ViewportEnv } from "../shell/viewport.ts";
+import {
+  breakpointFor,
+  createViewport,
+  measureHinge,
+  type ViewportEnv,
+} from "../shell/viewport.ts";
+import { foundation } from "../tokens/index.ts";
 import type { BreakpointName } from "../tokens/index.ts";
 import { harness, mountInShell } from "../testing/shell-harness.ts";
 import App from "../App.vue";
@@ -109,6 +115,26 @@ describe("a notice the operator has not read", () => {
 
     r.ui.dismiss(id);
     expect(texts(r.ui), "an error could not be dismissed").toEqual([]);
+  });
+
+  it("is owed the screen only when it is an error, warnings included", () => {
+    // `Notice` declares three kinds and the two tests above pin two of them,
+    // which left "warn" free to go either way. It is settled here as a
+    // promise: a warning expires like an informational notice does.
+    //
+    // That is the deliberate choice, not an accident of the implementation.
+    // The warnings this shell raises are transient conditions -- reconnecting,
+    // a layout that drifted back into line -- and a stack that keeps them
+    // until they are clicked away fills with stale ones that sit on top of
+    // the errors underneath. Only something the operator still has to act on
+    // gets to hold the screen.
+    const r = uiRig();
+    for (const kind of ["info", "warn"] as const) r.ui.notify(kind, kind);
+    r.ui.notify("error", "error");
+
+    r.advance(LONG_ENOUGH_MS);
+
+    expect(texts(r.ui), "only an error may outlive the timeout").toEqual(["error"]);
   });
 
   it("is one of several, shown in the order they arrived", () => {
@@ -235,6 +261,29 @@ describe("the notice stack the operator looks at", () => {
     );
   });
 
+  it("marks a failure as a failure, and not merely as one more line of text", async () => {
+    // `data-kind` is the only thing that tells an error apart from a
+    // confirmation on screen -- the scoped CSS colors the border from it --
+    // so a test that reads the text alone passes for a stack that renders
+    // every failure in the same neutral chrome as a success.
+    const rig = harness();
+    const { wrapper } = mountInShell(NoticeStack, { harness: rig });
+
+    rig.shell.ui.notify("error", "the node refused to move the window", "shell.window.place");
+    rig.shell.ui.notify("info", "copied the path");
+    await wrapper.vm.$nextTick();
+
+    const errors = wrapper.findAll('[data-kind="error"]');
+    expect(errors.length, "the failure was not marked as an error on screen").toBe(1);
+    expect(errors[0]!.text(), "something other than the failure was marked as the error").toContain(
+      "the node refused to move the window",
+    );
+    expect(
+      wrapper.findAll('[data-kind="info"]').length,
+      "the informational notice was not marked as informational",
+    ).toBe(1);
+  });
+
   it("takes down the notice whose button was pressed, and only that one", async () => {
     const rig = harness();
     const { wrapper } = mountInShell(NoticeStack, { harness: rig });
@@ -291,6 +340,31 @@ describe("the confirmation dialog the operator answers", () => {
       ).toBe(false);
     }
   });
+
+  it("claims no count when the backend never reported one", async () => {
+    // The absent branch, which the case above cannot reach. A blank number
+    // reads as a count of nothing: "Affects items." is worse than saying
+    // nothing, because the count is the one figure the operator is being
+    // asked to check before answering.
+    const rig = harness();
+    const { wrapper } = mountInShell(ConfirmDialog, { harness: rig });
+
+    void rig.shell.ui.confirm({
+      command: "mail.archive",
+      title: "Archive messages?",
+      detail: "They can be restored from the archive.",
+      risk: "write",
+    });
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.text(), "the dialog was not put in front of the operator at all").toContain(
+      "Archive messages?",
+    );
+    expect(
+      wrapper.text(),
+      "a dialog with no reported count still claimed to affect something",
+    ).not.toContain("Affects");
+  });
 });
 
 /** The classes the shell promises, narrowest first. */
@@ -326,20 +400,26 @@ function viewportRig(
     size?: { w: number; h: number };
     coarsePointer?: boolean;
     hinge?: number | null;
+    /** Installed as a PWA in its own window, rather than open in a tab. */
+    standalone?: boolean;
   } = {},
 ): ViewportRig {
   let size = options.size ?? { w: widthIn("desktop"), h: 900 };
   let hinge = options.hinge ?? null;
   let coarse = options.coarsePointer ?? false;
+  const standalone = options.standalone ?? false;
   const resizes = new Set<() => void>();
   const pointerHandlers: Array<(event: { matches: boolean }) => void> = [];
 
   const env: ViewportEnv = {
     media(query) {
       const coarseQuery = query.includes("pointer: coarse");
+      const displayQuery = query.includes("display-mode");
       return {
         get matches() {
-          return coarseQuery ? coarse : false;
+          if (coarseQuery) return coarse;
+          if (displayQuery) return standalone;
+          return false;
         },
         media: query,
         onchange: null,
@@ -400,6 +480,22 @@ describe("the size classes", () => {
       expect(seen.has(name), `no width is ever classified as ${name}`).toBe(true);
     }
   });
+
+  it("each begin at their own threshold rather than a pixel past it", () => {
+    // This is not a pixel assertion and does not break the file's rule
+    // against pinning thresholds: the widths are read back out of the tokens,
+    // so retuning a breakpoint moves this test with it. What is pinned is the
+    // semantics -- a class starts *at* its threshold, inclusively -- which is
+    // otherwise undefined by the suite. A comparison weakened to `>` shifts
+    // every boundary by one pixel at once, and the 360px cover screen that
+    // `foldFolded` exists for is then classified as a phone.
+    for (const name of CLASSES) {
+      expect(
+        breakpointFor(foundation.breakpoint[name]),
+        `${name} did not begin at its own threshold`,
+      ).toBe(name);
+    }
+  });
 });
 
 describe("the layout the shell is in", () => {
@@ -418,6 +514,47 @@ describe("the layout the shell is in", () => {
       `a 320px screen was classified as ${viewport.breakpoint.value}`,
     ).toBeLessThan(rank("tablet"));
     expect(viewport.width.value, "the measured width was not picked up").toBe(320);
+  });
+
+  it("publishes both axes of the measured size, not the width twice", () => {
+    // `height` is published API with real callers: it is what sizes a sheet
+    // and a compact pane, and it is the axis `visualViewport` shrinks when a
+    // soft keyboard opens. Two same-typed fields next to each other are easy
+    // to swap, and a shell that reads the width as its height runs compact
+    // content off the bottom of the rotated portrait panel while a phone with
+    // the keyboard up never shrinks at all. Asserted as a pair so a swap in
+    // either direction shows up.
+    const measured = { w: widthIn("desktop"), h: 820 };
+    const r = viewportRig({ size: measured });
+    const viewport = createViewport(r.env);
+
+    expect(
+      [viewport.width.value, viewport.height.value],
+      "the size the shell started at was misread, or its axes were swapped",
+    ).toEqual([measured.w, measured.h]);
+
+    r.resizeTo({ w: 320, h: 1600 });
+
+    expect(
+      [viewport.width.value, viewport.height.value],
+      "a resize was not picked up on both axes, or they were swapped",
+    ).toEqual([320, 1600]);
+  });
+
+  it("knows an installed window from a browser tab, which is what lets it ask for the keyboard", () => {
+    // `standalone` is the gate on App.vue's one request for Keyboard Lock.
+    // Forced false, an installed Deckjack never asks, and Ctrl+W then closes
+    // the whole workspace instead of one window -- the exact failure the lock
+    // is there to prevent. A tab must not claim it either: the browser will
+    // refuse, and the shell would be asking for something it cannot have.
+    expect(
+      createViewport(viewportRig().env).standalone.value,
+      "a plain browser tab reported itself as an installed window",
+    ).toBe(false);
+    expect(
+      createViewport(viewportRig({ standalone: true }).env).standalone.value,
+      "an installed window did not report itself standalone",
+    ).toBe(true);
   });
 
   it("is compact on a touch screen however wide it is", () => {
@@ -485,6 +622,89 @@ describe("a foldable's hinge", () => {
       rank("foldFolded"),
     );
     expect(viewport.splitFraction.value, "the hinge was not re-measured on unfolding").toBe(0.47);
+  });
+});
+
+/**
+ * A window for `measureHinge`, which reads only `matchMedia` and `innerWidth`
+ * off it. The document it probes is happy-dom's real one.
+ */
+function hingeWindow(options: { segments: boolean; innerWidth?: number }): Window {
+  return {
+    innerWidth: options.innerWidth ?? 1000,
+    matchMedia: (query: string) =>
+      ({
+        matches: options.segments && query.includes("horizontal-viewport-segments"),
+        media: query,
+      }) as unknown as MediaQueryList,
+  } as unknown as Window;
+}
+
+/**
+ * Where the browser lays the probe out — the one thing happy-dom cannot
+ * answer, because it has no layout engine and so resolves every `env()` to a
+ * rect at zero. Faking that is faking the layout engine, the same edge the
+ * rig fakes for `matchMedia`; the document, the element and the measurement
+ * arithmetic are all real.
+ */
+function withProbeLaidOutAt(left: number, run: () => void) {
+  const proto = HTMLElement.prototype;
+  const original = proto.getBoundingClientRect;
+  proto.getBoundingClientRect = () =>
+    ({
+      x: left,
+      y: 0,
+      left,
+      top: 0,
+      right: left + 1,
+      bottom: 1,
+      width: 1,
+      height: 1,
+      toJSON: () => ({}),
+    }) as DOMRect;
+  try {
+    run();
+  } finally {
+    proto.getBoundingClientRect = original;
+  }
+}
+
+describe("measuring a hinge in the browser rather than through the rig", () => {
+  // Every viewport test above injects `hingeFraction`, so the function the
+  // browser actually calls had no test at all -- the "built, tested and never
+  // constructed" defect class this file's header exists to catch, one layer
+  // further out. These drive the real implementation.
+
+  it("reports no hinge on a device that has only one viewport segment", () => {
+    // Without this guard every ordinary laptop reports a hinge from a probe
+    // that env() never resolved, and its panes get split around a crease
+    // that is not there.
+    expect(
+      measureHinge(document, hingeWindow({ segments: false })),
+      "a device with no viewport segments reported a hinge",
+    ).toBeNull();
+  });
+
+  it("reports the hinge where the segment boundary actually lands", () => {
+    // The whole reason for the probe: an asymmetric fold's hinge is not in
+    // the middle, and assuming it is creases a pane.
+    withProbeLaidOutAt(400, () => {
+      expect(
+        measureHinge(document, hingeWindow({ segments: true, innerWidth: 1000 })),
+        "a measured hinge was discarded in favor of a guess",
+      ).toBe(0.4);
+    });
+  });
+
+  it("falls back to the middle of a fold whose probe did not resolve", () => {
+    // Two segments, but a rect at the very edge: the browser understood the
+    // media query and not the env(). There is a hinge, so the split still
+    // needs somewhere to go, and the middle is the least wrong answer --
+    // returning nothing at all would be read as "this device does not fold".
+    expect(
+      measureHinge(document, hingeWindow({ segments: true })),
+      "a fold whose hinge could not be measured was reported as having none",
+    ).toBe(0.5);
   });
 });
 

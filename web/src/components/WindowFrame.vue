@@ -310,8 +310,10 @@ const style = computed(() => ({
 }
 
 /* A grab cursor on a window that cannot be moved is a promise the layout does
-   not keep. The buttons in the bar still work, and double-click still
-   maximizes, so the bar is not inert — only the dragging is gone. */
+   not keep. The bar is not inert: Minimize and Close still work, and so does
+   focusing by clicking the title. What the layout owns it keeps — maximizing
+   and snapping are refused while tiled, with a reason, rather than leaving a
+   hole in the layout and a window over its neighbor. */
 .window.tiled .bar,
 .window.tiled .bar:active {
   cursor: default;

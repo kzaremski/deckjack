@@ -90,6 +90,16 @@ function live(options: HarnessOptions = {}) {
       await flushPromises();
       return id;
     },
+    /**
+     * Answers whatever the shell has asked the node for since the last call.
+     *
+     * `open` above answers the invoke it starts itself. This is for work a
+     * *click* started, where the test has no promise to hold on to.
+     */
+    async answer(): Promise<void> {
+      answerInvokes(rig.socket(), answered);
+      await flushPromises();
+    },
   };
 }
 
@@ -167,6 +177,47 @@ describe("the node pill", () => {
     ).not.toMatch(/\d+ms/);
   });
 
+  it("keeps naming the node that went quiet, so the operator knows which one dropped", async () => {
+    // The withdrawal test above checks that "gen N" is gone and the word
+    // "reconnecting" is there, which a pill reading "node · reconnecting"
+    // satisfies while having lost the one fact that distinguishes two nodes.
+    // Pinning the whole string says it in one assertion: the name is kept,
+    // the generation is gone, and no round trip is quoted beside it.
+    const { rig } = live();
+    const wrapper = mountBar(rig);
+    measureRoundTrip(rig, 40);
+    rig.advance(UNTIL_DECLARED_DEAD_MS);
+    await wrapper.vm.$nextTick();
+
+    expect(
+      wrapper.get(".node").text(),
+      "the degraded pill does not read exactly as the operator is owed",
+    ).toBe("pocket · reconnecting");
+  });
+
+  it("withdraws a round trip whose connection is no longer open, whatever the store holds", async () => {
+    // The bar's own `status === "open"` gate is what this is about, and the
+    // suite cannot see it from the outside: the bus nulls `rtt` on both of
+    // its own ways down, so a bar with no gate at all passes anyway. Putting
+    // a measurement back after the connection has gone asks the component
+    // directly, and models the obvious "show the last known latency" change
+    // to the store that would otherwise reach the pill unopposed.
+    const { rig } = live();
+    const wrapper = mountBar(rig);
+    measureRoundTrip(rig, 40);
+    await wrapper.vm.$nextTick();
+    expect(wrapper.get(".rtt").text(), "no round trip was reported to begin with").toBe("40ms");
+
+    rig.advance(UNTIL_DECLARED_DEAD_MS);
+    rig.shell.bus.rtt.value = 40;
+    await wrapper.vm.$nextTick();
+
+    expect(
+      wrapper.find(".rtt").exists(),
+      "the bar quotes a round trip measured over a connection that is gone",
+    ).toBe(false);
+  });
+
   it("says this device is offline instead of naming a node it cannot reach", async () => {
     const { rig } = live();
     const wrapper = mountBar(rig);
@@ -197,6 +248,30 @@ describe("the node pill", () => {
     // Exact, because the harness owns the bus clock: 40ms is the time the
     // node took, not an interval the test happens to have observed.
     expect(wrapper.text(), "the measured round trip is not reported").toContain("40ms");
+  });
+
+  it("shows no round trip at all until it has measured one", async () => {
+    // The sibling test asserts this with `/\d+ms/`, which is blind to the way
+    // the gate actually breaks: an ungated figure renders the literal
+    // "nullms", and that has no digits in it. So this asks whether the
+    // round-trip element is on screen at all, and pins the pill's whole text.
+    const { rig } = live();
+    const wrapper = mountBar(rig);
+    await wrapper.vm.$nextTick();
+
+    expect(
+      wrapper.find(".rtt").exists(),
+      "a round trip is reported on a connection nothing has come back over yet",
+    ).toBe(false);
+    expect(
+      wrapper.get(".node").text(),
+      "the pill says something about a round trip before there is one to report",
+    ).toBe("pocket · gen 1");
+
+    measureRoundTrip(rig, 40);
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.get(".rtt").text(), "the measured round trip is not reported").toBe("40ms");
   });
 
   it("does not quote a round trip while telling the operator the device is offline", async () => {
@@ -238,6 +313,26 @@ describe("what is running", () => {
     await wrapper.vm.$nextTick();
     expect(switcher.text(), "the bar still names the window you left").not.toContain("Terminal");
     expect(switcher.text(), "the bar does not follow focus to the new window").toContain("Notes");
+  });
+
+  it("follows focus rather than the focus history, on a phone", async () => {
+    // `recent` is the focus history and it keeps a minimized window at its
+    // head, because minimizing does not pop it. A bar that reads the history
+    // therefore names a window that is no longer on screen while a different
+    // one has focus, and its title then disagrees with its own switcher.
+    const node = live(PHONE);
+    const wrapper = mountBar(node.rig);
+
+    await node.open("terminal");
+    const notes = await node.open("notes");
+    node.rig.shell.windows.minimize(notes);
+    await wrapper.vm.$nextTick();
+
+    const switcher = wrapper.get('[aria-label="Switch window"]');
+    expect(switcher.text(), "the bar names the window it just put away").not.toContain("Notes");
+    expect(switcher.text(), "the bar does not name the window that has focus").toContain(
+      "Terminal",
+    );
   });
 
   it("does not show a window the node never confirmed", async () => {
@@ -284,6 +379,138 @@ describe("what is running", () => {
       dockButton(wrapper, "Notes").attributes("aria-pressed"),
       "the window that lost focus is still shown as focused",
     ).toBe("false");
+  });
+
+  it("launches an app whose button is pressed while it is not running", async () => {
+    // The taskbar is the launcher as well as the switcher, and on a fresh
+    // session almost every item is in this state. A dock button that does
+    // nothing here -- no window, no command, no error -- is the failure
+    // nobody reports, because there is nothing to report.
+    const node = live();
+    const wrapper = mountBar(node.rig);
+    await wrapper.vm.$nextTick();
+
+    await dockButton(wrapper, "Terminal").trigger("click");
+    await node.answer();
+    await wrapper.vm.$nextTick();
+
+    expect(
+      node.rig.shell.windows.all.value.map((w) => w.app),
+      "pressing the button for an app that is not running opened nothing",
+    ).toContain("terminal");
+    expect(
+      dockButton(wrapper, "Terminal").attributes("aria-pressed"),
+      "the app was launched behind whatever the operator was already looking at",
+    ).toBe("true");
+  });
+
+  it("puts away the window the operator is looking at, not another of that app's", async () => {
+    // Two windows of one app is where the lit button and the window it acts
+    // on can come apart: the button lights because *some* Terminal has focus,
+    // so if it minimizes a different Terminal the operator presses a lit
+    // button, watches nothing move, and presses it again forever.
+    const node = live();
+    const wrapper = mountBar(node.rig);
+
+    const first = await node.open("terminal");
+    const second = await node.open("terminal");
+    await wrapper.vm.$nextTick();
+    expect(
+      node.rig.shell.windows.focused.value?.id,
+      "the second window never took focus, so there is nothing to confuse",
+    ).toBe(second);
+
+    const onScreen = () => node.rig.shell.windows.visible.value.map((w) => w.id);
+
+    await dockButton(wrapper, "Terminal").trigger("click");
+    await wrapper.vm.$nextTick();
+
+    expect(onScreen(), "the button put away a background window and left the focused one up").toEqual(
+      [first],
+    );
+
+    await dockButton(wrapper, "Terminal").trigger("click");
+    await wrapper.vm.$nextTick();
+
+    expect(onScreen(), "pressing the button again cannot put away what is left").toEqual([]);
+    expect(
+      dockButton(wrapper, "Terminal").attributes("aria-pressed"),
+      "nothing of the app is on screen and its button still reads as focused",
+    ).toBe("false");
+  });
+
+  it("shows the Assistant's pending approvals as a count on its own dock button", async () => {
+    // The Assistant surfaces rather than taking over, which makes this badge
+    // the whole of what the operator gets to tell them the Assistant is
+    // blocked waiting on them.
+    const node = live();
+    const wrapper = mountBar(node.rig);
+    node.rig.shell.inboxPending.value = 2;
+    await wrapper.vm.$nextTick();
+
+    const assistant = dockButton(wrapper, "Assistant");
+    expect(assistant.text(), "nothing on the bar says the Assistant is waiting").toContain("2");
+    expect(
+      assistant.text(),
+      "a screen reader is given a bare number with nothing to say what it counts",
+    ).toContain("approvals waiting");
+    expect(
+      dockButton(wrapper, "Files").find(".badge").exists(),
+      "an app with no Inbox is wearing the Assistant's count",
+    ).toBe(false);
+  });
+
+  it("puts no badge on a bar with nothing waiting", async () => {
+    // The mirror of the test above: a badge that always renders is a
+    // warning-colored "0" on every item and a false "approvals waiting"
+    // announced for apps that have no Inbox at all.
+    const node = live();
+    const wrapper = mountBar(node.rig);
+    await wrapper.vm.$nextTick();
+
+    expect(
+      wrapper.findAll(".badge").length,
+      "a badge rendered for an app with nothing pending",
+    ).toBe(0);
+    expect(
+      wrapper.text(),
+      "the bar announces approvals that nobody is waiting on",
+    ).not.toContain("approvals waiting");
+  });
+});
+
+describe("the lockdown button", () => {
+  it("actually locks the workspace down", async () => {
+    // The worst defect this bar can ship: the operator presses the button
+    // labeled "Lock down this workspace", believes the workspace is secured,
+    // and walks away from one that is not. So this follows the press all the
+    // way to the frame the node receives, rather than trusting the label.
+    const { rig } = live();
+    const wrapper = mountBar(rig);
+    await wrapper.vm.$nextTick();
+
+    await wrapper.get('[aria-label="Lock down this workspace"]').trigger("click");
+    await flushPromises();
+
+    const asked = rig.shell.ui.confirmation.value;
+    expect(asked?.command, "the button did not even ask to lock the workspace down").toBe(
+      "system.lockdown",
+    );
+    asked?.resolve(true);
+    await flushPromises();
+
+    expect(
+      rig
+        .socket()
+        .frames()
+        .filter((frame) => frame.type === "invoke")
+        .map((frame) => frame.command),
+      "the operator confirmed a lockdown that never reached the node",
+    ).toContain("system.lockdown");
+    expect(
+      rig.shell.ui.paletteOpen.value,
+      "the lockdown button opened the palette instead",
+    ).toBe(false);
   });
 });
 

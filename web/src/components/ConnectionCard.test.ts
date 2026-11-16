@@ -146,6 +146,14 @@ describe("which of the two failures it was", () => {
       /this device is offline/i,
     );
     expect(text, "nothing said what the shell is waiting for").toMatch(/waiting for a network/i);
+    // The pip is the one thing on the card that is not words, and the
+    // stylesheet reads it off this attribute: red for a dead network, amber
+    // and pulsing for something still trying. A pip that disagrees with the
+    // heading above it is the same lie in color.
+    expect(
+      wrapper.get(".card").attributes("data-state"),
+      "the pip told a different story than the heading",
+    ).toBe("offline");
   });
 
   it("stops blaming the network as soon as the network is back", async () => {
@@ -219,6 +227,152 @@ describe("which of the two failures it was", () => {
       facts(wrapper),
       "a countdown to an attempt that will never be made",
     ).not.toHaveProperty("Next try");
+    expect(
+      wrapper.get(".card").attributes("data-state"),
+      "an abandoned connection was given the pip of one still trying",
+    ).toBe("closed");
+  });
+
+  it("promises no attempt after the shell closes a connection it was retrying", async () => {
+    // The scenario the other "nothing is retrying" test cannot reach: it
+    // closes before anything was ever opened, so there is no pending retry
+    // for the shutdown to have to call off. Here a real attempt has already
+    // failed and a real retry is scheduled when the shell gives the order.
+    const rig = rigAt();
+    const { wrapper } = mountInShell(ConnectionCard, { harness: rig });
+    rig.shell.bus.connect();
+    rig.socket().close(); // one failed attempt, so a retry is now pending
+    await nextTick();
+    expect(
+      facts(wrapper),
+      "this test needs a retry in flight for the shutdown to call off",
+    ).toHaveProperty("Next try");
+
+    rig.shell.bus.close(); // the shell is shutting this connection down
+    await nextTick();
+
+    expect(wrapper.text(), "nothing said that no retry is coming").toMatch(
+      /nothing is retrying/i,
+    );
+    expect(
+      facts(wrapper),
+      "a countdown to a retry of a connection the shell had closed",
+    ).not.toHaveProperty("Next try");
+    // The one assertion in this file on a store ref rather than on words, and
+    // deliberately: the card refuses to count down on a closed connection, so
+    // the card alone cannot show whether the bus still believes an attempt is
+    // due. Two guards implement this promise and neither is allowed to be the
+    // only one, because the next change to either reveals the other.
+    expect(
+      rig.shell.bus.retryAt.value,
+      "the bus still had an attempt on the books for a connection it closed",
+    ).toBeNull();
+  });
+
+  it("shows no countdown while the status says nothing is retrying", async () => {
+    const rig = rigAt();
+    const { wrapper } = mountInShell(ConnectionCard, { harness: rig });
+
+    // The card's own half of the guard above, pinned on its own. The bus will
+    // not leave a retry on the books while closed, so this state is written
+    // by hand: what is being tested is that the card would not render a
+    // countdown even if it were handed one.
+    rig.shell.bus.retryAt.value = EPOCH + 1_000;
+    rig.shell.bus.status.value = "closed";
+    await nextTick();
+
+    expect(wrapper.text(), "an abandoned connection read like one still trying").toMatch(
+      /nothing is retrying/i,
+    );
+    expect(
+      facts(wrapper),
+      'a countdown rendered directly under the words "nothing is retrying it"',
+    ).not.toHaveProperty("Next try");
+  });
+
+  it("leaves a closed connection closed when the network comes back", async () => {
+    // The network returning is worth one immediate attempt on a connection
+    // that is trying to come up. On one the shell shut down it is not: the
+    // operator would get a live node nobody asked for, and "closed" would
+    // stop meaning "nothing is retrying this".
+    const rig = rigAt();
+    rig.connect("pocket");
+    const { wrapper } = mountInShell(ConnectionCard, { harness: rig });
+    rig.shell.bus.close();
+    await nextTick();
+
+    const before = rig.sockets.length;
+    rig.setOnline(false);
+    rig.setOnline(true);
+    await nextTick();
+
+    expect(
+      rig.sockets.length,
+      "a connection the shell closed reopened itself when the network returned",
+    ).toBe(before);
+    expect(wrapper.text(), "a reopened connection stopped reading as a closed one").toMatch(
+      /nothing is retrying/i,
+    );
+  });
+
+  it("says the shell gave up, not that it is waiting for wifi, when both are true", async () => {
+    // Offline and closed at once. The two sentences disagree about what
+    // happens next — one says the shell resumes when the network returns, and
+    // for a closed connection that is not true — so the operator must be told
+    // the one that will still be true after they have fixed the wifi.
+    const rig = rigAt({ online: false });
+    const { wrapper } = mountInShell(ConnectionCard, { harness: rig });
+    rig.shell.bus.close();
+    await nextTick();
+
+    expect(
+      wrapper.get("h2").text(),
+      "an abandoned connection was reported as a network problem",
+    ).toBe("Disconnected");
+    expect(wrapper.text(), "nothing said that no retry is coming").toMatch(
+      /nothing is retrying/i,
+    );
+    expect(
+      wrapper.text(),
+      "the operator was promised a recovery that will never happen",
+    ).not.toMatch(/waiting for a network/i);
+  });
+
+  it("calls it reconnecting only while an attempt is actually in flight", async () => {
+    const rig = rigAt();
+    rig.connect("pocket");
+    const { wrapper } = mountInShell(ConnectionCard, { harness: rig });
+
+    await step(rig, 28_000); // the node goes quiet, and the retry has fired
+
+    expect(
+      fact(wrapper, "Next try"),
+      "this test needs an attempt under way, not one being waited for",
+    ).toBe("now");
+    expect(
+      wrapper.get("h2").text(),
+      "an attempt in flight read the same as a node declared down",
+    ).toMatch(/reconnecting/i);
+  });
+
+  it("does not claim an attempt is in flight while it is counting down to one", async () => {
+    const rig = rigAt();
+    rig.connect("pocket");
+    const { wrapper } = mountInShell(ConnectionCard, { harness: rig });
+
+    // Stopped between the bus condemning the node and its retry coming due.
+    // The bus's status reads "connecting" for the whole of that wait, with no
+    // socket open, which is the state an operator spends an outage in.
+    await step(rig, 26_300);
+
+    expect(
+      fact(wrapper, "Next try"),
+      "this test needs a wait that has not expired yet",
+    ).not.toBe("now");
+    expect(
+      wrapper.get("h2").text(),
+      "the card claimed an attempt was in flight beside the countdown to it",
+    ).not.toMatch(/reconnecting/i);
   });
 
   /**
@@ -348,6 +502,23 @@ describe("the next attempt", () => {
     expect(first - later, "the countdown did not move with the clock").toBe(3);
   });
 
+  it("rounds the wait up, so an attempt that has not happened is not called 'now'", async () => {
+    const rig = rigAt();
+    const { wrapper } = mountInShell(ConnectionCard, { harness: rig });
+
+    // The first retry is a quarter of a second out. Rounding that down reads
+    // "now" for an attempt nothing has made yet, and the operator watching
+    // "now" sit there cannot tell a wait from a hang — which is the one thing
+    // this countdown exists to tell them.
+    rig.shell.bus.connect();
+    rig.socket().close();
+    await nextTick();
+
+    expect(fact(wrapper, "Next try"), "an attempt still to come was announced as happening").toBe(
+      "1s",
+    );
+  });
+
   it("never counts down past zero when the attempt is late", async () => {
     const rig = rigAt();
     const { wrapper } = mountInShell(ConnectionCard, { harness: rig });
@@ -382,6 +553,30 @@ describe("the next attempt", () => {
       facts(wrapper),
       "a countdown was still being shown for an attempt already under way",
     ).not.toHaveProperty("Next try");
+  });
+
+  it("starts the wait over from the bottom when the attempt it made fails too", async () => {
+    const rig = rigAt();
+    const { wrapper } = mountInShell(ConnectionCard, { harness: rig });
+    await stuckInBackoff(rig);
+
+    const capped = Number.parseInt(fact(wrapper, "Next try"), 10);
+    expect(capped, "this test needs a long wait to be worth skipping").toBeGreaterThan(5);
+
+    await tryNow(wrapper).trigger("click");
+    rig.socket().close(); // the node is still not there
+    await nextTick();
+
+    // Half of what "Try now" promises is that the operator stops waiting. The
+    // other half is that asking counts for something afterwards: an operator
+    // who presses it at the capped wait and is handed the same cap again is
+    // pinned there for as long as they keep asking.
+    const shown = fact(wrapper, "Next try");
+    const seconds = shown === "now" ? 0 : Number.parseInt(shown, 10);
+    expect(
+      seconds,
+      "pressing Try now left the operator waiting out the cap all over again",
+    ).toBeLessThanOrEqual(1);
   });
 });
 

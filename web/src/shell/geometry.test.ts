@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { tileMasterStack, type Rect, type Size } from "./geometry.ts";
+import {
+  clampToWorkArea,
+  rectForZone,
+  tileMasterStack,
+  type Rect,
+  type Size,
+  type SnapZone,
+} from "./geometry.ts";
 
 /**
  * What a tiled layout promises, stated as properties rather than coordinates.
@@ -102,5 +109,144 @@ describe("master and stack", () => {
 
   it("asks for nothing when there is nothing open", () => {
     expect(tileMasterStack(0, LANDSCAPE, GAP)).toEqual([]);
+  });
+});
+
+/**
+ * Which half of the screen a zone name refers to, across and down.
+ *
+ * This is the whole promise of a snap zone: `bottom` is the bottom, `top-left`
+ * is the top-left, and the names are shared with the palette's tiling commands
+ * and with the drag overlay, so a window dropped at the bottom edge and a
+ * window sent there by the keyboard have to land in the same place. Stating it
+ * as a band rather than a rectangle keeps the seam, the rounding and any future
+ * change to the gap free to move.
+ */
+type Band = "start" | "end" | "full";
+
+const WHERE: Record<SnapZone, { across: Band; down: Band }> = {
+  maximize: { across: "full", down: "full" },
+  left: { across: "start", down: "full" },
+  right: { across: "end", down: "full" },
+  top: { across: "full", down: "start" },
+  bottom: { across: "full", down: "end" },
+  "top-left": { across: "start", down: "start" },
+  "top-right": { across: "end", down: "start" },
+  "bottom-left": { across: "start", down: "end" },
+  "bottom-right": { across: "end", down: "end" },
+};
+
+/**
+ * Whether an extent along one axis sits in the named band. The slack is the
+ * seam plus the half-pixel the halves round away, which is what lets a layout
+ * change its gap without this becoming a coordinate assertion.
+ */
+function inBand(start: number, extent: number, total: number, band: Band, seam: number): boolean {
+  const slack = seam * 2 + 1;
+  switch (band) {
+    case "start":
+      return start <= slack && start + extent <= total / 2 + slack && extent >= total * 0.4;
+    case "end":
+      return start >= total / 2 - slack && start + extent <= total && extent >= total * 0.4;
+    case "full":
+      return start <= slack && start + extent >= total - slack;
+  }
+}
+
+describe("the rectangle a snap zone names", () => {
+  it("puts the window in the half or quarter the zone is named after", () => {
+    for (const screen of [LANDSCAPE, PORTRAIT]) {
+      for (const seam of [0, GAP]) {
+        for (const zone of Object.keys(WHERE) as SnapZone[]) {
+          const r = rectForZone(zone, screen, seam);
+          const shape = `${zone} on ${screen.w}x${screen.h} with a ${seam}px seam gave ${JSON.stringify(r)}`;
+          expect(
+            inBand(r.x, r.w, screen.w, WHERE[zone].across, seam),
+            `${shape}: that is not the side of the screen the zone is named after`,
+          ).toBe(true);
+          expect(
+            inBand(r.y, r.h, screen.h, WHERE[zone].down, seam),
+            `${shape}: that is not the part of the screen, top to bottom, that the zone names`,
+          ).toBe(true);
+        }
+      }
+    }
+  });
+
+  it("divides the screen between the four corner zones", () => {
+    // Independent of the band check above, and for a different failure: two
+    // corners that resolve to the same quarter leave half the screen
+    // unreachable by dragging, and two windows on top of each other.
+    const corners = (["top-left", "top-right", "bottom-left", "bottom-right"] as const).map(
+      (zone) => ({ zone, rect: rectForZone(zone, LANDSCAPE, GAP) }),
+    );
+
+    for (let i = 0; i < corners.length; i++) {
+      for (let j = i + 1; j < corners.length; j++) {
+        expect(
+          overlaps(corners[i]!.rect, corners[j]!.rect),
+          `${corners[i]!.zone} and ${corners[j]!.zone} are the same part of the screen`,
+        ).toBe(false);
+      }
+    }
+
+    const used = corners.reduce((sum, c) => sum + area(c.rect), 0);
+    expect(used / area(LANDSCAPE), "the four corners do not add up to the screen").toBeGreaterThan(
+      0.9,
+    );
+  });
+});
+
+/**
+ * How much of a window must stay on screen to be grabbable at all. Stated in
+ * human terms on purpose: 80px is about the width of a title you can put a
+ * pointer or a thumb on without hunting for it, and at the bottom edge it has
+ * to clear the rounded corner and the dock. It is deliberately NOT written as
+ * `MIN_VISIBLE`, so dropping that constant to a sliver fails here instead of
+ * being quietly ratified.
+ */
+const GRABBABLE = 80;
+const TITLEBAR = 34;
+
+describe("keeping a thrown window reachable", () => {
+  const sizes: Size[] = [
+    { w: 320, h: 180 },
+    { w: 680, h: 440 },
+    // Wider and taller than the screen: a window pushed partly off the left
+    // edge to read its right half is a real thing to want, and must still be
+    // grabbable.
+    { w: 2000, h: 1500 },
+  ];
+
+  it("leaves a strip of the window on screen however far it is thrown", () => {
+    for (const screen of [LANDSCAPE, PORTRAIT]) {
+      for (const size of sizes) {
+        for (const x of [-9000, -size.w, 0, screen.w, 9000]) {
+          const at = clampToWorkArea({ x, y: 100, ...size }, screen, TITLEBAR);
+          const onScreen = Math.min(at.x + at.w, screen.w) - Math.max(at.x, 0);
+          expect(
+            onScreen,
+            `a ${size.w}x${size.h} window thrown to x=${x} left only ${onScreen}px to grab`,
+          ).toBeGreaterThanOrEqual(GRABBABLE);
+        }
+      }
+    }
+  });
+
+  it("keeps the title bar row between the top of the work area and its bottom edge", () => {
+    for (const screen of [LANDSCAPE, PORTRAIT]) {
+      for (const size of sizes) {
+        for (const y of [-9000, -size.h, 0, screen.h, 9000]) {
+          const at = clampToWorkArea({ x: 100, y, ...size }, screen, TITLEBAR);
+          expect(at.y, `a window thrown to y=${y} put its title bar above the screen`).toBeGreaterThanOrEqual(
+            0,
+          );
+          expect(
+            at.y + TITLEBAR,
+            `a window thrown to y=${y} put its title bar under the dock`,
+          ).toBeLessThanOrEqual(screen.h);
+        }
+      }
+    }
   });
 });
