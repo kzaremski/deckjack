@@ -28,15 +28,48 @@ export interface ShellCommandDeps {
   theme: ThemeController;
   viewport: Viewport;
   keyboard: Keyboard;
+  /**
+   * Leaves the shell for one of the node's own pages.
+   *
+   * Injected rather than calling `window.location` from inside a command, for
+   * the same reason every store here takes its dependencies as arguments: a
+   * command that reaches for a global cannot be driven or tested, and "did
+   * this actually go anywhere" is the only thing worth asserting about a
+   * command whose entire job is to go somewhere.
+   */
+  navigate(url: string): void;
 }
 
 export function shellCommands(deps: ShellCommandDeps): CommandEntry[] {
-  const { windows, ui, bus, theme, viewport, keyboard } = deps;
+  const { windows, ui, bus, theme, viewport, keyboard, navigate } = deps;
 
   const focused = () => windows.focused.value;
   const hasWindow = () => focused() !== null;
 
   const entries: CommandEntry[] = [
+    {
+      /**
+       * The gap this closes: every route for enrolling a passkey has been
+       * mounted and working for as long as `passkeyhttp` has existed, and
+       * nothing in the product called any of them. Registering a credential
+       * meant pasting a script into a devtools console, which rules out every
+       * phone -- and the sign-in page could not lead to having anything to
+       * sign in with.
+       *
+       * A command rather than a settings screen: the palette is where every
+       * other thing the shell can do already lives, and one link does not
+       * earn a screen of its own.
+       */
+      id: "shell.passkey.enroll",
+      title: "Set up a passkey",
+      summary: "Enroll this device, or add another one",
+      risk: "read_only",
+      group: "Shell",
+      keywords: ["passkey", "webauthn", "enroll", "device", "sign in", "security key"],
+      run: () => {
+        navigate("/passkey/enroll");
+      },
+    },
     {
       id: "shell.palette.open",
       title: "Command palette",

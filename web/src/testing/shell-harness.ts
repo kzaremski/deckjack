@@ -126,6 +126,8 @@ export interface Harness {
   setOnline(up: boolean): void;
   /** Connect and complete the handshake, so the shell has a live node. */
   connect(hostName?: string): void;
+  /** Pages a command asked the browser to open, in order. */
+  navigated: string[];
   dispose(): void;
 }
 
@@ -140,6 +142,8 @@ export function harness(options: HarnessOptions = {}): Harness {
   let notifyOnline: ((up: boolean) => void) | null = null;
   let timers: Array<{ at: number; fn: () => void; dead: boolean }> = [];
   const size = options.size ?? { w: 1600, h: 900 };
+  /** Where a command asked the browser to go, instead of actually going. */
+  const navigated: string[] = [];
   const storage = memoryStorage();
 
   const busEnv: BusEnv = {
@@ -195,7 +199,18 @@ export function harness(options: HarnessOptions = {}): Harness {
   const keyboard = createKeyboard({ apple: false, storage });
   const inboxPending = ref(0);
 
-  commands.register(shellCommands({ windows, ui, bus, theme, viewport, keyboard }));
+  commands.register(
+    shellCommands({
+      windows,
+      ui,
+      bus,
+      theme,
+      viewport,
+      keyboard,
+      // A test that navigated would tear down the page it is asserting on.
+      navigate: (url) => void navigated.push(url),
+    }),
+  );
   keyboard.bind(DEFAULT_SHORTCUTS);
 
   const shell: Shell = {
@@ -242,6 +257,7 @@ export function harness(options: HarnessOptions = {}): Harness {
       bus.connect();
       sockets.at(-1)!.open(hostName);
     },
+    navigated,
     dispose() {
       shell.dispose();
     },

@@ -171,7 +171,13 @@ impl Harness {
         // own — or with its fallback — would be a panic at startup, and a
         // test that served this router by itself would never find out.
         let app = deckjack_core::http::router(Arc::clone(&ctx))
-            .merge(passkey_router(Arc::clone(&passkeys)));
+            .merge(passkey_router(Arc::clone(&passkeys)))
+            // The pages too, as `wiring::app` merges them. Serving the routes
+            // without them would leave the one failure this suite most needs
+            // to catch invisible: a page that calls a route with a method the
+            // router does not mount answers 405 on load, and no amount of
+            // asserting on the routes alone would show it.
+            .merge(deckjack_core::passkeypage::page_router(true));
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a loopback port");
@@ -909,4 +915,115 @@ fn a_second_write_of_one_credential_moves_its_sign_count_instead_of_adding_a_row
         row(b"pocket-4", "Pocket 4", 7).created,
         "`created` is not a field an assertion may rewrite"
     );
+}
+
+// ---------------------------------------------------------------------------
+// the pages that call these routes
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_device_list_answers_the_method_the_enrollment_page_uses() {
+    // The bug this exists for: the enrollment script's first draft POSTed to
+    // the device list, which is mounted as a GET. The page loaded, asked the
+    // node what it held, got a 405, and showed an error with no way forward --
+    // and the unit test that checked the script "calls /passkey/credentials"
+    // was green throughout, because the path was right and the verb was not.
+    let h = Harness::start(&[]).await;
+
+    let get = h.get("/passkey/credentials", &[]).await;
+    assert_eq!(
+        get.status, 401,
+        "the list must refuse a caller with no session, not reject the method: {}",
+        get.body
+    );
+    assert!(get.body.contains("sign in first"), "{}", get.body);
+
+    let posted = h.post("/passkey/credentials", &[], "{}").await;
+    assert_eq!(
+        posted.status, 405,
+        "a POST to the list is a method error, which is what the page must not send"
+    );
+}
+
+#[tokio::test]
+async fn the_enrollment_page_and_its_script_are_served() {
+    let h = Harness::start(&[]).await;
+
+    let page = h.get(deckjack_core::passkeypage::ENROLL_PATH, &[]).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body.contains("Set up a passkey"),
+        "the enrollment page was not served: {}",
+        page.body
+    );
+    // No session, and that is deliberate: the page explains what to do, and
+    // every route it calls checks for itself. A redirect here would mean an
+    // operator who has not signed in gets no explanation at all.
+    assert!(
+        page.body.contains("id=\"nickname\""),
+        "the page offered no way to name a device"
+    );
+
+    let script = h
+        .get(deckjack_core::passkeypage::ENROLL_SCRIPT_PATH, &[])
+        .await;
+    assert_eq!(script.status, 200, "{}", script.body);
+    assert!(
+        script.body.contains("navigator.credentials.create"),
+        "the enrollment script was not served"
+    );
+}
+
+#[tokio::test]
+async fn the_sign_in_page_links_to_enrollment_so_a_first_passkey_is_reachable() {
+    // The whole point of this page's existence: before it, the only way to
+    // register a credential was to paste a script into a devtools console.
+    let h = Harness::start(&[]).await;
+    let page = h.get(deckjack_core::passkeypage::PAGE_PATH, &[]).await;
+    assert_eq!(page.status, 200);
+    assert!(
+        page.body.contains(deckjack_core::passkeypage::ENROLL_PATH),
+        "no route from signing in to having something to sign in with: {}",
+        page.body
+    );
+}
+
+#[tokio::test]
+async fn enrollment_is_not_mounted_when_no_browser_would_accept_a_credential() {
+    // `page_router(false)` is what a node with no usable rp_id assembles. The
+    // ceremony page still answers, because /login links to it unconditionally
+    // and a link to a 404 is worse than a page that explains -- but nothing
+    // may invite an enrollment that would bind a credential to a name the
+    // browser rejects, because a passkey cannot be moved afterwards.
+    let app = deckjack_core::passkeypage::page_router(false);
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port");
+    let addr = tcp.local_addr().expect("the bound address");
+    tokio::spawn(async move {
+        let _ = axum::serve(tcp, app.into_make_service_with_connect_info::<SocketAddr>()).await;
+    });
+
+    let page = request(
+        addr,
+        "GET",
+        deckjack_core::passkeypage::PAGE_PATH,
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("Passkeys are off"), "{}", page.body);
+
+    for path in [
+        deckjack_core::passkeypage::ENROLL_PATH,
+        deckjack_core::passkeypage::ENROLL_SCRIPT_PATH,
+        deckjack_core::passkeypage::SCRIPT_PATH,
+    ] {
+        let r = request(addr, "GET", path, &[], None).await;
+        assert_eq!(
+            r.status, 404,
+            "{path} was mounted on a node where no credential could work"
+        );
+    }
 }

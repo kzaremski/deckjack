@@ -64,7 +64,17 @@ export function createShell(): Shell {
   const inboxPending = ref(0);
 
   commands.register(
-    shellCommands({ windows, ui, bus, theme, viewport, keyboard }),
+    shellCommands({
+      windows,
+      ui,
+      bus,
+      theme,
+      viewport,
+      keyboard,
+      // `assign`, not `replace`: the shell is where the operator came from and
+      // the back button should take them back to it.
+      navigate: (url) => window.location.assign(url),
+    }),
   );
   keyboard.bind(DEFAULT_SHORTCUTS);
 
