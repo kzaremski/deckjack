@@ -5,6 +5,7 @@ import CommandPalette from "./components/CommandPalette.vue";
 import CompactShell from "./components/CompactShell.vue";
 import ConfirmDialog from "./components/ConfirmDialog.vue";
 import ConnectionCard from "./components/ConnectionCard.vue";
+import QuickLook from "./components/QuickLook.vue";
 import DesktopShell from "./components/DesktopShell.vue";
 import NoticeStack from "./components/NoticeStack.vue";
 import TopBar from "./components/TopBar.vue";
@@ -105,6 +106,13 @@ watch(
     <CommandPalette />
     <WindowSwitcher />
     <NoticeStack />
+    <!--
+      Above the dialogs and below the connection card: a preview covers the
+      workspace, but losing the node covers the preview too, because with no
+      node there are no bytes to show.
+    -->
+    <QuickLook />
+
     <ConfirmDialog />
     <!--
       Last, so it covers everything above it. While it is up the shell cannot

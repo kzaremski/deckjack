@@ -26,6 +26,7 @@ function commandsWith() {
     theme: rig.shell.theme,
     viewport: rig.shell.viewport,
     keyboard: rig.shell.keyboard,
+    quicklook: rig.shell.quicklook,
     navigate: (url) => void visited.push(url),
   });
   return { rig, entries, visited };
@@ -68,5 +69,49 @@ describe("setting up a passkey", () => {
     const { entries } = commandsWith();
     const enroll = entries.find((e) => e.id === "shell.passkey.enroll")!;
     expect(enroll.risk).toBe("read_only");
+  });
+});
+
+describe("Quick Look from the palette", () => {
+  it("previews the file it was handed", () => {
+    const rig = harness();
+    const entries = shellCommands({
+      windows: rig.shell.windows,
+      ui: rig.shell.ui,
+      bus: rig.shell.bus,
+      theme: rig.shell.theme,
+      viewport: rig.shell.viewport,
+      keyboard: rig.shell.keyboard,
+      quicklook: rig.shell.quicklook,
+      navigate: () => {},
+    });
+    const peek = entries.find((e) => e.id === "shell.quicklook.open")!;
+
+    peek.run({ path: "/Photos/holiday.jpg" });
+
+    expect(rig.shell.quicklook.visible.value).toBe(true);
+    expect(rig.shell.quicklook.current.value).toBe("/Photos/holiday.jpg");
+  });
+
+  it("says what is missing rather than opening an empty preview", () => {
+    // Reachable from an agent and the CLI, so "called with nothing" is a real
+    // case and not a hypothetical.
+    const rig = harness();
+    const entries = shellCommands({
+      windows: rig.shell.windows,
+      ui: rig.shell.ui,
+      bus: rig.shell.bus,
+      theme: rig.shell.theme,
+      viewport: rig.shell.viewport,
+      keyboard: rig.shell.keyboard,
+      quicklook: rig.shell.quicklook,
+      navigate: () => {},
+    });
+    const peek = entries.find((e) => e.id === "shell.quicklook.open")!;
+
+    peek.run();
+
+    expect(rig.shell.quicklook.visible.value, "an empty preview opened").toBe(false);
+    expect(rig.shell.ui.notices.value.some((n) => n.kind === "error")).toBe(true);
   });
 });

@@ -11,6 +11,7 @@ pub mod audit;
 pub mod auth;
 pub mod command;
 pub mod config;
+pub mod content;
 pub mod events;
 pub mod files;
 pub mod grants;

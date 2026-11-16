@@ -112,7 +112,7 @@ async fn start() -> Harness {
     // Registered because main.rs registers them: a duplicate command id
     // between the sets would be a startup failure in production and a silent
     // absence here.
-    let _files =
+    let files =
         files::register_commands(&registry, dir.path(), &node_id).expect("the file commands");
     let windows =
         wiring::register_windows(&registry, node_id.clone()).expect("the window commands register");
@@ -295,6 +295,7 @@ async fn start() -> Harness {
         Arc::clone(&lockdown),
         Some(Arc::clone(&app_host)),
         Some(passkeys),
+        Arc::clone(&files),
     );
     let tcp = TcpListener::bind("127.0.0.1:0")
         .await

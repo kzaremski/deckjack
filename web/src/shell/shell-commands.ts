@@ -6,6 +6,7 @@ import type { Bus } from "../stores/bus.ts";
 import { themeList, type DensityName, type ThemeController } from "../tokens/index.ts";
 import type { Keyboard } from "./keyboard.ts";
 import type { Viewport } from "./viewport.ts";
+import type { QuickLookStore } from "./quicklook.ts";
 
 /**
  * The shell's own commands.
@@ -28,6 +29,7 @@ export interface ShellCommandDeps {
   theme: ThemeController;
   viewport: Viewport;
   keyboard: Keyboard;
+  quicklook: QuickLookStore;
   /**
    * Leaves the shell for one of the node's own pages.
    *
@@ -41,7 +43,7 @@ export interface ShellCommandDeps {
 }
 
 export function shellCommands(deps: ShellCommandDeps): CommandEntry[] {
-  const { windows, ui, bus, theme, viewport, keyboard, navigate } = deps;
+  const { windows, ui, bus, theme, viewport, keyboard, quicklook, navigate } = deps;
 
   const focused = () => windows.focused.value;
   const hasWindow = () => focused() !== null;
@@ -68,6 +70,28 @@ export function shellCommands(deps: ShellCommandDeps): CommandEntry[] {
       keywords: ["passkey", "webauthn", "enroll", "device", "sign in", "security key"],
       run: () => {
         navigate("/passkey/enroll");
+      },
+    },
+    {
+      /**
+       * Quick Look, from the palette. `path` is a parameter rather than a
+       * selection read out of the Files panel, because a command has to be
+       * callable by an agent and from the CLI -- principle 3 -- and neither
+       * of those has a selection.
+       */
+      id: "shell.quicklook.open",
+      title: "Quick Look",
+      summary: "Preview a file without opening its app",
+      risk: "read_only",
+      group: "Shell",
+      keywords: ["preview", "quick look", "peek", "view", "open"],
+      run: (params) => {
+        const path = typeof params?.path === "string" ? params.path : null;
+        if (!path) {
+          ui.notify("error", "Quick Look needs a file path.", "shell.quicklook.open");
+          return;
+        }
+        quicklook.open(path);
       },
     },
     {

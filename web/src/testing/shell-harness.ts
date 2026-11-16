@@ -28,6 +28,7 @@ import { createWindows } from "../stores/windows.ts";
 import { createThemeController } from "../tokens/index.ts";
 import { createKeyboard, DEFAULT_SHORTCUTS } from "../shell/keyboard.ts";
 import { createViewport } from "../shell/viewport.ts";
+import { createQuickLook } from "../shell/quicklook.ts";
 import { shellCommands } from "../shell/shell-commands.ts";
 import { ref } from "vue";
 
@@ -197,6 +198,7 @@ export function harness(options: HarnessOptions = {}): Harness {
     hingeFraction: () => null,
   });
   const keyboard = createKeyboard({ apple: false, storage });
+  const quicklook = createQuickLook({ online: () => online });
   const inboxPending = ref(0);
 
   commands.register(
@@ -207,6 +209,7 @@ export function harness(options: HarnessOptions = {}): Harness {
       theme,
       viewport,
       keyboard,
+      quicklook,
       // A test that navigated would tear down the page it is asserting on.
       navigate: (url) => void navigated.push(url),
     }),
@@ -221,6 +224,7 @@ export function harness(options: HarnessOptions = {}): Harness {
     theme,
     viewport,
     keyboard,
+    quicklook,
     inboxPending,
     dispose() {
       viewport.stop();

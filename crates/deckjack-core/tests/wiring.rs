@@ -276,6 +276,11 @@ async fn start_with(auto: lockdown::AutoPolicy) -> Node {
         .expect("the passkey registry starts"),
     );
 
+    // The same namespace the file commands use, because that is what `main`
+    // hands the assembly: one `Root`, crossed by the bus and by HTTP alike.
+    let files = deckjack_core::files::register_commands(&registry, dir.path(), NODE)
+        .expect("the file commands register");
+
     let app = wiring::app(
         Arc::clone(&ctx),
         ws_ctx,
@@ -287,6 +292,7 @@ async fn start_with(auto: lockdown::AutoPolicy) -> Node {
         Arc::clone(&lockdown),
         Some(Arc::clone(&app_host)),
         Some(passkeys),
+        files,
     );
     let tcp = TcpListener::bind("127.0.0.1:0")
         .await
@@ -884,6 +890,25 @@ async fn every_route_the_wiring_mounts_is_answered_by_its_own_handler() {
             signed_in: false,
             status: 200,
             mark: "text/javascript",
+        },
+        // content::router, behind `require_session`. Until it existed the only
+        // way a file reached the browser was `files.read`, inside a JSON
+        // command response and capped, so nothing could be previewed or
+        // seeked.
+        //
+        // The working directory root always exists, so asking for it reaches
+        // the one refusal only this handler writes. A missing-file path was
+        // the first choice and was wrong: resolution fails before the handler
+        // looks at the file, so the mark came back as the files layer's
+        // wording. The test said so, which is the whole reason the mark is a
+        // string and not a status code.
+        Mounted {
+            method: "GET",
+            path: "/content?path=/",
+            body: "",
+            signed_in: true,
+            status: 400,
+            mark: "that is a directory",
         },
         // apps::ui_router, behind `require_session` — signed in here because
         // the gate is what `an_apps_own_ui_...` pins.

@@ -178,7 +178,7 @@ fn main() -> anyhow::Result<()> {
     // Named rather than discarded: the HTTP file routes, WebDAV, previews and
     // downloads must all cross this same boundary. Opening a second Root for
     // them is exactly how the predecessor's configured root became decorative.
-    let _files = deckjack_core::files::register_commands(&registry, &working_dir, &node_id)
+    let files = deckjack_core::files::register_commands(&registry, &working_dir, &node_id)
         .context("cannot register the file commands")?;
     // ---- the kill switch ------------------------------------------------
     //
@@ -495,6 +495,7 @@ fn main() -> anyhow::Result<()> {
         Arc::clone(&lockdown),
         Arc::clone(&app_host),
         passkeys.clone(),
+        Arc::clone(&files),
         AgentDoors {
             install: install.clone(),
             working_dir: working_dir.clone(),
@@ -546,6 +547,7 @@ async fn serve(
     lockdown: Arc<Lockdown>,
     app_host: Arc<AppHost>,
     passkeys: Option<Arc<deckjack_core::passkeyhttp::PasskeyCtx>>,
+    files: Arc<deckjack_core::files::Namespace>,
     doors: AgentDoors,
     env: &OsEnv,
     held: &mut lock::Lock,
@@ -620,6 +622,7 @@ async fn serve(
         lockdown,
         Some(Arc::clone(&app_host)),
         passkeys,
+        files,
     );
 
     let http = axum::serve(tcp, app.into_make_service_with_connect_info::<SocketAddr>());

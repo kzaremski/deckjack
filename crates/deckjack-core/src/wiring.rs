@@ -1482,6 +1482,13 @@ pub fn app(
     // see `crate::passkeyhttp::settings_for`. The ceremony page is still
     // mounted and explains, because `/login` links to it either way.
     passkeys: Option<Arc<crate::passkeyhttp::PasskeyCtx>>,
+    // The one `files::Namespace` the command bus already uses. Passed in
+    // rather than built here, and that is the point: the content route,
+    // WebDAV, previews and downloads must all cross the same boundary as
+    // `files.read`. A second `Root` built for HTTP would be a second place for
+    // the working-directory containment rules to drift, which is how the
+    // predecessor project ended up with a root that was decorative.
+    files: Arc<crate::files::Namespace>,
 ) -> axum::Router {
     // Each app's own web build, served from the core's origin at
     // `/apps/<name>/`. Behind `require_session`, which is the point: an app's
@@ -1535,9 +1542,16 @@ pub fn app(
         )
     };
 
-    crate::http::router(ctx)
+    crate::http::router(Arc::clone(&ctx))
         .merge(ws::router(ws_ctx))
         .merge(health)
+        // Bytes out of the working directory, for the previews and downloads
+        // that `files.read` cannot carry: it answers inside a JSON command
+        // response, capped, with no way to seek. The route applies
+        // `require_session` itself -- see `content::router`, which argues why
+        // that layer belongs inside the function rather than at this call
+        // site.
+        .merge(crate::content::router(Arc::clone(&ctx), files))
         .merge(crate::lockdown::unlock_router(unlock_ctx))
         // Merged HERE, inside this function and above the gate, and that
         // placement is the whole point. `axum`'s `.layer()` applies only to

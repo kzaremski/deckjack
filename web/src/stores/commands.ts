@@ -18,8 +18,18 @@ import type { CommandSpec, Risk } from "../protocol.ts";
  */
 
 export interface CommandEntry extends CommandSpec {
-  /** Runs it. Local for shell commands, a bus call for everything else. */
-  run(): void | Promise<void>;
+  /**
+   * Runs it. Local for shell commands, a bus call for everything else.
+   *
+   * `params` is optional because most commands act on the focused thing and
+   * need nothing. The ones that do need it -- Quick Look is meaningless
+   * without a path -- used to have no way to be told, so they could only be
+   * driven by reaching into a panel's selection: the one caller an agent and
+   * the CLI do not have. Principle 3 says every caller dispatches the same
+   * command, and that is only true if every caller can pass the same
+   * parameters.
+   */
+  run(params?: Record<string, unknown>): void | Promise<void>;
   /** Re-evaluated when the palette opens, not cached. */
   available?: () => boolean;
 }
@@ -43,7 +53,7 @@ export interface CommandsStore {
   register(entries: CommandEntry[]): () => void;
   /** Replaces everything the bus provided, keeping local shell commands. */
   adopt(specs: CommandSpec[], call: (id: string, node?: string) => Promise<void>): void;
-  dispatch(id: string): Promise<void>;
+  dispatch(id: string, params?: Record<string, unknown>): Promise<void>;
   search(query: string, limit?: number): Scored[];
   lastError: Ref<string | null>;
 }
@@ -118,7 +128,7 @@ export function createCommands(env: CommandsEnv): CommandsStore {
         run: () => call(spec.id, spec.node),
       }));
     },
-    async dispatch(id) {
+    async dispatch(id, params) {
       const entry = find(id);
       if (!entry) {
         // A missing command is a wiring bug, not something to swallow: a
@@ -129,7 +139,7 @@ export function createCommands(env: CommandsEnv): CommandsStore {
       if (entry.available && !entry.available()) return;
       remember(id);
       try {
-        await entry.run();
+        await entry.run(params);
         lastError.value = null;
       } catch (e) {
         lastError.value = e instanceof Error ? e.message : String(e);

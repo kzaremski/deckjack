@@ -25,6 +25,7 @@ import {
 } from "./keyboard.ts";
 import { shellCommands } from "./shell-commands.ts";
 import { browserViewportEnv, createViewport, type Viewport } from "./viewport.ts";
+import { createQuickLook, type QuickLookStore } from "./quicklook.ts";
 
 /**
  * The composition root.
@@ -43,6 +44,12 @@ export interface Shell {
   theme: ThemeController;
   viewport: Viewport;
   keyboard: Keyboard;
+  /**
+   * Quick Look. In the shell rather than an app because the browser already
+   * decodes what it shows, and because it is reachable from Files, from the
+   * palette and from any app -- which an app-owned window is not.
+   */
+  quicklook: QuickLookStore;
   /** Pending Inbox approvals, from the server's `inbox` event. */
   inboxPending: Ref<number>;
   dispose(): void;
@@ -61,6 +68,9 @@ export function createShell(): Shell {
   const commands = createCommands({ storage });
   const viewport = createViewport(browserViewportEnv());
   const keyboard = createKeyboard(browserKeyboardEnv(storage));
+  // `navigator.onLine` is only trusted when it says false, the same rule the
+  // bus follows: a captive portal reports true.
+  const quicklook = createQuickLook({ online: () => navigator.onLine !== false });
   const inboxPending = ref(0);
 
   commands.register(
@@ -71,6 +81,7 @@ export function createShell(): Shell {
       theme,
       viewport,
       keyboard,
+      quicklook,
       // `assign`, not `replace`: the shell is where the operator came from and
       // the back button should take them back to it.
       navigate: (url) => window.location.assign(url),
@@ -144,6 +155,7 @@ export function createShell(): Shell {
     theme,
     viewport,
     keyboard,
+    quicklook,
     inboxPending,
     dispose() {
       offBus();

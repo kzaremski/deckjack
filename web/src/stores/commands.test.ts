@@ -754,3 +754,41 @@ describe("what the operator is told a command will do", () => {
     ]);
   });
 });
+
+describe("a command that needs to be told what to act on", () => {
+  it("is given its parameters, so an agent and the palette reach it the same way", async () => {
+    // Principle 3: every action has an id and typed parameters, and the UI,
+    // the keyboard, the palette, the CLI and agents all dispatch the same
+    // command. `run()` took none, so a command like Quick Look -- which is
+    // meaningless without a path -- could only have been driven by reaching
+    // into a panel's selection, which is the one caller an agent does not
+    // have.
+    const store = createCommands({ storage: memoryStorage().env });
+    const seen: Array<Record<string, unknown> | undefined> = [];
+    store.register([
+      {
+        id: "x.peek",
+        title: "Peek",
+        risk: "read_only",
+        group: "Test",
+        run: (params) => void seen.push(params),
+      },
+    ]);
+
+    await store.dispatch("x.peek", { path: "/Photos/a.jpg" });
+
+    expect(seen).toEqual([{ path: "/Photos/a.jpg" }]);
+  });
+
+  it("still runs the commands that take none", async () => {
+    const store = createCommands({ storage: memoryStorage().env });
+    let ran = 0;
+    store.register([
+      { id: "x.plain", title: "Plain", risk: "read_only", group: "Test", run: () => void ran++ },
+    ]);
+
+    await store.dispatch("x.plain");
+
+    expect(ran).toBe(1);
+  });
+});
