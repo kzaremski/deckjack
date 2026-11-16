@@ -262,23 +262,35 @@ export function createBus(env: BusEnv): Bus {
    * advance the reconnect backoff a second time, which would turn the first
    * prompt retry into a longer wait nobody earned.
    */
+  /**
+   * Severs a socket so completely that it cannot speak again.
+   *
+   * Detaching the handlers before closing is the load-bearing half. A socket
+   * whose `onclose` still fires gets to rewrite `status` and schedule a
+   * reconnect *after* the caller has already decided what should happen, so
+   * every deliberate transition has to take the handlers away first or be
+   * silently overruled by the socket it just discarded.
+   */
+  function sever(sock: SocketLike | null) {
+    if (!sock) return;
+    sock.onopen = null;
+    sock.onclose = null;
+    sock.onerror = null;
+    sock.onmessage = null;
+    try {
+      sock.close();
+    } catch {
+      // Already gone. Nothing here depends on the close succeeding.
+    }
+  }
+
   function giveUp(message: string) {
     const dead = socket;
     socket = null;
     stopHeartbeat();
     rtt.value = null;
     lastError.value = message;
-    if (dead) {
-      dead.onopen = null;
-      dead.onclose = null;
-      dead.onerror = null;
-      dead.onmessage = null;
-      try {
-        dead.close();
-      } catch {
-        // Already gone. Nothing here depends on the close succeeding.
-      }
-    }
+    sever(dead);
     failPending("connection to the shell node closed");
     status.value = "connecting";
     scheduleReconnect();
@@ -536,13 +548,30 @@ export function createBus(env: BusEnv): Bus {
       return () => handlers.delete(handler);
     },
     connect,
+    /**
+     * Shuts the bus down for good: nothing retries after this.
+     *
+     * The socket is severed rather than merely closed. `close()` used to call
+     * `socket.close()` with the handlers still attached, so the socket's own
+     * `onclose` ran straight afterwards, rewrote the status from "closed" to
+     * "detached" and scheduled a reconnect -- a connection the shell had
+     * deliberately shut down came back up, `shell.dispose()` left a bus
+     * reconnecting forever, and "closed", the one status that means nothing is
+     * retrying, was unreachable whenever a socket had been open.
+     *
+     * In-flight calls are answered for the same reason they are in `giveUp`:
+     * their sockets are gone, so nothing else will ever resolve them.
+     */
     close() {
+      const dead = socket;
+      socket = null;
       cancelRetry?.();
       stopHeartbeat();
       retryAt.value = null;
+      rtt.value = null;
+      sever(dead);
+      failPending("the connection to the shell node was closed");
       status.value = "closed";
-      socket?.close();
-      socket = null;
     },
   };
 }

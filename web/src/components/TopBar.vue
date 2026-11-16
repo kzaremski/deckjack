@@ -76,9 +76,20 @@ const nodeLabel = computed(() => {
   }
 });
 
-/** Round-trip time, once measured. Proof the pill is not just optimistic. */
+/**
+ * Round-trip time, once measured. Proof the pill is not just optimistic.
+ *
+ * Gated on `online` as well as on the status, and for the same reason
+ * `nodeLabel` is. Losing the network does not change the bus status -- the
+ * socket is only condemned later, by the heartbeat, which is what finally
+ * nulls `rtt` -- so for that whole window this read "offline 40ms": the name
+ * correctly withdrawn, and a stale figure presented beside it as if it were
+ * current. That is the same cached-value lie `nodeLabel` was written to
+ * prevent, in the one place the fix was missed.
+ */
 const latency = computed(() => {
   const ms = shell.bus.rtt.value;
+  if (!shell.bus.online.value) return null;
   return shell.bus.status.value === "open" && ms !== null ? `${ms}ms` : null;
 });
 

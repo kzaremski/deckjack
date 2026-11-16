@@ -127,7 +127,10 @@ export interface Keyboard {
 
 export function createKeyboard(env: KeyboardEnv): Keyboard {
   const table = new Map<string, Shortcut>();
-  const byCommand = new Map<string, string>();
+  /** The chord shown in the UI for a command: the first one the table gave it. */
+  const primary = new Map<string, string>();
+  /** Every chord currently bound to a command, so a rebind can clear them all. */
+  const live = new Map<string, string[]>();
   const lockStatus = ref<LockStatus>("idle");
 
   let overrides: Record<string, string> = {};
@@ -139,12 +142,38 @@ export function createKeyboard(env: KeyboardEnv): Keyboard {
     overrides = {};
   }
 
+  /** Unbinds every chord a command holds. */
+  function forget(commandId: string) {
+    for (const chord of live.get(commandId) ?? []) table.delete(chord);
+    live.delete(commandId);
+    primary.delete(commandId);
+  }
+
+  /**
+   * Binds one chord, distinguishing an *alias* from a *rebind*.
+   *
+   * These pull in opposite directions and conflating them cost the shell its
+   * primary chord. One command may legitimately ship several chords -- the
+   * table gives `shell.palette.open` both `mod+k` and `mod+shift+p` -- while a
+   * chord the operator reassigned must replace what shipped rather than
+   * leaving two live. This used to keep exactly one chord per command and
+   * delete the previous one, so loading the shipped table made the second
+   * palette entry evict the first: `mod+k` was dead, and `labelFor` advertised
+   * Ctrl+Shift+P to every surface that displays it.
+   *
+   * So a default adds to whatever the command already has, and an operator's
+   * override replaces the lot. The label follows the first chord installed,
+   * which is the one the table lists first and the one worth advertising.
+   */
   function install(shortcut: Shortcut) {
-    const chord = overrides[shortcut.commandId] ?? shortcut.chord;
-    const previous = byCommand.get(shortcut.commandId);
-    if (previous) table.delete(previous);
+    const override = overrides[shortcut.commandId];
+    if (override) forget(shortcut.commandId);
+    const chord = override ?? shortcut.chord;
     table.set(chord, { ...shortcut, chord });
-    byCommand.set(shortcut.commandId, chord);
+    const chords = live.get(shortcut.commandId) ?? [];
+    if (!chords.includes(chord)) chords.push(chord);
+    live.set(shortcut.commandId, chords);
+    if (!primary.has(shortcut.commandId)) primary.set(shortcut.commandId, chord);
   }
 
   return {
@@ -156,12 +185,17 @@ export function createKeyboard(env: KeyboardEnv): Keyboard {
     rebind(commandId, chord) {
       overrides[commandId] = chord;
       env.storage.write(CHORDS_KEY, JSON.stringify(overrides));
-      const existing = table.get(byCommand.get(commandId) ?? "");
-      install({ commandId, chord, whileTyping: existing?.whileTyping });
+      const existing = table.get(primary.get(commandId) ?? "");
+      // Every previous chord goes, aliases included: the operator asked for
+      // one chord, not for theirs plus whatever happened to ship.
+      forget(commandId);
+      table.set(chord, { commandId, chord, whileTyping: existing?.whileTyping });
+      live.set(commandId, [chord]);
+      primary.set(commandId, chord);
     },
-    chordFor: (commandId) => byCommand.get(commandId) ?? null,
+    chordFor: (commandId) => primary.get(commandId) ?? null,
     labelFor(commandId) {
-      const chord = byCommand.get(commandId);
+      const chord = primary.get(commandId);
       return chord ? chordLabel(chord, env.apple) : null;
     },
     resolve(event) {
@@ -213,5 +247,9 @@ export const DEFAULT_SHORTCUTS: Shortcut[] = [
   { commandId: "shell.theme.cycle", chord: "mod+alt+d" },
   { commandId: "shell.split.toggle", chord: "mod+alt+s" },
   { commandId: "shell.switcher.open", chord: "mod+j" },
-  { commandId: "shell.lockdown", chord: "mod+alt+l" },
+  // `system.lockdown`, not `shell.lockdown`: the lockdown is the node's, not
+  // the shell's, and this chord was bound to an id nothing registers, so the
+  // panic kill-switch silently dispatched nothing. TopBar's button used the
+  // right id all along, which is how the mismatch stayed hidden.
+  { commandId: "system.lockdown", chord: "mod+alt+l" },
 ];

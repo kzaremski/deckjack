@@ -1501,8 +1501,43 @@ pub fn app(
         None => axum::Router::new(),
     };
 
+    // `/healthz`, the one route `ALLOWED_WHILE_LOCKED` names besides `/unlock`.
+    //
+    // It was carved out of the lockdown gate and listed in the allow-list, but
+    // nothing ever mounted it, so it fell through to the shell-asset fallback
+    // and an unauthenticated health check was answered with a redirect to
+    // sign in -- locked or not. `tests/lockdown.rs` mounts a stand-in
+    // `/healthz` in its own router to exercise the gate, which is how a
+    // carve-out with no handler behind it stayed invisible.
+    //
+    // The payload is deliberately narrower than `Status`, which also carries
+    // how many recovery codes are left and why the node locked itself. None of
+    // that belongs on a route that answers before sign-in. `locked` does: the
+    // locked page is already served to anyone who asks, and a load balancer
+    // has to know not to send work to a node that cannot do any. See
+    // docs/DESIGN.md -- the multi-node routing this feeds is a later phase, so
+    // this is the health check and not yet the lock-generation handshake.
+    let health = {
+        let lockdown = Arc::clone(&lockdown);
+        axum::Router::new().route(
+            "/healthz",
+            axum::routing::get(move || {
+                let lockdown = Arc::clone(&lockdown);
+                async move {
+                    let status = lockdown.status();
+                    axum::Json(serde_json::json!({
+                        "node": status.node_id,
+                        "locked": status.locked,
+                        "key_generation": status.key_generation,
+                    }))
+                }
+            }),
+        )
+    };
+
     crate::http::router(ctx)
         .merge(ws::router(ws_ctx))
+        .merge(health)
         .merge(crate::lockdown::unlock_router(unlock_ctx))
         // Merged HERE, inside this function and above the gate, and that
         // placement is the whole point. `axum`'s `.layer()` applies only to
