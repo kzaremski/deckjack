@@ -8,3 +8,7 @@ web/dist/
 
 # Working directories (a Deckjack data dir may sit anywhere, including here)
 .deckjack/
+
+# Playwright (web/e2e)
+web/test-results/
+web/playwright-report/

@@ -1,0 +1,20 @@
+[package]
+name = "deckjack-scribe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Deckjack app: a text and code editor over the core's file commands"
+
+[[bin]]
+name = "deckjack-scribe"
+path = "src/main.rs"
+
+[dependencies]
+deckjack-app.workspace = true
+anyhow.workspace = true
+rust-embed.workspace = true
+
+[dev-dependencies]
+deckjack-protocol.workspace = true

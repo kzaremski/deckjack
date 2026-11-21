@@ -13,6 +13,10 @@ title = "Notes"
 lifecycle = "on-demand"
 # Two panes below this and neither is usable.
 min_width = 360
+tag = "No"
+summary = "Markdown notes in the working directory"
+default_width = 620
+default_height = 480
 
 # Notes are Markdown files under `Notes/` in the working directory, and that
 # is the only thing this app can see. Not the rest of the working directory,

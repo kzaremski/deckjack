@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/deckjack-app", "crates/deckjack-core", "crates/deckjack-files", "crates/deckjack-notes", "crates/deckjack-protocol", "crates/deckjack-tasks", "xtask"]
+members = ["crates/deckjack-app", "crates/deckjack-core", "crates/deckjack-editor", "crates/deckjack-files", "crates/deckjack-notes", "crates/deckjack-protocol", "crates/deckjack-tasks", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,8 +15,14 @@ deckjack-protocol = { path = "crates/deckjack-protocol" }
 anyhow = "1.0.104"
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.23.1"
+# Thumbnails in Files. Pure Rust decoders only, and only the formats a
+# thumbnail is made of: no AVIF/EXR/TIFF, which would pull in C or large
+# decoders for files Files does not preview anyway.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
+flate2 = "1.1.10"
+futures-util = { version = "0.3.34", default-features = false }
 cookie = "0.18.2"
-nix = { version = "0.31.3", features = ["signal", "hostname"] }
+nix = { version = "0.31.3", features = ["signal", "hostname", "fs"] }
 landlock = "0.4.7"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 rand = { version = "0.10.3", default-features = false, features = ["sys_rng", "std"] }
@@ -26,7 +32,12 @@ libc = "0.2.191"
 mime_guess = "2.0.5"
 portable-pty = "0.9.0"
 rmcp = { version = "1.8.0", features = ["server", "transport-io"] }
-rust-embed = { version = "8.5.0", features = ["compression"] }
+# `debug-embed`: embed in debug builds too. Without it rust-embed reads from
+# the source tree at runtime, and an app runs under Landlock, which does not
+# grant the source tree, so every app UI answered 404 from a debug build.
+# rust-embed's mode is one switch for the whole build, so the core's shell is
+# embedded in debug as well; see `shell.rs`.
+rust-embed = { version = "8.5.0", features = ["compression", "debug-embed"] }
 schemars = "1.2.2"
 seccompiler = "0.5.0"
 sha2 = "0.10.9"

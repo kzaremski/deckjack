@@ -29,6 +29,7 @@ use deckjack_core::command::{
     RiskLevel,
 };
 use deckjack_core::store::{Store, StoreGrants};
+use deckjack_core::wiring;
 
 // ---------------------------------------------------------------------------
 // A node with one app installed
@@ -82,11 +83,20 @@ fn install_app(install: &Path, name: &str, manifest_text: &str) {
 }
 
 async fn rig(apps_to_install: &[&str]) -> Rig {
+    let manifests: Vec<(&str, String)> = apps_to_install
+        .iter()
+        .map(|name| (*name, manifest(name)))
+        .collect();
+    rig_with(&manifests).await
+}
+
+/// A rig over apps whose manifests the test writes itself.
+async fn rig_with(apps_to_install: &[(&str, String)]) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let install = dir.path().join("install");
     std::fs::create_dir_all(&install).unwrap();
-    for name in apps_to_install {
-        install_app(&install, name, &manifest(name));
+    for (name, text) in apps_to_install {
+        install_app(&install, name, text);
     }
 
     let store = Arc::new(std::sync::Mutex::new(Store::open(dir.path()).unwrap()));
@@ -101,6 +111,7 @@ async fn rig(apps_to_install: &[&str]) -> Rig {
         apps::Host::new(
             install.clone(),
             dir.path().to_path_buf(),
+            apps::CoreDoor::new("127.0.0.1:7878".parse().unwrap(), vec![]),
             apps::OsEnv::new(),
             apps::Policy::default(),
             Box::new(StoreGrants::new(store)),
@@ -680,4 +691,158 @@ impl deckjack_core::command::DynCommand for CoreOwned {
     > {
         Box::pin(async { Ok(Value::Null) })
     }
+}
+
+// ---------------------------------------------------------------------------
+// What the shell's dock is built from
+// ---------------------------------------------------------------------------
+
+/// Run `system.apps` through the bus, as the shell does.
+async fn system_apps(rig: &Rig) -> Value {
+    wiring::register_apps(&rig.registry, Arc::clone(&rig.host)).expect("app commands register");
+    let request = Request::new(
+        CommandId::new("system.apps".to_string()).unwrap(),
+        json!({}),
+        Issuer::operator(),
+    );
+    let Ok(Admitted::Running(running)) = rig.bus.dispatch(request) else {
+        panic!("system.apps was not admitted");
+    };
+    let (_rx, done) = running.split();
+    done.await.outcome.expect("system.apps answers")
+}
+
+#[tokio::test]
+async fn system_apps_hands_the_shell_each_apps_dock_fields() {
+    // The shell used to read its dock from a list compiled into the bundle,
+    // so an app installed after the build could never reach it. What it
+    // reads now is this answer, built from the manifest on disk.
+    let rig = rig_with(&[
+        (
+            "photo",
+            format!(
+                "[app]\nname = \"photo\"\nversion = \"2.0.0\"\nprotocol = {}\n\
+             title = \"Photos\"\ntag = \"Ph\"\nsummary = \"Edit photographs\"\n\
+             min_width = 360\ndefault_width = 900\ndefault_height = 600\nwide = false\n",
+                apps::PROTOCOL_VERSION
+            ),
+        ),
+        ("plain", manifest("plain")),
+    ])
+    .await;
+
+    let value = system_apps(&rig).await;
+    let list = value["apps"].as_array().expect("an apps list");
+    let photo = list
+        .iter()
+        .find(|a| a["name"] == "photo")
+        .unwrap_or_else(|| panic!("photo is not in {value}"));
+    assert_eq!(photo["title"], "Photos");
+    assert_eq!(photo["tag"], "Ph");
+    assert_eq!(photo["summary"], "Edit photographs");
+    assert_eq!(photo["min_width"], 360);
+    assert_eq!(photo["default_width"], 900);
+    assert_eq!(photo["default_height"], 600);
+    assert_eq!(photo["compact"], true);
+    assert_eq!(photo["wide"], false);
+
+    // Absent fields arrive as null, not as a default the core made up: the
+    // shell owns the defaults, and two places holding them would drift.
+    let plain = list
+        .iter()
+        .find(|a| a["name"] == "plain")
+        .unwrap_or_else(|| panic!("plain is not in {value}"));
+    assert_eq!(plain["tag"], Value::Null);
+    assert_eq!(plain["summary"], Value::Null);
+    assert_eq!(plain["default_width"], Value::Null);
+    assert_eq!(plain["compact"], true);
+}
+
+// ---------------------------------------------------------------------------
+// An app awaiting approval is discoverable, and says how to approve it
+// ---------------------------------------------------------------------------
+
+/// An app that needs approving. Its network grant names a port: a host list
+/// with no ports opens every port, the core's own included, and is refused
+/// at approval while the core listens on loopback (`apps::reaches_core`).
+fn needy(name: &str) -> String {
+    format!(
+        "[app]\nname = \"{name}\"\nversion = \"1.0.0\"\nprotocol = {}\ntitle = \"Notes\"\n\n\
+         [needs]\nnetwork = [\"cloud.example.net\"]\nconnect_tcp = [443]\n",
+        apps::PROTOCOL_VERSION
+    )
+}
+
+#[tokio::test]
+async fn system_apps_says_which_apps_await_approval_and_what_they_ask() {
+    // After the fingerprint moved to SHA-256 every approved app went stale,
+    // and nothing the shell could see said so: the window failed to open and
+    // the log named a CLI command that does not exist. The shell builds its
+    // "Approve <app>" entries from this answer.
+    let rig = rig_with(&[("notes", needy("notes")), ("plain", manifest("plain"))]).await;
+
+    let value = system_apps(&rig).await;
+    let list = value["apps"].as_array().expect("an apps list");
+    let find = |name: &str| {
+        list.iter()
+            .find(|a| a["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is not in {value}"))
+            .clone()
+    };
+    let notes = find("notes");
+    assert_eq!(notes["approval"], "required", "{notes}");
+    assert!(
+        notes["asks"]
+            .as_str()
+            .is_some_and(|a| a.contains("cloud.example.net")),
+        "{notes}"
+    );
+    assert_eq!(find("plain")["approval"], "not-needed");
+
+    rig.host.approve("notes").expect("the operator approves");
+    // Registered by the first call; asked again directly.
+    let request = Request::new(
+        CommandId::new("system.apps".to_string()).unwrap(),
+        json!({}),
+        Issuer::operator(),
+    );
+    let Ok(Admitted::Running(running)) = rig.bus.dispatch(request) else {
+        panic!("system.apps was not admitted");
+    };
+    let (_rx, done) = running.split();
+    let value = done.await.outcome.expect("system.apps answers");
+    let notes = value["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "notes")
+        .cloned()
+        .unwrap();
+    assert_eq!(notes["approval"], "approved", "{notes}");
+}
+
+#[tokio::test]
+async fn opening_an_app_awaiting_approval_says_how_to_approve_it() {
+    let rig = rig_with(&[("notes", needy("notes"))]).await;
+    let windows = wiring::register_windows(&rig.registry, "apphost-node".to_string())
+        .expect("the window commands register");
+    windows.attach_app_host(Arc::clone(&rig.host));
+
+    let request = Request::new(
+        CommandId::new("shell.window.open".to_string()).unwrap(),
+        json!({ "id": "w1", "app": "notes" }),
+        Issuer::operator(),
+    );
+    let Ok(Admitted::Running(running)) = rig.bus.dispatch(request) else {
+        panic!("shell.window.open was not admitted");
+    };
+    let (_rx, done) = running.split();
+    let why = done
+        .await
+        .outcome
+        .expect_err("an unapproved app must not open")
+        .to_string();
+    assert!(why.contains("Approve Notes"), "{why}");
+    assert!(why.contains("cloud.example.net"), "{why}");
+    assert!(!why.contains("see the log"), "{why}");
 }

@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>untouched</title>
+<!-- The control for question 5: served under the same shell CSP as the Vue
+     build (set by the test), an inline script must be refused and reported.
+     If it is not, the check against the real build proves nothing. -->
+<script>
+  document.title = "inline script ran";
+</script>

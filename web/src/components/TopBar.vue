@@ -2,7 +2,6 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 import { useShell } from "../shell/context.ts";
-import { apps, dockOrder } from "../stores/apps.ts";
 
 /**
  * The bar: the launcher, what is running, the layout, and the state of the node.
@@ -94,14 +93,14 @@ const latency = computed(() => {
 });
 
 const items = computed(() =>
-  dockOrder.map((id) => {
-    const open = shell.windows.all.value.filter((w) => w.app === id);
+  shell.apps.dock.value.map((app) => {
+    const open = shell.windows.all.value.filter((w) => w.app === app.id);
     const focused = open.find((w) => !w.minimized && w.id === shell.windows.focusedId.value);
     return {
-      app: apps[id],
+      app,
       running: open.length > 0,
       active: focused !== undefined,
-      badge: apps[id].badge === "inbox" ? shell.inboxPending.value : 0,
+      badge: app.badge === "inbox" ? shell.inboxPending.value : 0,
       // The window a click acts on has to be the same window the lit state is
       // about. This used to hand over `open[0]`, the *bottom* of the app's
       // z-order, while `active` was true if any of the app's windows had

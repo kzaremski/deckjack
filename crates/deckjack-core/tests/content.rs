@@ -372,6 +372,39 @@ async fn a_directory_is_not_a_document() {
 }
 
 #[tokio::test]
+async fn a_named_pipe_is_refused_rather_than_waited_on() {
+    // Opening a FIFO for reading blocks until a writer appears, on a
+    // blocking-pool thread nothing can cancel. A browser that gives up does
+    // not free it, so each preview of a pipe would park one more thread until
+    // the pool is gone and every file command in the core stalls.
+    let h = Harness::start().await;
+    let fifo = h.dir.path().join("pipe.txt");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path; mkfifo only reads it.
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "mkfifo failed"
+    );
+
+    let answer = tokio::time::timeout(
+        Duration::from_secs(5),
+        h.signed_get("/content?path=/pipe.txt", &[]),
+    )
+    .await;
+    let r = match answer {
+        Ok(r) => r,
+        Err(_) => {
+            // Release the blocked open so the server thread can finish.
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("the content route blocked on a named pipe");
+        }
+    };
+    assert_eq!(r.status, 400, "{}", r.text());
+    assert!(r.text().contains("not a regular file"), "{}", r.text());
+}
+
+#[tokio::test]
 async fn a_missing_file_says_so() {
     let h = Harness::start().await;
     let r = h.signed_get("/content?path=/nope.txt", &[]).await;
@@ -473,5 +506,102 @@ async fn a_preview_is_shown_in_place_rather_than_downloaded() {
     assert!(
         disposition.starts_with("inline"),
         "an image preview was sent as a download: {disposition:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// a file bigger than one read, which is every video
+// ---------------------------------------------------------------------------
+
+/// Bytes with a pattern, so a body that is the right length but the wrong
+/// window of the file does not compare equal by accident.
+fn patterned(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// Larger than anything the route might buffer in one go. The route used to
+/// read an 8 MiB window and send it as if it were the whole answer.
+const LARGE: usize = 9 * 1024 * 1024 + 4321;
+
+#[tokio::test]
+async fn a_file_larger_than_one_read_arrives_whole() {
+    // A browser that does not send `Range` -- an `<img>` of a 20 MB panorama,
+    // a download -- is asking for the file. Sending the first few megabytes
+    // with a 200 is a corrupt file that looks like a successful download.
+    let h = Harness::start().await;
+    let bytes = patterned(LARGE);
+    h.write("panorama.jpg", &bytes);
+
+    let r = h.signed_get("/content?path=/panorama.jpg", &[]).await;
+
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("content-length"), Some(LARGE.to_string().as_str()));
+    assert_eq!(r.body.len(), LARGE, "the body stopped short of the file");
+    assert!(r.body == bytes, "the body is not the file's own bytes");
+}
+
+#[tokio::test]
+async fn a_range_on_a_large_file_sends_exactly_what_its_content_range_claims() {
+    // A `<video>` opens with `Range: bytes=0-` and seeks with `bytes=N-`. The
+    // promise a player relies on is that `Content-Range`, `Content-Length` and
+    // the body agree; a header claiming the rest of a 2 GB file over an 8 MiB
+    // body is a stream the player believes ends where it does not.
+    let h = Harness::start().await;
+    let bytes = patterned(LARGE);
+    h.write("clip.mp4", &bytes);
+
+    let r = h
+        .signed_get("/content?path=/clip.mp4", &[("Range", "bytes=1000-")])
+        .await;
+
+    assert_eq!(r.status, 206);
+    let claimed = r
+        .header("content-range")
+        .expect("a content range")
+        .to_string();
+    let (span, total) = claimed
+        .strip_prefix("bytes ")
+        .and_then(|s| s.split_once('/'))
+        .expect("bytes start-end/total");
+    let (start, end) = span.split_once('-').expect("start-end");
+    let (start, end): (usize, usize) = (start.parse().unwrap(), end.parse().unwrap());
+    assert_eq!(total, LARGE.to_string());
+    assert_eq!(start, 1000);
+    assert_eq!(
+        r.header("content-length"),
+        Some((end - start + 1).to_string().as_str()),
+        "Content-Length disagrees with Content-Range {claimed}"
+    );
+    assert_eq!(
+        r.body.len(),
+        end - start + 1,
+        "the body disagrees with {claimed}"
+    );
+    assert!(
+        r.body == bytes[start..=end],
+        "the body is not bytes {start}-{end}"
+    );
+}
+
+#[tokio::test]
+async fn a_seek_into_the_middle_of_a_large_file_lands_on_those_bytes() {
+    let h = Harness::start().await;
+    let bytes = patterned(LARGE);
+    h.write("clip.mp4", &bytes);
+    let from = LARGE - 777;
+    let range = format!("bytes={from}-{}", LARGE - 1);
+
+    let r = h
+        .signed_get("/content?path=/clip.mp4", &[("Range", range.as_str())])
+        .await;
+
+    assert_eq!(r.status, 206);
+    assert_eq!(
+        r.header("content-range"),
+        Some(format!("bytes {from}-{}/{LARGE}", LARGE - 1).as_str())
+    );
+    assert!(
+        r.body == bytes[from..],
+        "the tail of the file did not arrive"
     );
 }

@@ -1,0 +1,10 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Q3: CSP host-source paths in script-src</title>
+<!-- Served with `script-src {{A}}/js/allowed/ {{A}}/js/exact.js` (set by the
+     test): one directory and one exact file, and no 'self'. Each script
+     records its own path in `self.ran`. -->
+<script src="/js/denied/mark.js?tag=q3-denied"></script>
+<script src="/js/allowed/mark.js?tag=q3-allowed"></script>
+<script src="/js/exact.js?tag=q3-exact"></script>
+<script src="/js/exact2.js?tag=q3-exact2"></script>

@@ -282,6 +282,7 @@ async fn rig() -> Rig {
         apps::Host::new(
             install.clone(),
             dir.path().to_path_buf(),
+            apps::CoreDoor::new("127.0.0.1:7878".parse().unwrap(), vec![]),
             apps::OsEnv::new(),
             apps::Policy::default(),
             Box::new(StoreGrants::new(Arc::clone(&store))),

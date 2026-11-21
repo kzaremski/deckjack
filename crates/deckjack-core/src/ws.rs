@@ -105,6 +105,16 @@ pub const PATH: &str = "/ws";
 /// actually sent.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Error code for an invoke that still carries the removed `confirmed`
+/// field. Not a protocol bump: the frame still parses, and the answer says
+/// exactly what changed, which a handshake refusal could not.
+pub const CONFIRMED_REMOVED: &str = "confirmed_removed";
+
+/// Error code for a `confirm` frame whose ticket did not run anything:
+/// unknown, used, expired, or for another socket, issuer, command or
+/// parameters.
+pub const CONFIRMATION_REFUSED: &str = "confirmation_refused";
+
 /// Close codes.
 ///
 /// 4000-4999 is the range reserved for application use. These mirror the
@@ -286,6 +296,12 @@ impl fmt::Display for ConnectionId {
 // Wire frames
 // ---------------------------------------------------------------------------
 
+/// `Some` for a field that is in the frame, whatever its value, `null`
+/// included. Used with `#[serde(default)]`, so an absent field stays `None`.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
 /// Browser to server.
 ///
 /// Internally tagged so the TypeScript side is a discriminated union on
@@ -307,14 +323,52 @@ pub enum ClientFrame {
         command: CommandId,
         #[serde(default)]
         params: Value,
-        /// The operator answered the confirmation dialog for this call.
+        /// **Removed.** This was the client saying "the operator answered the
+        /// dialog", and the bus believed it, so any script on the socket
+        /// could skip the dialog. A confirmation is now a server-issued
+        /// ticket redeemed with [`ClientFrame::Confirm`].
         ///
-        /// The bus bounds what this can do: it cannot change a command's
-        /// risk, so the worst a buggy client achieves is skipping its own
-        /// dialog for something that was already destructive. Ignored
-        /// entirely for agents.
+        /// Still parsed, only so that a frame carrying it is answered with an
+        /// error naming the change rather than run as if unconfirmed or
+        /// silently ignored: a stale client that sends it learns why.
+        /// Present at all is enough, `null` included: serde would otherwise
+        /// read `"confirmed": null` as absent.
+        #[serde(
+            default,
+            deserialize_with = "present",
+            skip_serializing_if = "Option::is_none"
+        )]
+        confirmed: Option<Value>,
+        /// The call is made on behalf of this installed app's window, not
+        /// by the shell itself (docs/APP-UI-ISOLATION.md §4.6).
+        ///
+        /// It can only narrow what the call may do: the bus then treats it
+        /// as that app's window and holds it to the app's approved scope,
+        /// never to the operator's. Accepted here, on a socket whose session
+        /// cookie the upgrade verified, and nowhere else.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        as_app: Option<String>,
+    },
+    /// Run a command the operator has just confirmed.
+    ///
+    /// `ticket` is what the `needs_confirmation` answer to an earlier invoke
+    /// carried. `command` and `params` are that same call again: the server
+    /// keeps only a digest of what it asked about, and runs this only if the
+    /// two agree. Valid once, for a minute, on the socket that was asked.
+    /// `id` is a fresh correlation id, answered like an invoke's.
+    Confirm {
+        id: CorrelationId,
+        ticket: String,
+        command: CommandId,
         #[serde(default)]
-        confirmed: bool,
+        params: Value,
+        /// The `as_app` the invoke that was asked about carried, again. The
+        /// ticket is bound to the issuer it named, so a ticket issued to an
+        /// app's window is refused on a confirm that names another app or
+        /// none, and one issued to the shell is refused on a confirm that
+        /// names any app.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        as_app: Option<String>,
     },
     /// Ask a running command to stop. Cooperative: the command sees the
     /// signal and unwinds, so a `response` still arrives for `id`.
@@ -493,6 +547,16 @@ impl CommandError {
         )
     }
 
+    /// An invoke still carrying the client-asserted `confirmed` field.
+    fn confirmed_removed() -> CommandError {
+        CommandError::new(
+            CONFIRMED_REMOVED,
+            "`confirmed` is no longer accepted on an invoke: the server issues a \
+             confirmation ticket and a `confirm` frame redeems it. Nothing was run. \
+             Reload the desktop to pick up the current client",
+        )
+    }
+
     /// Cancel arrived for a correlation id nothing is running under. Not an
     /// error worth closing over: a cancel racing a response is normal.
     fn not_running() -> CommandError {
@@ -532,9 +596,13 @@ pub struct Call {
     /// nothing aborts the future, because a command killed between two
     /// writes leaves worse state than one that unwinds.
     pub cancel: CancelSignal,
-    /// The operator answered the confirmation dialog. Carried, not
-    /// interpreted: what it is worth is the bus's decision.
-    pub confirmed: bool,
+    /// The confirmation ticket, when this call came in as a `confirm` frame.
+    /// Carried, not interpreted: whether it is good is the dispatcher's
+    /// decision, which holds the tickets.
+    pub ticket: Option<String>,
+    /// The installed app whose window this call is made for, from the
+    /// frame's `as_app`. Carried, not interpreted, like `ticket`.
+    pub as_app: Option<String>,
 }
 
 /// Who issued a call, for the attribution log and for ownership.
@@ -1165,12 +1233,7 @@ async fn upgrade(
         return refuse(StatusCode::FORBIDDEN, "cross-origin websocket refused");
     }
 
-    let session = crate::auth::session::from_cookie_headers(
-        headers
-            .get_all(header::COOKIE)
-            .iter()
-            .filter_map(|v| v.to_str().ok()),
-    );
+    let session = ctx.auth.session_cookie(peer, &headers);
 
     let decision = {
         let now = ctx.now();
@@ -1507,12 +1570,41 @@ fn handle(
             }
         }
 
-        ClientFrame::Invoke {
-            id,
-            command,
-            params,
-            confirmed,
-        } => {
+        // A confirm is an invoke that carries a ticket; past this point the
+        // two are one path, so neither can grow a check the other lacks.
+        frame @ (ClientFrame::Invoke { .. } | ClientFrame::Confirm { .. }) => {
+            let (id, command, params, ticket, as_app) = match frame {
+                ClientFrame::Invoke {
+                    id,
+                    command,
+                    params,
+                    confirmed,
+                    as_app,
+                } => {
+                    // Answered rather than closed: the call is refused, and
+                    // the socket is fine. Before anything is registered, so
+                    // it costs no in-flight slot and reaches no command.
+                    if confirmed.is_some() {
+                        return queue_or_close(
+                            out,
+                            ServerFrame::Response {
+                                id,
+                                outcome: Outcome::error(CommandError::confirmed_removed()),
+                                elapsed_ms: 0,
+                            },
+                        );
+                    }
+                    (id, command, params, None, as_app)
+                }
+                ClientFrame::Confirm {
+                    id,
+                    ticket,
+                    command,
+                    params,
+                    as_app,
+                } => (id, command, params, Some(ticket), as_app),
+                _ => unreachable!("only invoke and confirm reach this arm"),
+            };
             let started = ctx.clock.mono();
             let cancel = match registry.begin(&id, command.clone(), started) {
                 Ok(cancel) => cancel,
@@ -1548,7 +1640,8 @@ fn handle(
                 // frame: a client cannot name the session it is acting as.
                 issuer: Issuer::new(conn, peer.session.clone(), peer.ip),
                 cancel,
-                confirmed,
+                ticket,
+                as_app,
             };
             let sink = ProgressSink {
                 id: id.clone(),

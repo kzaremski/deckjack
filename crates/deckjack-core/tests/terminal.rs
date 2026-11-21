@@ -100,6 +100,8 @@ struct Shell {
     resizes: Arc<Mutex<Vec<WinSize>>>,
     /// The size the backend was handed when the pty was opened.
     opened_with: WinSize,
+    /// One message per successful `wait`: the child was reaped.
+    reaped: Arc<Mutex<Receiver<()>>>,
 }
 
 impl Shell {
@@ -142,6 +144,33 @@ impl Shell {
 
     fn resizes(&self) -> Vec<WinSize> {
         self.resizes.lock().unwrap().clone()
+    }
+
+    /// Whether the child was reaped within `deadline`. A failure deadline,
+    /// not pacing: a reap that happens resolves this immediately, and one
+    /// that never happens is the zombie this exists to catch.
+    fn reaped_within(&self, deadline: Duration) -> bool {
+        self.reaped.lock().unwrap().recv_timeout(deadline).is_ok()
+    }
+
+    /// Whether, within `deadline`, the server let go of everything this
+    /// terminal held: the input thread ended (it owned the only writer) and
+    /// the pty itself was dropped (it owned the only reap sender). This is
+    /// the fd and the thread an exited terminal used to keep forever.
+    fn released_within(&self, deadline: Duration) -> bool {
+        fn drained<T>(rx: &Receiver<T>, until: std::time::Instant) -> bool {
+            use std::sync::mpsc::RecvTimeoutError;
+            loop {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                match rx.recv_timeout(left) {
+                    Ok(_) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return true,
+                    Err(RecvTimeoutError::Timeout) => return false,
+                }
+            }
+        }
+        let until = std::time::Instant::now() + deadline;
+        drained(&self.typed.lock().unwrap(), until) && drained(&self.reaped.lock().unwrap(), until)
     }
 }
 
@@ -204,6 +233,7 @@ struct FakePty {
     gate: Mutex<Option<Receiver<()>>>,
     signals: Arc<Mutex<Vec<Hangup>>>,
     resizes: Arc<Mutex<Vec<WinSize>>>,
+    reaped: Sender<()>,
 }
 
 impl PtyProcess for FakePty {
@@ -252,6 +282,7 @@ impl PtyProcess for FakePty {
         if self.plan.unreapable {
             return None;
         }
+        let _ = self.reaped.send(());
         Some((self.plan.exit_code, None))
     }
 }
@@ -302,6 +333,7 @@ impl PtyBackend for FakeBackend {
         let (typed_tx, typed_rx) = channel::<Vec<u8>>();
         let (gate_tx, gate_rx) = channel::<()>();
         let (hold_tx, hold_rx) = channel::<()>();
+        let (reaped_tx, reaped_rx) = channel::<()>();
 
         let writer: Box<dyn Write + Send> = if plan.wedged_input {
             Box::new(WedgedWriter(hold_rx))
@@ -321,6 +353,7 @@ impl PtyBackend for FakeBackend {
                 signals: Arc::clone(&signals),
                 resizes: Arc::clone(&resizes),
                 opened_with: spec.size,
+                reaped: Arc::new(Mutex::new(reaped_rx)),
             },
         );
         Ok(Box::new(FakePty {
@@ -334,6 +367,7 @@ impl PtyBackend for FakeBackend {
             gate: Mutex::new(plan.gate_wait.then_some(gate_rx)),
             signals,
             resizes,
+            reaped: reaped_tx,
         }))
     }
 }
@@ -366,6 +400,7 @@ fn small_rig(scrollback_bytes: usize) -> Rig {
     rig(Limits {
         max_sessions: 8,
         scrollback_bytes,
+        ..Limits::default()
     })
 }
 
@@ -796,6 +831,7 @@ async fn max_sessions_is_enforced_and_an_exited_session_does_not_count() {
     let r = rig(Limits {
         max_sessions: 2,
         scrollback_bytes: 1024,
+        ..Limits::default()
     });
     let first = r.registry.open(shell_spec()).unwrap();
     let _second = r.registry.open(shell_spec()).unwrap();
@@ -820,6 +856,7 @@ fn a_backend_that_cannot_open_a_pty_does_not_consume_a_slot() {
     let r = rig(Limits {
         max_sessions: 1,
         scrollback_bytes: 1024,
+        ..Limits::default()
     });
     r.backend.next(Plan {
         fail_open: true,
@@ -842,6 +879,7 @@ fn a_pty_whose_output_stream_cannot_be_taken_is_not_registered() {
     let r = rig(Limits {
         max_sessions: 1,
         scrollback_bytes: 1024,
+        ..Limits::default()
     });
     r.backend.next(Plan {
         fail_reader: true,
@@ -927,6 +965,76 @@ async fn lockdown_kills_every_live_shell_without_a_signal_it_can_trap() {
     );
 }
 
+/// A killed shell is reaped even though the registry has already forgotten
+/// it.
+///
+/// `kill_all` drains the registry and drops every session, so the output
+/// pump was the only thing left that could `wait` on the child — and it
+/// reaped through the session, which it holds weakly. The session was gone by
+/// the time the killed shell's output ended, so nothing ever called `wait`,
+/// and every lockdown left one zombie per shell behind for the life of the
+/// server.
+#[test]
+fn a_killed_shell_is_reaped_after_the_registry_has_forgotten_it() {
+    let r = rig(Limits::default());
+    let term = r.registry.open(client(&an_id())).unwrap();
+    let shell = r.backend.shell(term.id());
+    // The registry's copy is the only one left, as in production, where the
+    // handler that opened the terminal returned long ago.
+    drop(term);
+
+    assert_eq!(r.registry.kill_all(), 1);
+    // The signal lands: the shell dies and its output stream ends.
+    shell.ends();
+
+    assert!(
+        shell.reaped_within(Duration::from_secs(10)),
+        "the killed shell was never waited on: it is a zombie"
+    );
+}
+
+/// The same promise for an ordinary close, which forgets the session before
+/// the shell has finished hanging up.
+#[test]
+fn a_closed_shell_is_reaped_after_the_registry_has_forgotten_it() {
+    let r = rig(Limits::default());
+    let term = r.registry.open(shell_spec()).unwrap();
+    let id = term.id().clone();
+    let shell = r.backend.shell(&id);
+    drop(term);
+
+    r.registry.close(&id).unwrap();
+    shell.ends();
+
+    assert!(
+        shell.reaped_within(Duration::from_secs(10)),
+        "the closed shell was never waited on: it is a zombie"
+    );
+}
+
+/// A session closed while its shell was still printing does not leave the
+/// shell behind either. The pump used to give up the moment it found the
+/// session gone mid-stream, which skipped the reap just the same.
+#[test]
+fn a_shell_closed_mid_output_is_still_reaped() {
+    let r = rig(Limits::default());
+    let term = r.registry.open(shell_spec()).unwrap();
+    let id = term.id().clone();
+    let shell = r.backend.shell(&id);
+    drop(term);
+
+    r.registry.close(&id).unwrap();
+    // Output the pump reads after the session is gone.
+    shell.says(b"still talking\n");
+    shell.says(b"and more\n");
+    shell.ends();
+
+    assert!(
+        shell.reaped_within(Duration::from_secs(10)),
+        "a shell closed mid-output was never waited on: it is a zombie"
+    );
+}
+
 #[test]
 fn closing_a_terminal_hangs_it_up_politely_and_forgets_it() {
     let r = rig(Limits::default());
@@ -999,6 +1107,251 @@ async fn prune_forgets_only_the_sessions_that_exited_before_the_cutoff() {
     assert!(r.registry.attach(running.id()).is_ok());
     assert_eq!(r.registry.prune_exited(u64::MAX), 1);
     assert!(r.registry.attach(running.id()).is_ok());
+}
+
+#[tokio::test]
+async fn an_exited_terminal_is_kept_for_its_grace_and_then_let_go() {
+    let r = rig(Limits {
+        exited_grace_secs: 60,
+        ..Limits::default()
+    });
+    r.clock.set(1_000);
+    let term = r.registry.open(shell_spec()).unwrap();
+    let id = term.id().clone();
+    let shell = r.backend.shell(&id);
+    shell.ends();
+    within(term.wait_for_exit()).await;
+    drop(term);
+
+    // Inside the grace a reconnecting browser still finds it.
+    r.clock.set(1_060);
+    assert_eq!(r.registry.list().len(), 1, "forgotten inside its grace");
+    assert!(r.registry.attach(&id).is_ok());
+    assert!(
+        !shell.released_within(Duration::from_millis(50)),
+        "the pty went while the terminal could still be reattached"
+    );
+
+    // Past it, nobody has to ask: any look at the registry lets it go — the
+    // owner's own list, which is what the panel asks, included.
+    r.clock.set(1_061);
+    assert!(
+        r.registry.list_for(&Opener::Host).is_empty(),
+        "kept past its grace"
+    );
+    assert!(matches!(
+        r.registry.attach(&id).unwrap_err(),
+        TerminalError::NoSuchTerminal { .. }
+    ));
+    assert!(
+        shell.released_within(Duration::from_secs(5)),
+        "a forgotten terminal still holds its pty or its input thread"
+    );
+}
+
+#[tokio::test]
+async fn a_loop_of_open_and_exit_holds_a_bounded_number_of_dead_terminals() {
+    // The failure this guards: exited terminals do not count against
+    // `max_sessions`, so a client opening a shell, typing `exit` and going
+    // again kept one pty master and one input thread per pass, for good.
+    let r = rig(Limits {
+        max_sessions: 4,
+        max_exited: 3,
+        ..Limits::default()
+    });
+    let mut shells = Vec::new();
+    for i in 0..20 {
+        r.clock.set(1_000 + i);
+        let term = r.registry.open(shell_spec()).unwrap();
+        let shell = r.backend.shell(term.id());
+        shell.ends();
+        within(term.wait_for_exit()).await;
+        shells.push((term.id().clone(), shell));
+    }
+    // Opening alone enforced the bound: nobody listed anything, and the
+    // oldest dead terminal is already gone.
+    assert!(matches!(
+        r.registry.attach(&shells[0].0).unwrap_err(),
+        TerminalError::NoSuchTerminal { .. }
+    ));
+    // One more look, as the panel's list would.
+    let listed = r.registry.list();
+
+    assert_eq!(listed.len(), 3, "{listed:?}");
+    let kept: Vec<&TerminalId> = listed.iter().map(|i| &i.id).collect();
+    let newest: Vec<&TerminalId> = shells[17..].iter().map(|(id, _)| id).collect();
+    assert_eq!(kept, newest, "the cap kept the wrong ones");
+    for (_, shell) in &shells[..17] {
+        assert!(
+            shell.released_within(Duration::from_secs(5)),
+            "a pruned terminal still holds its pty or its input thread"
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_session_looping_open_and_exit_does_not_evict_another_sessions_dead_terminal() {
+    // The cap on exited terminals is node-wide, so it has to choose whose
+    // go. A session that opens and exits shells in a loop must pay for its
+    // own loop: another session's recently exited terminal, inside its grace,
+    // keeps its last output and exit status for that session's reattach.
+    let r = rig(Limits {
+        max_sessions: 4,
+        max_exited: 3,
+        ..Limits::default()
+    });
+    let (quiet, noisy) = (an_id(), an_id());
+    r.clock.set(1_000);
+    let theirs = r.registry.open(client(&quiet)).unwrap();
+    r.backend.shell(theirs.id()).ends();
+    within(theirs.wait_for_exit()).await;
+    let theirs = theirs.id().clone();
+
+    for i in 0..20 {
+        r.clock.set(1_001 + i);
+        let term = r.registry.open(client(&noisy)).unwrap();
+        r.backend.shell(term.id()).ends();
+        within(term.wait_for_exit()).await;
+    }
+
+    let kept: Vec<TerminalId> = r
+        .registry
+        .list_for(&Opener::Client(quiet))
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(
+        kept,
+        vec![theirs],
+        "another session's loop evicted this one's terminal"
+    );
+    assert_eq!(
+        r.registry.list_for(&Opener::Client(noisy)).len(),
+        2,
+        "the looping session should hold what is left of the cap"
+    );
+    assert_eq!(
+        r.registry.list().len(),
+        3,
+        "the node-wide cap no longer holds"
+    );
+}
+
+#[tokio::test]
+async fn the_wired_registry_lets_go_of_dead_terminals_when_nobody_is_looking() {
+    // Opening and listing reap in passing. A node nobody is using does
+    // neither, so the wiring sweeps on a timer; without it an exited
+    // terminal kept its pty master and input thread until someone came back.
+    let Rig {
+        registry: terminals,
+        backend,
+        clock,
+    } = rig(Limits {
+        exited_grace_secs: 60,
+        ..Limits::default()
+    });
+    let commands = deckjack_core::command::Registry::new();
+    let terminals = deckjack_core::wiring::register_terminal_with(
+        &commands,
+        PathBuf::from("/srv/deckjack"),
+        terminals,
+        Duration::from_millis(20),
+    )
+    .unwrap();
+    let term = terminals.open(shell_spec()).unwrap();
+    let id = term.id().clone();
+    let shell = backend.shell(&id);
+    shell.ends();
+    within(term.wait_for_exit()).await;
+    drop(term);
+
+    // Past its grace, and then nothing but time: no open, no list. `attach`
+    // only looks, it does not reap.
+    clock.set(2_000);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while terminals.attach(&id).is_ok() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        terminals.attach(&id).is_err(),
+        "an idle node kept a terminal past its grace"
+    );
+    assert!(
+        shell.released_within(Duration::from_secs(5)),
+        "the swept terminal still holds its pty or its input thread"
+    );
+}
+
+#[tokio::test]
+async fn a_pruned_terminal_whose_jobs_linger_is_still_reached_by_the_kill_switch() {
+    // A shell that exited may have left `nohup make &` behind in its session.
+    // Forgetting the terminal must not put that job out of lockdown's reach.
+    struct Lingering(Box<dyn PtyProcess>, Arc<std::sync::atomic::AtomicBool>);
+    impl PtyProcess for Lingering {
+        fn resize(&self, s: WinSize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.resize(s)
+        }
+        fn reader(&self) -> Result<Box<dyn Read + Send>, Box<dyn std::error::Error + Send + Sync>> {
+            self.0.reader()
+        }
+        fn writer(
+            &self,
+        ) -> Result<Box<dyn Write + Send>, Box<dyn std::error::Error + Send + Sync>> {
+            self.0.writer()
+        }
+        fn pid(&self) -> Option<u32> {
+            self.0.pid()
+        }
+        fn hangup(&self, how: Hangup) -> Result<(), nix::Error> {
+            self.0.hangup(how)
+        }
+        fn wait(&self) -> Option<(u32, Option<String>)> {
+            self.0.wait()
+        }
+        fn lingers(&self) -> bool {
+            self.1.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    struct LingeringBackend(Arc<FakeBackend>, Arc<std::sync::atomic::AtomicBool>);
+    impl PtyBackend for LingeringBackend {
+        fn open(
+            &self,
+            spec: &SessionSpec,
+            id: &TerminalId,
+        ) -> Result<Box<dyn PtyProcess>, TerminalError> {
+            Ok(Box::new(Lingering(
+                self.0.open(spec, id)?,
+                Arc::clone(&self.1),
+            )))
+        }
+    }
+
+    let clock = TestClock::at(1_000);
+    let fakes = FakeBackend::new();
+    let lingers = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let registry = Registry::new(
+        Arc::clone(&clock) as Arc<dyn Env>,
+        Arc::new(LingeringBackend(Arc::clone(&fakes), Arc::clone(&lingers))) as Arc<dyn PtyBackend>,
+        Limits {
+            exited_grace_secs: 10,
+            ..Limits::default()
+        },
+    );
+    let term = registry.open(shell_spec()).unwrap();
+    let shell = fakes.shell(term.id());
+    shell.ends();
+    within(term.wait_for_exit()).await;
+    drop(term);
+
+    clock.set(2_000);
+    assert!(registry.list().is_empty(), "kept past its grace");
+    registry.kill_all();
+
+    assert!(
+        shell.signals().contains(&Hangup::Now),
+        "the kill switch never reached a forgotten terminal's lingering jobs: {:?}",
+        shell.signals()
+    );
 }
 
 #[test]
@@ -1144,4 +1497,50 @@ fn a_refused_keystroke_is_not_quoted_back_in_the_error() {
         !shown.contains("hunter2"),
         "the error quoted the input: {shown}"
     );
+}
+
+/// A terminal closed while something in it is still running stays within the
+/// kill switch's reach.
+///
+/// `close` hangs up politely and forgets the session; a job that ignores the
+/// hangup keeps the pty open and runs on. A lockdown that walked only the
+/// terminals still listed never signaled it.
+#[test]
+fn lockdown_still_kills_a_closed_terminal_whose_output_has_not_ended() {
+    let r = rig(Limits::default());
+    let term = r.registry.open(client(&an_id())).unwrap();
+    let shell = r.backend.shell(term.id());
+    let id = term.id().clone();
+    drop(term);
+
+    r.registry.close(&id).unwrap();
+    assert_eq!(shell.signals(), vec![Hangup::Polite]);
+    // A later close must not let go of the earlier one while it still runs.
+    let later = r.registry.open(client(&an_id())).unwrap();
+    r.registry.close(&later.id().clone()).unwrap();
+
+    r.registry.kill_all();
+    assert_eq!(
+        shell.signals(),
+        vec![Hangup::Polite, Hangup::Now],
+        "the closed terminal's processes were out of the kill switch's reach"
+    );
+    shell.ends();
+    assert!(shell.reaped_within(Duration::from_secs(10)));
+}
+
+/// The same for a session signed out, whose terminals are closed together.
+#[test]
+fn lockdown_still_kills_terminals_closed_by_a_sign_out() {
+    let r = rig(Limits::default());
+    let signed_out = an_id();
+    let term = r.registry.open(client(&signed_out)).unwrap();
+    let shell = r.backend.shell(term.id());
+    drop(term);
+
+    assert_eq!(r.registry.close_for_session(&signed_out), 1);
+    r.registry.kill_all();
+    assert_eq!(shell.signals(), vec![Hangup::Polite, Hangup::Now]);
+    shell.ends();
+    assert!(shell.reaped_within(Duration::from_secs(10)));
 }

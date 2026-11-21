@@ -23,6 +23,11 @@ const pending = computed(() => shell.ui.confirmation.value);
       <span class="risk" :data-risk="pending.risk">{{ riskLabel(pending.risk) }}</span>
       <h2>{{ pending.title }}</h2>
       <p>{{ pending.detail }}</p>
+      <!-- Text interpolation, never v-html: the target comes from params,
+           and params can name anything. -->
+      <p v-if="pending.target" class="target" data-testid="confirm-target">
+        {{ pending.target }}
+      </p>
       <p v-if="pending.count !== undefined" class="count">
         Affects <strong>{{ pending.count }}</strong> items.
       </p>
@@ -69,6 +74,18 @@ p {
   color: var(--dj-color-text-muted);
   font-size: var(--dj-type-small-size);
   line-height: var(--dj-type-small-line);
+}
+
+.target {
+  padding: var(--dj-space-2) var(--dj-space-3);
+  border-radius: var(--dj-radius-md);
+  background: var(--dj-color-sunken);
+  color: var(--dj-color-text);
+  font-family: var(--dj-font-mono);
+  overflow-wrap: anywhere;
+  /* The node already strips bidi controls; isolating the box as well means
+     a right-to-left name cannot reorder the text around it. */
+  unicode-bidi: isolate;
 }
 
 .count strong {

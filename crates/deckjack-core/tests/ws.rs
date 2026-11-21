@@ -203,7 +203,6 @@ fn the_three_client_frames_deserialize_from_what_the_shell_sends() {
         "id": "c1",
         "command": "files.list",
         "params": { "path": "." },
-        "confirmed": true,
     }))
     .unwrap();
     match invoke {
@@ -212,13 +211,39 @@ fn the_three_client_frames_deserialize_from_what_the_shell_sends() {
             command,
             params,
             confirmed,
+            ..
         } => {
             assert_eq!(id.as_str(), "c1");
             assert_eq!(command.as_str(), "files.list");
             assert_eq!(params, json!({ "path": "." }));
-            assert!(confirmed);
+            assert!(confirmed.is_none());
         }
         other => panic!("expected invoke, got {other:?}"),
+    }
+
+    let confirm: ClientFrame = serde_json::from_value(json!({
+        "type": "confirm",
+        "id": "c2",
+        "ticket": "00112233445566778899aabbccddeeff",
+        "command": "files.trash.empty",
+        "params": {},
+    }))
+    .unwrap();
+    match confirm {
+        ClientFrame::Confirm {
+            id,
+            ticket,
+            command,
+            params,
+            as_app,
+        } => {
+            assert_eq!(id.as_str(), "c2");
+            assert_eq!(ticket, "00112233445566778899aabbccddeeff");
+            assert_eq!(command.as_str(), "files.trash.empty");
+            assert_eq!(params, json!({}));
+            assert_eq!(as_app, None, "a confirm with no as_app is the shell's");
+        }
+        other => panic!("expected confirm, got {other:?}"),
     }
 
     let cancel: ClientFrame =
@@ -227,10 +252,9 @@ fn the_three_client_frames_deserialize_from_what_the_shell_sends() {
 }
 
 #[test]
-fn an_invoke_without_params_or_confirmed_means_null_and_false() {
-    // protocol.ts marks both optional, so the shell leaves them out for a
-    // no-argument command. A `confirmed` that defaulted to true would skip
-    // the operator's dialog for everything.
+fn an_invoke_without_params_means_null_and_asserts_no_confirmation() {
+    // protocol.ts marks params optional, so the shell leaves them out for a
+    // no-argument command.
     let invoke: ClientFrame =
         serde_json::from_value(json!({ "type": "invoke", "id": "c1", "command": "node.info" }))
             .unwrap();
@@ -239,7 +263,10 @@ fn an_invoke_without_params_or_confirmed_means_null_and_false() {
             params, confirmed, ..
         } => {
             assert_eq!(params, Value::Null);
-            assert!(!confirmed, "an absent `confirmed` must never mean yes");
+            assert!(
+                confirmed.is_none(),
+                "nothing was sent, so nothing is refused"
+            );
         }
         other => panic!("expected invoke, got {other:?}"),
     }
@@ -837,7 +864,88 @@ async fn the_issuer_comes_from_the_upgrade_and_cannot_be_named_in_a_frame() {
     assert_eq!(seen[0].command, "test.ok");
     assert_eq!(seen[0].params, json!({}));
     assert_eq!(seen[0].ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
-    assert!(!seen[0].confirmed);
+    assert!(seen[0].ticket.is_none(), "an invoke carries no ticket");
+}
+
+/// The client-asserted `confirmed` bit is gone, and a frame still carrying it
+/// is answered with an error naming the change. It never reaches the bus:
+/// neither as a confirmed call, which is the hole this closes, nor as an
+/// unconfirmed one, which a stale client would take for "nothing happened".
+#[tokio::test]
+async fn an_invoke_still_carrying_confirmed_is_refused_and_never_dispatched() {
+    let server = Server::start(Settings::default(), default_bus()).await;
+    let mut ws = server.open().await;
+    ws.hello(1).await;
+    ws.next_frame().await;
+
+    // Control: the same call without the field reaches the bus.
+    ws.invoke("ok", "test.ok", json!({})).await;
+    assert_eq!(ws.next_frame().await["outcome"]["status"], "ok");
+    assert_eq!(server.bus.seen().len(), 1);
+
+    for (id, value) in [("t", json!(true)), ("f", json!(false))] {
+        ws.send_json(&json!({
+            "type": "invoke",
+            "id": id,
+            "command": "test.ok",
+            "params": {},
+            "confirmed": value,
+        }))
+        .await;
+        let answer = ws.next_frame().await;
+        assert_eq!(answer["id"], id);
+        assert_eq!(answer["outcome"]["status"], "error", "got {answer}");
+        assert_eq!(
+            answer["outcome"]["error"]["code"],
+            ws::CONFIRMED_REMOVED,
+            "got {answer}"
+        );
+        let message = answer["outcome"]["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("confirm") && message.contains("Reload"),
+            "the error says what changed and what to do: {message}"
+        );
+    }
+    assert_eq!(
+        server.bus.seen().len(),
+        1,
+        "a frame asserting its own confirmation reached the bus"
+    );
+
+    // The socket is still good.
+    ws.invoke("after", "test.ok", json!({})).await;
+    assert_eq!(ws.next_frame().await["outcome"]["status"], "ok");
+}
+
+/// A `confirm` frame reaches the dispatcher as a call carrying its ticket,
+/// with the same issuer an invoke gets: the transport does not judge the
+/// ticket, and does not let a frame name who is presenting it.
+#[tokio::test]
+async fn a_confirm_frame_carries_its_ticket_to_the_dispatcher_under_the_upgraded_issuer() {
+    let server = Server::start(Settings::default(), default_bus()).await;
+    let mut ws = server.open().await;
+    ws.hello(1).await;
+    let connection = ws.next_frame().await["connection"].as_u64().unwrap();
+
+    ws.send_json(&json!({
+        "type": "confirm",
+        "id": "c1",
+        "ticket": "the-ticket",
+        "command": "test.ok",
+        "params": { "a": 1 },
+        "session": SessionId::generate().unwrap().encode(),
+    }))
+    .await;
+    let answer = ws.next_frame().await;
+    assert_eq!(answer["id"], "c1", "a confirm is answered like an invoke");
+
+    let seen = server.bus.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].ticket.as_deref(), Some("the-ticket"));
+    assert_eq!(seen[0].command, "test.ok");
+    assert_eq!(seen[0].params, json!({ "a": 1 }));
+    assert_eq!(seen[0].session, server.session.encode());
+    assert_eq!(seen[0].connection, ConnectionId(connection));
 }
 
 #[tokio::test]
@@ -1099,7 +1207,7 @@ impl ws::Clock for TestClock {
 struct Seen {
     command: String,
     params: Value,
-    confirmed: bool,
+    ticket: Option<String>,
     connection: ConnectionId,
     ip: IpAddr,
     /// Encoded here only so a test can prove it is the session the upgrade
@@ -1127,7 +1235,7 @@ impl Dispatch for Bus {
         self.calls.lock().unwrap().push(Seen {
             command: call.command.as_str().to_string(),
             params: call.params.clone(),
-            confirmed: call.confirmed,
+            ticket: call.ticket.clone(),
             connection: call.issuer.connection(),
             ip: call.issuer.ip(),
             session: call.issuer.session().encode(),

@@ -66,22 +66,40 @@ export function measureHinge(doc: Document, win: Window): number | null {
   return fraction > 0.05 && fraction < 0.95 ? fraction : 0.5;
 }
 
+/**
+ * The size of the layout viewport, which is what layout decisions follow.
+ *
+ * Not `visualViewport`: that shrinks when a soft keyboard opens over the
+ * page and when the operator pinch-zooms it, and a layout that follows it
+ * reshapes itself under the operator's fingers. A stacked split on a
+ * portrait phone turned into two 180px columns the moment the keyboard came
+ * up, and back when it went away. The keyboard is an overlay to inset
+ * around, which is each panel's own business: the terminal and the editor
+ * measure how much of their own box it covers.
+ *
+ * The root element's client size is the layout viewport in every engine;
+ * `innerWidth`/`innerHeight` follow pinch-zoom in Safari, so they are only
+ * the fallback for a document that reports nothing.
+ */
+export function layoutViewportSize(doc: Document, win: Window): { w: number; h: number } {
+  const root = doc.documentElement;
+  return {
+    w: Math.round(root?.clientWidth || win.innerWidth),
+    h: Math.round(root?.clientHeight || win.innerHeight),
+  };
+}
+
 export function browserViewportEnv(): ViewportEnv {
   return {
     media: (q) => window.matchMedia(q),
-    size: () => ({
-      // `visualViewport` is what shrinks when a soft keyboard opens, which is
-      // the size a compact layout actually has to fit into.
-      w: Math.round(window.visualViewport?.width ?? window.innerWidth),
-      h: Math.round(window.visualViewport?.height ?? window.innerHeight),
-    }),
+    size: () => layoutViewportSize(document, window),
+    // The layout viewport changes on rotation, unfolding and window resizes,
+    // and every one of those fires the window's own resize. A soft keyboard
+    // or a page pinch-zoom resizes only the visual viewport, and neither is
+    // a reason to change layout, so that event is deliberately not followed.
     onResize(fn) {
       window.addEventListener("resize", fn, { passive: true });
-      window.visualViewport?.addEventListener("resize", fn, { passive: true });
-      return () => {
-        window.removeEventListener("resize", fn);
-        window.visualViewport?.removeEventListener("resize", fn);
-      };
+      return () => window.removeEventListener("resize", fn);
     },
     hingeFraction: () => measureHinge(document, window),
   };

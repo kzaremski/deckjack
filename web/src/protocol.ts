@@ -29,13 +29,30 @@ export interface Hello {
   client?: string;
 }
 
+/**
+ * Run a command. There is no `confirmed` field: the node refuses an invoke
+ * that carries one. A confirmation is a ticket the node issues and a
+ * `confirm` frame redeems.
+ */
 export interface Invoke {
   type: "invoke";
   id: CorrelationId;
   command: string;
   params?: unknown;
-  /** The operator answered the confirmation dialog for this call. */
-  confirmed?: boolean;
+}
+
+/**
+ * Run a call the operator just confirmed. `ticket` is what the node's
+ * `needs_confirmation` answer carried; `command` and `params` are the same
+ * call again, which the node checks against what it asked about. Good once,
+ * for a minute, on the socket that was asked. `id` is a fresh correlation id.
+ */
+export interface Confirm {
+  type: "confirm";
+  id: CorrelationId;
+  ticket: string;
+  command: string;
+  params?: unknown;
 }
 
 /**
@@ -62,7 +79,7 @@ export interface Ping {
   token?: string;
 }
 
-export type ClientFrame = Hello | Invoke | Cancel | Ping;
+export type ClientFrame = Hello | Invoke | Confirm | Cancel | Ping;
 
 // --- server -> client -------------------------------------------------------
 
@@ -213,8 +230,17 @@ export type CommandOutcome =
    * The operator has not been asked yet. `prompt` is the bus's own wording,
    * not the client's: the backend declared the risk and wrote the sentence,
    * so a client cannot describe a destructive command as something milder.
+   * `target` is what the call acts on, rendered by the node from the
+   * validated params, as plain text. `ticket` redeems the confirmation.
    */
-  | { id: CorrelationId; status: "confirm"; prompt: string; risk: string };
+  | {
+      id: CorrelationId;
+      status: "confirm";
+      prompt: string;
+      risk: string;
+      target?: string;
+      ticket: string;
+    };
 
 /**
  * What `bus.call` resolves to.

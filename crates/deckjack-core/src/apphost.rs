@@ -140,11 +140,16 @@ pub struct AppHost {
 
 impl AppHost {
     pub fn new(
-        host: apps::Host<apps::OsEnv>,
+        mut host: apps::Host<apps::OsEnv>,
         registry: Arc<Registry>,
         install_dir: PathBuf,
         handshake: Duration,
     ) -> Arc<AppHost> {
+        // Approval summaries group a window's `[ui]` scope by risk, read from
+        // the same registry the bus routes by. Set here rather than left to
+        // the caller, so a host the product builds can never summarize
+        // without it.
+        host.set_command_risks(Arc::clone(&registry) as Arc<dyn apps::CommandRisks>);
         Arc::new(AppHost {
             host: Mutex::new(host),
             links: Mutex::new(BTreeMap::new()),
@@ -286,8 +291,27 @@ impl AppHost {
         self.host().approve(app)
     }
 
+    /// Withdraw an app's approval. Its commands and its window's scope leave
+    /// the bus now, not when its socket closes: a process may trap the stop
+    /// signal and hold the connection, and a scope with no stored approval
+    /// behind it is not a scope (docs/APP-UI-ISOLATION.md §4.6).
     pub fn revoke(&self, app: &str) -> Result<(), apps::HostError> {
-        self.host().revoke(app)
+        self.host().revoke(app)?;
+        let mine = self.provided().remove(app).unwrap_or_default();
+        self.registry.remove_all(&mine);
+        self.registry.unregister_app(app);
+        let _ = self.send(app, Outgoing::Stop);
+        Ok(())
+    }
+
+    /// Where an installed app stands with the operator's approval, and what
+    /// it asks for in words, for `system.apps` and a refused window open.
+    /// `None` for an app that is not installed.
+    pub fn approval(&self, app: &str) -> Option<(Result<apps::ApprovalState, String>, String)> {
+        let host = self.host();
+        let installed = host.installed().find(|i| i.name == app)?;
+        let asks = host.summary(&installed.manifest.needs);
+        Some((host.approval(app).map_err(|e| e.to_string()), asks))
     }
 
     pub fn installed(&self) -> Vec<apps::AppInfo> {
@@ -330,6 +354,13 @@ impl AppHost {
         let stale = self.provided().remove(app).unwrap_or_default();
         self.registry.remove_all(&stale);
 
+        // What this app's window may call beyond its own commands, from the
+        // operator's stored approval, recorded before the commands so the
+        // app is never registered without its scope. Its own scope is what
+        // `register_provided` records below, command by command.
+        let ui_invoke = self.host().approved_ui_invoke(app);
+        self.registry.register_app(app, ui_invoke);
+
         let mut accepted = 0;
         let mut ids = Vec::with_capacity(commands.len());
         for command in &commands {
@@ -341,7 +372,7 @@ impl AppHost {
                         command: command.id.clone(),
                         host: Arc::clone(self),
                     };
-                    match self.registry.register_declared(declaration, bridge) {
+                    match self.registry.register_provided(app, declaration, bridge) {
                         Ok(registered) => {
                             accepted += 1;
                             ids.push(registered);
@@ -374,6 +405,9 @@ impl AppHost {
     fn lost(&self, app: &str, reason: &str) {
         let mine = self.provided().remove(app).unwrap_or_default();
         let dropped = self.registry.remove_all(&mine);
+        // And its window's scope with them: a window whose process is gone
+        // may call nothing, not even what the app used to provide.
+        self.registry.unregister_app(app);
         self.links().remove(app);
         let events = self.host().on_lost(app, reason);
         self.report(events);

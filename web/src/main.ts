@@ -2,7 +2,7 @@ import { createApp } from "vue";
 
 import App from "./App.vue";
 import { createShell } from "./shell/context.ts";
-import { isAppId } from "./stores/apps.ts";
+import { openWhenReady } from "./shell/shell-commands.ts";
 import "./styles/base.css";
 
 /**
@@ -24,9 +24,9 @@ createApp(App, { shell }).mount("#app");
  * becoming a second source of truth about what is open.
  */
 const launch = new URLSearchParams(location.search).get("open");
-if (launch && isAppId(launch)) {
-  void shell.commands.dispatch(`app.open.${launch}`);
+if (launch) {
   history.replaceState(null, "", location.pathname);
+  openWhenReady(shell, launch);
 }
 
 /**

@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Editor</title>
+    <link rel="stylesheet" href="/kit/kit.css" />
+    <style>
+      body {
+        /* Whatever of this frame the on-screen keyboard covers, measured by
+           editor.js from the top window's visual viewport. */
+        padding-bottom: var(--keyboard-inset, 0px);
+      }
+      button,
+      input {
+        min-height: var(--dj-touch, 2rem);
+      }
+      .dj-bar {
+        flex-wrap: wrap;
+        row-gap: var(--dj-space-1, 0.25rem);
+      }
+      .dj-button[aria-pressed="true"] {
+        color: var(--dj-color-accent, #7aa2f7);
+        border-color: var(--dj-color-accent, #7aa2f7);
+      }
+      .dj-button[hidden] {
+        display: none;
+      }
+      #save:not([disabled]) {
+        background: var(--dj-color-accent, #7aa2f7);
+        border-color: var(--dj-color-accent, #7aa2f7);
+        color: var(--dj-color-text-on-accent, #0b0d12);
+        font-weight: 600;
+      }
+
+      /* Tabs scroll sideways rather than squeezing a name to nothing. */
+      #tabs {
+        display: flex;
+        flex: 1 1 8rem;
+        gap: 0.125rem;
+        min-width: 6rem;
+        overflow-x: auto;
+        scrollbar-width: none;
+      }
+      .tab {
+        display: flex;
+        flex: none;
+        align-items: center;
+        border: 1px solid var(--dj-color-border, #2a2e38);
+        border-radius: var(--dj-radius-sm, 4px);
+        background: var(--dj-color-surface, #16181d);
+      }
+      .tab[aria-selected="true"] {
+        border-color: var(--dj-color-accent, #7aa2f7);
+        background: var(--dj-color-selection, #2d3344);
+      }
+      .tab button {
+        border: 0;
+        background: none;
+        color: inherit;
+        font: inherit;
+        cursor: pointer;
+      }
+      .tab-name {
+        max-width: 14rem;
+        overflow: hidden;
+        padding: 0 0.25rem 0 0.5rem;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .tab-close {
+        min-width: var(--dj-touch, 2rem);
+        color: var(--dj-color-text-muted, #9aa0ad);
+      }
+
+      #notice {
+        display: flex;
+        flex: none;
+        flex-wrap: wrap;
+        gap: var(--dj-space-2, 0.5rem);
+        align-items: center;
+        padding: var(--dj-space-2, 0.5rem) var(--dj-space-3, 0.75rem);
+        border-bottom: 1px solid var(--dj-color-border, #2a2e38);
+        background: var(--dj-color-warn-soft, #3a3220);
+      }
+      #notice[hidden] {
+        display: none;
+      }
+      #notice-text {
+        flex: 1 1 14rem;
+        margin: 0;
+      }
+      #notice-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--dj-space-2, 0.5rem);
+      }
+
+      #host {
+        flex: 1;
+        min-height: 0;
+        overflow: hidden;
+      }
+      #host[hidden],
+      #empty[hidden] {
+        display: none;
+      }
+      #empty {
+        flex: 1;
+        margin: 0;
+        padding: var(--dj-space-4, 1rem);
+        color: var(--dj-color-text-muted, #9aa0ad);
+      }
+
+      #picker {
+        display: flex;
+        flex: 1;
+        flex-direction: column;
+        min-height: 0;
+      }
+      #picker[hidden] {
+        display: none;
+      }
+      #picker:not([hidden]) ~ #host,
+      #picker:not([hidden]) ~ #empty {
+        display: none;
+      }
+      #picker-path {
+        flex: 1;
+        min-width: 0;
+        padding: 0 0.5rem;
+        border: 1px solid var(--dj-color-border, #2a2e38);
+        border-radius: var(--dj-radius-sm, 4px);
+        background: var(--dj-color-surface, #16181d);
+        color: inherit;
+        font-family: var(--dj-font-mono, ui-monospace, monospace);
+      }
+      #picker-list {
+        flex: 1;
+        overflow-y: auto;
+      }
+      #picker-list .dj-row {
+        min-height: var(--dj-touch, 2rem);
+        align-items: center;
+      }
+      #picker-list .dj-row[data-kind="dir"] {
+        color: var(--dj-color-accent, #7aa2f7);
+      }
+
+      .foot {
+        display: flex;
+        flex: none;
+        align-items: center;
+        border-top: 1px solid var(--dj-color-border, #2a2e38);
+      }
+      .foot .dj-status {
+        flex: 1;
+        min-width: 0;
+        border-top: 0;
+      }
+      .dj-status[data-kind="error"] {
+        color: var(--dj-color-danger, #f7768e);
+      }
+      #position {
+        flex: none;
+        padding: var(--dj-space-1, 0.25rem) var(--dj-space-3, 0.75rem);
+        color: var(--dj-color-text-muted, #9aa0ad);
+        font-size: var(--dj-type-micro-size, 0.75rem);
+        font-variant-numeric: tabular-nums;
+      }
+
+      /* CodeMirror's search and go-to-line panels, sized for a finger. */
+      .cm-panel.cm-search,
+      .cm-panel.cm-gotoLine {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.375rem;
+        align-items: center;
+        padding: 0.5rem 2.75rem 0.5rem 0.75rem !important;
+        font: inherit;
+      }
+      .cm-panel input[type="text"],
+      .cm-panel .cm-textfield {
+        min-height: var(--dj-touch, 2rem);
+        min-width: 9rem;
+        padding: 0 0.5rem;
+        border: 1px solid var(--dj-color-border, #2a2e38);
+        border-radius: var(--dj-radius-sm, 4px);
+        background: var(--dj-color-surface, #16181d);
+        color: inherit;
+        font: inherit;
+      }
+      .cm-panel button,
+      .cm-panel .cm-button {
+        min-height: var(--dj-touch, 2rem);
+        padding: 0 0.625rem;
+        border: 1px solid var(--dj-color-border, #2a2e38);
+        border-radius: var(--dj-radius-sm, 4px);
+        background: var(--dj-color-raised, #1b1e25);
+        background-image: none;
+        color: inherit;
+        font: inherit;
+      }
+      .cm-panel label {
+        display: inline-flex;
+        gap: 0.25rem;
+        align-items: center;
+        min-height: var(--dj-touch, 2rem);
+      }
+      .cm-panel button[name="close"] {
+        position: absolute;
+        top: 0.5rem;
+        right: 0.5rem;
+        min-width: var(--dj-touch, 2rem);
+      }
+
+      /* Syntax colors: CodeMirror's class highlighter, painted with the
+         desktop theme's syntax roles so the editor follows the theme. */
+      .tok-comment { color: var(--dj-color-syntax-comment, #6b7089); font-style: italic; }
+      .tok-keyword { color: var(--dj-color-syntax-keyword, #bb9af7); }
+      .tok-operator { color: var(--dj-color-syntax-operator, #89ddff); }
+      .tok-punctuation { color: var(--dj-color-syntax-punctuation, #a9b1d6); }
+      .tok-string, .tok-string2 { color: var(--dj-color-syntax-string, #9ece6a); }
+      .tok-number { color: var(--dj-color-syntax-number, #ff9e64); }
+      .tok-bool, .tok-atom { color: var(--dj-color-syntax-constant, #ff9e64); }
+      .tok-variableName { color: var(--dj-color-syntax-variable, #c0caf5); }
+      .tok-variableName.tok-definition { color: var(--dj-color-syntax-variable, #c0caf5); }
+      .tok-propertyName { color: var(--dj-color-syntax-property, #73daca); }
+      .tok-typeName, .tok-className, .tok-namespace { color: var(--dj-color-syntax-type, #2ac3de); }
+      .tok-macroName { color: var(--dj-color-syntax-function, #7aa2f7); }
+      .tok-labelName { color: var(--dj-color-syntax-parameter, #e0af68); }
+      .tok-tagName { color: var(--dj-color-syntax-tag, #f7768e); }
+      .tok-attributeName { color: var(--dj-color-syntax-attribute, #e0af68); }
+      .tok-invalid { color: var(--dj-color-syntax-invalid, #db4b4b); }
+      .tok-inserted { color: var(--dj-color-syntax-diff-added, #9ece6a); }
+      .tok-deleted { color: var(--dj-color-syntax-diff-removed, #f7768e); }
+      .tok-changed { color: var(--dj-color-syntax-diff-changed, #e0af68); }
+      .tok-meta { color: var(--dj-color-syntax-comment, #6b7089); }
+      .tok-heading { color: var(--dj-color-syntax-keyword, #bb9af7); font-weight: 600; }
+      .tok-link, .tok-url { color: var(--dj-color-accent, #7aa2f7); text-decoration: underline; }
+      .tok-emphasis { font-style: italic; }
+      .tok-strong { font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <div class="dj-bar" id="files-bar">
+      <button class="dj-button" id="open" title="Open a file">Open</button>
+      <button class="dj-button" id="new" title="A new, unsaved file">New</button>
+      <div id="tabs" role="tablist" aria-label="Open files"></div>
+      <button class="dj-button" id="save" title="Save (Ctrl+S)" disabled>Save</button>
+    </div>
+    <div class="dj-bar" id="tools-bar">
+      <button class="dj-button" id="undo" title="Undo (Ctrl+Z)" aria-label="Undo" disabled>Undo</button>
+      <button class="dj-button" id="redo" title="Redo (Ctrl+Shift+Z)" aria-label="Redo" disabled>Redo</button>
+      <button class="dj-button" id="find" title="Find and replace (Ctrl+F)" disabled>Find</button>
+      <button class="dj-button" id="goto" title="Go to line (Ctrl+Alt+G)" disabled>Line</button>
+      <button class="dj-button" id="wrap" title="Wrap long lines" aria-pressed="true">Wrap</button>
+      <button class="dj-button" id="earlier" title="Load the part of the file before this" hidden>Load earlier</button>
+      <span class="dj-spacer"></span>
+      <button class="dj-button" id="revert" title="Reload from disk, discarding changes" disabled>Revert</button>
+    </div>
+
+    <div id="notice" role="status" hidden>
+      <p id="notice-text"></p>
+      <div id="notice-actions"></div>
+    </div>
+
+    <div id="picker" hidden>
+      <div class="dj-bar">
+        <input id="picker-path" type="text" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Path" />
+        <button class="dj-button" id="picker-go">Go</button>
+        <button class="dj-button" id="picker-close">Cancel</button>
+      </div>
+      <div id="picker-list" aria-label="Working directory"></div>
+    </div>
+
+    <p id="empty">Nothing open. Open a file from the working directory, or start a new one.</p>
+    <div id="host"></div>
+
+    <div class="foot">
+      <p class="dj-status" id="status" role="status">Loading…</p>
+      <span id="position"></span>
+    </div>
+
+    <script type="module">
+      import { bus } from "/kit/bus.js";
+      import { shell } from "/kit/shell.js";
+      import * as cm from "./vendor/codemirror.js";
+      import { mountEditor } from "./editor.js";
+
+      // `localStorage` throws outright in some private windows; the editor is
+      // given something that never does, and works without it.
+      const storage = {
+        read(key) {
+          try {
+            return localStorage.getItem(key);
+          } catch {
+            return null;
+          }
+        },
+        write(key, value) {
+          try {
+            localStorage.setItem(key, value);
+            return true;
+          } catch {
+            // Full or forbidden: the session is a convenience, not the file,
+            // but the editor tells the operator their draft is not kept.
+            return false;
+          }
+        },
+      };
+
+      const query = new URLSearchParams(location.search);
+      const editor = mountEditor(document, {
+        bus,
+        cm,
+        shell,
+        storage,
+        win: window,
+        windowId: query.get("window"),
+        ask: async (question, value) => window.prompt(question, value),
+        confirm: async (question) => window.confirm(question),
+        every: (ms, fn) => {
+          const t = setInterval(fn, ms);
+          return () => clearInterval(t);
+        },
+        later: (ms, fn) => {
+          const t = setTimeout(fn, ms);
+          return () => clearTimeout(t);
+        },
+      });
+      editor.start(query.get("path")).catch((e) => {
+        document.getElementById("status").textContent = e instanceof Error ? e.message : String(e);
+      });
+    </script>
+  </body>
+</html>

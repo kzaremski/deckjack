@@ -25,8 +25,14 @@
 /// that lets this page interpolate a message without the WebAuthn ceremony
 /// being reachable. Images and a manifest are static same-origin assets and
 /// carry no such risk.
+///
+/// `frame-ancestors 'none'` (with `X-Frame-Options: DENY` beside it, for
+/// engines that predate CSP 2): a sign-in form inside someone else's frame is
+/// a clickjacking surface, and nothing legitimate ever frames it.
+/// `'self'` is not used, because it does not stop a same-origin document —
+/// a file opened through `/content`, an app UI — from framing the page.
 pub const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; manifest-src 'self'; \
-form-action 'self'";
+form-action 'self'; frame-ancestors 'none'";
 
 /// Shared with [`crate::passkeypage`], which is a sibling pre-authentication
 /// page and should not look like a different product. `pub(crate)` rather

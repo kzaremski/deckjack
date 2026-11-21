@@ -16,6 +16,33 @@ use std::path::{Path, PathBuf};
 // appears it should move somewhere neutral rather than be duplicated.
 use crate::auth::code::os_random;
 
+/// Every top-level entry the install directory holds. Defined beside the
+/// manifest rules in the protocol crate, because manifest validation refuses
+/// these names before the core is involved; this is the same constant, not a
+/// second list. See [`deckjack_protocol::INSTALL_LAYOUT`].
+pub use deckjack_protocol::INSTALL_LAYOUT;
+
+/// The install entry a top-level name inside `install_root` is, if any.
+///
+/// The exact name always is. A name that differs only in case is the entry
+/// only when `same_file` says the two are one file: true on a mount that
+/// folds case (exFAT, NTFS, casefold ext4, APFS), where `BIN/deckjack` opens
+/// the core binary and `realpath` hands it back as written; false on an
+/// ordinary Linux filesystem, where the operator's own `Cache/` or `Keys` is
+/// a different file and stays theirs.
+pub fn install_entry_named(
+    name: &std::ffi::OsStr,
+    install_root: &Path,
+    same_file: impl Fn(&Path, &Path) -> bool,
+) -> Option<&'static str> {
+    let name = name.to_str()?;
+    INSTALL_LAYOUT.iter().copied().find(|entry| {
+        name == *entry
+            || (name.eq_ignore_ascii_case(entry)
+                && same_file(&install_root.join(name), &install_root.join(entry)))
+    })
+}
+
 /// Where the id lives, relative to the install directory.
 pub const ID_FILE: &str = "keys/node-id";
 

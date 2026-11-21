@@ -48,10 +48,64 @@ pub struct Policy {
     pub read: Vec<PathBuf>,
     /// Directories both readable and writable.
     pub read_write: Vec<PathBuf>,
-    /// Whether the process may use the network at all. When false, and the
-    /// kernel is new enough for Landlock's network rules, TCP connect and bind
-    /// are refused outright.
-    pub network: bool,
+    /// Single files readable but not writable: `/dev/urandom`,
+    /// `/proc/cpuinfo`.
+    ///
+    /// Separate from [`Policy::read`] because Landlock refuses a
+    /// directory-only right such as `ReadDir` on anything that is not a
+    /// directory, and refuses it by failing the whole ruleset. A file here is
+    /// granted only the rights that apply to a file.
+    pub read_files: Vec<PathBuf>,
+    /// Single files both readable and writable: `/dev/null`, `/dev/kfd`.
+    pub read_write_files: Vec<PathBuf>,
+    /// What the process may do on the network. Denied unless said otherwise.
+    pub network: Network,
+}
+
+/// The network half of a [`Policy`].
+///
+/// Landlock's network rules (ABI 4) cover TCP `connect` and `bind`, by port.
+/// They say nothing about which host a connection goes to, and nothing about
+/// UDP, so neither does this type: [`Network::Ports`] is "TCP only on these
+/// port numbers, to anyone", and UDP is untouched by every variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Network {
+    /// TCP connect only to `connect_tcp` and bind only on `bind_tcp`; every
+    /// other TCP port is refused. Both empty is no TCP at all, which is the
+    /// default.
+    Ports {
+        connect_tcp: Vec<u16>,
+        bind_tcp: Vec<u16>,
+    },
+    /// Landlock's network rules are not installed at all.
+    Whole,
+}
+
+impl Network {
+    /// No TCP connect or bind on any port.
+    pub fn denied() -> Network {
+        Network::Ports {
+            connect_tcp: Vec::new(),
+            bind_tcp: Vec::new(),
+        }
+    }
+
+    /// True when nothing on the network is filtered.
+    pub fn is_whole(&self) -> bool {
+        matches!(self, Network::Whole)
+    }
+
+    /// True when no TCP port at all is allowed.
+    pub fn is_denied(&self) -> bool {
+        matches!(self, Network::Ports { connect_tcp, bind_tcp }
+            if connect_tcp.is_empty() && bind_tcp.is_empty())
+    }
+}
+
+impl Default for Network {
+    fn default() -> Network {
+        Network::denied()
+    }
 }
 
 impl Policy {
@@ -70,8 +124,8 @@ impl Policy {
         self
     }
 
-    pub fn with_network(mut self, allowed: bool) -> Policy {
-        self.network = allowed;
+    pub fn with_network(mut self, network: Network) -> Policy {
+        self.network = network;
         self
     }
 }
@@ -83,9 +137,9 @@ pub enum Availability {
     /// Landlock is present at this ABI and seccomp is compiled in.
     Enforcing {
         landlock_abi: i32,
-        /// Landlock gained network rules at ABI 4. Below that a policy with
-        /// `network: false` cannot be honored and is refused rather than
-        /// quietly granted.
+        /// Landlock gained network rules at ABI 4. Below that a policy that
+        /// denies or narrows the network cannot be honored and is refused
+        /// rather than quietly granted whole.
         network_rules: bool,
     },
     /// Nothing here can be confined. Carries the reason so the operator is
@@ -108,7 +162,8 @@ pub enum SandboxError {
     Unavailable { reason: String },
 
     #[error(
-        "the manifest asks for the network to be denied, but this kernel's Landlock is ABI {abi} \
+        "the manifest asks for the network to be denied or limited to some TCP ports, but this \
+         kernel's Landlock is ABI {abi} \
          and network rules arrived in ABI 4; refusing rather than granting network access the \
          manifest did not ask for"
     )]
@@ -159,6 +214,11 @@ pub enum SandboxError {
 /// - `reboot`, `swapon`, `swapoff`, `settimeofday`, `clock_settime`: change
 ///   the machine out from under everything else on it.
 /// - `add_key`, `request_key`, `keyctl`: the kernel keyring, which is shared.
+/// - `io_uring_setup`, `io_uring_enter`, `io_uring_register`: io_uring
+///   creates sockets (`IORING_OP_SOCKET`) and makes other calls without
+///   passing through seccomp, so with it every argument filter below — the
+///   MPTCP one in particular — is a filter on one of two doors. Denied the
+///   way Docker's default profile denies it; programs fall back to syscalls.
 ///
 /// `fork`/`clone` are deliberately NOT denied: an app spawning a helper is
 /// ordinary, and a child inherits both Landlock and seccomp, so it is confined
@@ -188,6 +248,9 @@ fn denied_syscalls() -> Vec<i64> {
         libc::SYS_add_key,
         libc::SYS_request_key,
         libc::SYS_keyctl,
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
         #[cfg(target_arch = "x86_64")]
         libc::SYS_chroot,
         #[cfg(target_arch = "aarch64")]
@@ -199,8 +262,8 @@ fn denied_syscalls() -> Vec<i64> {
 mod linux {
     use super::*;
     use landlock::{
-        ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
-        RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+        ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
+        Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
     };
     use seccompiler::{SeccompAction, SeccompFilter, TargetArch, apply_filter};
     use std::collections::BTreeMap;
@@ -252,6 +315,10 @@ mod linux {
     pub fn apply(policy: &Policy) -> Result<(), SandboxError> {
         let read_only = AccessFs::from_read(WANTED);
         let read_write = AccessFs::from_all(WANTED);
+        // The subset of each that Landlock accepts on a non-directory:
+        // execute, read, write and truncate, with every directory-only right
+        // (`ReadDir`, `MakeReg`, `RemoveFile`, ...) masked off.
+        let file = AccessFs::from_file(WANTED);
 
         let mut ruleset = Ruleset::default()
             // Missing kernel features become errors here rather than a
@@ -260,7 +327,7 @@ mod linux {
             .handle_access(read_write)
             .map_err(|e| SandboxError::Ruleset(e.to_string()))?;
 
-        if !policy.network {
+        if !policy.network.is_whole() {
             ruleset = ruleset
                 .handle_access(AccessNet::from_all(WANTED))
                 .map_err(|e| SandboxError::Ruleset(e.to_string()))?;
@@ -276,11 +343,30 @@ mod linux {
         for path in &policy.read_write {
             created = add_path(created, path, read_write)?;
         }
+        for path in &policy.read_files {
+            created = add_path(created, path, read_only & file)?;
+        }
+        for path in &policy.read_write_files {
+            created = add_path(created, path, read_write & file)?;
+        }
 
         // Denying the network is the ABSENCE of any NetPort rule after having
-        // handled AccessNet — Landlock grants nothing it was not told to. When
-        // the manifest allows the network we never handle AccessNet at all, so
-        // it stays untouched rather than being re-granted port by port.
+        // handled AccessNet — Landlock grants nothing it was not told to, so
+        // each port below is the whole of what TCP may do. When the manifest
+        // allows the whole network we never handle AccessNet at all, so it
+        // stays untouched rather than being re-granted port by port.
+        if let Network::Ports {
+            connect_tcp,
+            bind_tcp,
+        } = &policy.network
+        {
+            for &port in connect_tcp {
+                created = add_port(created, port, AccessNet::ConnectTcp)?;
+            }
+            for &port in bind_tcp {
+                created = add_port(created, port, AccessNet::BindTcp)?;
+            }
+        }
 
         let status = created
             .restrict_self()
@@ -303,6 +389,16 @@ mod linux {
 
         seccomp()?;
         Ok(())
+    }
+
+    fn add_port(
+        created: landlock::RulesetCreated,
+        port: u16,
+        access: AccessNet,
+    ) -> Result<landlock::RulesetCreated, SandboxError> {
+        created
+            .add_rule(NetPort::new(port, access))
+            .map_err(|e| SandboxError::Ruleset(e.to_string()))
     }
 
     fn add_path(
@@ -334,8 +430,47 @@ mod linux {
         }
     }
 
+    /// Refuse `socket(_, _, IPPROTO_MPTCP)` with `EPROTONOSUPPORT`.
+    ///
+    /// Landlock's TCP rules do not mediate MPTCP (upstream treats it as a
+    /// separate protocol, by design), and an MPTCP socket aimed at a plain
+    /// TCP listener falls back to TCP. So without this, an app allowed no
+    /// TCP port at all can still connect to the core on loopback, which is
+    /// exactly what D2 in docs/APP-UI-ISOLATION.md promises it cannot.
+    /// `EPROTONOSUPPORT` is what a kernel built without MPTCP answers, so a
+    /// program that tries MPTCP first (Go's listeners, `mptcpize`) falls back
+    /// to TCP and meets Landlock. Its own filter because seccompiler gives a
+    /// filter one errno; the kernel applies the stricter of stacked filters.
+    fn mptcp_filter(arch: TargetArch) -> Result<seccompiler::BpfProgram, SandboxError> {
+        use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompRule};
+        let build = |e: seccompiler::BackendError| SandboxError::SeccompBuild(e.to_string());
+        let protocol = SeccompCondition::new(
+            2,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::IPPROTO_MPTCP as u64,
+        )
+        .map_err(build)?;
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        rules.insert(
+            libc::SYS_socket,
+            vec![SeccompRule::new(vec![protocol]).map_err(build)?],
+        );
+        SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EPROTONOSUPPORT as u32),
+            arch,
+        )
+        .map_err(build)?
+        .try_into()
+        .map_err(build)
+    }
+
     fn seccomp() -> Result<(), SandboxError> {
         let arch = target_arch()?;
+        apply_filter(&mptcp_filter(arch)?)
+            .map_err(|e| SandboxError::SeccompApply(e.to_string()))?;
         let mut rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> = BTreeMap::new();
         for nr in denied_syscalls() {
             // An empty rule vector means "match this syscall unconditionally".
@@ -445,7 +580,9 @@ mod tests {
         let p = Policy::nothing();
         assert!(p.read.is_empty());
         assert!(p.read_write.is_empty());
-        assert!(!p.network, "network must be opt-in, not opt-out");
+        assert!(p.read_files.is_empty());
+        assert!(p.read_write_files.is_empty());
+        assert!(p.network.is_denied(), "network must be opt-in, not opt-out");
     }
 
     #[test]

@@ -1,0 +1,10 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Q3: the app frame of APP-UI-ISOLATION §4.2</title>
+<body>
+  <script>
+    window.reports = [];
+    addEventListener("message", (e) => reports.push({ origin: e.origin, data: e.data }));
+  </script>
+  <iframe sandbox="allow-scripts allow-forms" src="/apps/demo/~cap/index.html?tag=q3f-doc"></iframe>
+</body>

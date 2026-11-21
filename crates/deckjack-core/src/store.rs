@@ -781,6 +781,25 @@ impl Store {
         Ok(())
     }
 
+    /// Every stored app approval, by app name. For the startup banner's
+    /// proxy-trust warning, which has to know whether any approved app holds
+    /// a network grant before the app host has discovered anything. A row
+    /// that cannot be read is left out, as [`Store::app_grant`] treats it.
+    pub fn app_grants(&self) -> Result<Vec<crate::apps::Grant>, StoreError> {
+        let names: Vec<String> = self
+            .conn
+            .prepare("SELECT app FROM app_grants ORDER BY app")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let mut grants = Vec::with_capacity(names.len());
+        for name in names {
+            if let Some(grant) = self.app_grant(&name)? {
+                grants.push(grant);
+            }
+        }
+        Ok(grants)
+    }
+
     pub fn revoke_app_grant(&self, app: &str) -> Result<(), StoreError> {
         self.conn
             .execute("DELETE FROM app_grants WHERE app = ?1", params![app])?;

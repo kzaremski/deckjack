@@ -101,8 +101,45 @@ struct Node {
     /// The one the host built and handed to `BusParts`, so a test can ask
     /// whether the bus queues into *this* inbox or into one of its own.
     approvals: Arc<Approvals>,
+    /// The registry the bus dispatches from, so a test can add a probe
+    /// command to the assembled node.
+    registry: Arc<Registry>,
+    /// The clock the confirmation tickets are timed on, so a test can let
+    /// one expire without waiting a minute.
+    ticket_clock: Arc<ManualClock>,
     /// Keeps the working directory alive for as long as the server runs.
     _dir: tempfile::TempDir,
+}
+
+/// Real time plus however far a test has wound it forward.
+struct ManualClock {
+    ahead: std::sync::Mutex<Duration>,
+}
+
+impl ManualClock {
+    fn new() -> Arc<ManualClock> {
+        Arc::new(ManualClock {
+            ahead: std::sync::Mutex::new(Duration::ZERO),
+        })
+    }
+
+    fn advance(&self, by: Duration) {
+        *self.ahead.lock().expect("the clock") += by;
+    }
+
+    fn ahead(&self) -> Duration {
+        *self.ahead.lock().expect("the clock")
+    }
+}
+
+impl ws::Clock for ManualClock {
+    fn now(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now() + self.ahead()
+    }
+
+    fn mono(&self) -> std::time::Instant {
+        std::time::Instant::now() + self.ahead()
+    }
 }
 
 async fn start() -> Node {
@@ -238,6 +275,7 @@ async fn start_with(auto: lockdown::AutoPolicy) -> Node {
         apps::Host::new(
             install.clone(),
             dir.path().to_path_buf(),
+            apps::CoreDoor::new("127.0.0.1:7878".parse().unwrap(), vec![]),
             apps::OsEnv::new(),
             apps::Policy::default(),
             Box::new(deckjack_core::store::StoreGrants::new(Arc::clone(&store))),
@@ -252,9 +290,13 @@ async fn start_with(auto: lockdown::AutoPolicy) -> Node {
     wiring::register_apps(&registry, Arc::clone(&app_host)).expect("the app commands register");
     app_host.start().await;
 
+    let ticket_clock = ManualClock::new();
     let ws_ctx = ws::WsCtx::new(
         Arc::clone(&ctx),
-        BusDispatch::new(Arc::clone(&bus)),
+        BusDispatch::new(
+            Arc::clone(&bus),
+            deckjack_core::ticket::Tickets::new(Arc::clone(&ticket_clock) as Arc<dyn ws::Clock>),
+        ),
         ws::Hub::new(Arc::new(ws::SystemClock)),
         Arc::new(ws::SystemClock),
         node_id,
@@ -278,8 +320,13 @@ async fn start_with(auto: lockdown::AutoPolicy) -> Node {
 
     // The same namespace the file commands use, because that is what `main`
     // hands the assembly: one `Root`, crossed by the bus and by HTTP alike.
-    let files = deckjack_core::files::register_commands(&registry, dir.path(), NODE)
-        .expect("the file commands register");
+    let files = deckjack_core::files::register_commands(
+        &registry,
+        dir.path(),
+        NODE,
+        &dir.path().join("install"),
+    )
+    .expect("the file commands register");
 
     let app = wiring::app(
         Arc::clone(&ctx),
@@ -309,6 +356,8 @@ async fn start_with(auto: lockdown::AutoPolicy) -> Node {
         bridge,
         lockdown,
         approvals,
+        registry,
+        ticket_clock,
         _dir: dir,
     }
 }
@@ -406,9 +455,28 @@ async fn request(
 ) -> Response {
     // `Connection: close` makes the response end at EOF, so the reply can be
     // read to the end without implementing chunked framing.
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    // A caller that names `host` decides it, so a test can be a browser that
+    // reached this node by another name.
+    let mut req = format!("{method} {path} HTTP/1.1\r\nConnection: close\r\n");
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("host"))
+    {
+        req.push_str(&format!("Host: {addr}\r\n"));
+    }
+    // A browser's Fetch Metadata unless the caller says otherwise, because
+    // `fetchgate` refuses `/content`, `/passkey/*` and `/logout` without it.
+    // A caller that names `sec-fetch-site` decides; an empty value omits it.
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("sec-fetch-site"))
+    {
+        req.push_str("Sec-Fetch-Site: same-origin\r\n");
+    }
     for (name, value) in headers {
-        req.push_str(&format!("{name}: {value}\r\n"));
+        if !value.is_empty() {
+            req.push_str(&format!("{name}: {value}\r\n"));
+        }
     }
     match body {
         Some(b) => {
@@ -466,7 +534,8 @@ impl Ws {
     async fn connect(addr: SocketAddr, cookie: Option<&str>) -> Result<Ws, u16> {
         let mut req = format!(
             "GET {} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-Fetch-Site: same-origin\r\n",
             ws::PATH
         );
         if let Some(c) = cookie {
@@ -596,18 +665,52 @@ impl Ws {
 
     /// Invoke a command and wait for the response for that correlation id,
     /// stepping over progress and server-pushed events on the way.
-    async fn invoke(&mut self, id: &str, command: &str, params: Value, confirmed: bool) -> Value {
+    ///
+    /// `answer_yes` plays the operator: when the node asks for a
+    /// confirmation, its ticket is redeemed with a `confirm` frame and the
+    /// answer to that is returned. Without it, the question itself is.
+    async fn invoke(&mut self, id: &str, command: &str, params: Value, answer_yes: bool) -> Value {
         self.send_text(
             &json!({
                 "type": "invoke",
                 "id": id,
                 "command": command,
                 "params": params,
-                "confirmed": confirmed,
             })
             .to_string(),
         )
         .await;
+        let answer = self.response(id).await;
+        let asked = &answer["outcome"]["value"];
+        if !answer_yes || asked["status"] != "needs_confirmation" {
+            return answer;
+        }
+        let ticket = asked["ticket"]
+            .as_str()
+            .expect("a ticket to redeem")
+            .to_string();
+        self.confirm(&format!("{id}-yes"), &ticket, command, params)
+            .await
+    }
+
+    /// Redeem a confirmation ticket, and wait for the answer.
+    async fn confirm(&mut self, id: &str, ticket: &str, command: &str, params: Value) -> Value {
+        self.send_text(
+            &json!({
+                "type": "confirm",
+                "id": id,
+                "ticket": ticket,
+                "command": command,
+                "params": params,
+            })
+            .to_string(),
+        )
+        .await;
+        self.response(id).await
+    }
+
+    /// The response for one correlation id, stepping over everything else.
+    async fn response(&mut self, id: &str) -> Value {
         loop {
             let frame = self.expect_json().await;
             if frame["type"] == "response" && frame["id"] == id {
@@ -645,6 +748,18 @@ async fn every_command_the_wiring_registers_is_on_the_bus_and_answers_over_the_s
     let palette = h.palette();
 
     for id in [
+        // files::register_commands, which main.rs calls the same way
+        "files.list",
+        "files.rename",
+        "files.move",
+        "files.copy",
+        "files.trash",
+        "files.trash.list",
+        "files.trash.restore",
+        "files.trash.empty",
+        "files.space",
+        "files.thumbnail",
+        "files.archive.list",
         // register_terminal
         "terminal.open",
         "terminal.read",
@@ -671,6 +786,11 @@ async fn every_command_the_wiring_registers_is_on_the_bus_and_answers_over_the_s
         "system.apps",
         "system.app.approve",
         "system.app.revoke",
+        // editor::register_commands, which files::register_commands calls
+        "editor.open",
+        "editor.save",
+        "editor.revert",
+        "editor.find",
     ] {
         assert!(
             palette.iter().any(|known| known == id),
@@ -690,6 +810,15 @@ async fn every_command_the_wiring_registers_is_on_the_bus_and_answers_over_the_s
         value["apps"],
         json!([]),
         "system.apps should report an empty install, not fail: {value}"
+    );
+
+    // Free space, which only answers if the file commands were handed the
+    // working directory they report on.
+    let space = ws.invoke("space", "files.space", json!({}), false).await;
+    let value = ok_value(&space);
+    assert!(
+        value["total"].as_u64().is_some_and(|t| t > 0),
+        "files.space should report the working directory's filesystem: {value}"
     );
 
     // The window set, reached through the command that opens one. `app_status`
@@ -1208,7 +1337,7 @@ async fn an_apps_own_ui_is_not_reachable_without_signing_in() {
 /// Both halves are `BusDispatch`'s and only `BusDispatch`'s. The bus says
 /// `Admitted::NeedsConfirmation` with a prompt; whether that becomes an
 /// answer the shell can render or an error a toast swallows is decided here,
-/// as is whether the client's `confirmed` flag ever reaches the bus. A
+/// as is whether the ticket it issues is the thing that runs the call. A
 /// confirmation that cannot be answered is a command the operator can never
 /// run, and it would look exactly like a backend bug.
 #[tokio::test]
@@ -1243,10 +1372,11 @@ async fn a_destructive_command_asks_the_operator_first_and_runs_once_confirmed()
          the codes in the operator's wallet"
     );
 
-    // The same call with the dialog answered. If `confirmed` is not carried
-    // through, this asks again forever.
+    // The same call with the dialog answered: the ticket redeemed. If the
+    // redemption does not mark the call confirmed, this asks again forever.
+    let ticket = value["ticket"].as_str().expect("a ticket to redeem");
     let ran = ws
-        .invoke("codes2", "system.recovery_codes", json!({}), true)
+        .confirm("codes2", ticket, "system.recovery_codes", json!({}))
         .await;
     let value = ok_value(&ran);
     let codes = value["codes"]
@@ -1258,6 +1388,406 @@ async fn a_destructive_command_asks_the_operator_first_and_runs_once_confirmed()
         lockdown::RECOVERY_CODES_ISSUED,
         "the codes the operator was just shown are not the ones the node will accept"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Confirmation tickets (APP-UI-ISOLATION §4.7)
+// ---------------------------------------------------------------------------
+//
+// Every refusal below is checked on disk, not only by its status: the trash
+// item a refused ticket would have destroyed is still there afterwards. And
+// every refusal sits beside a control in the same fixture that redeems a
+// ticket successfully first, so a refusal cannot pass because redemption is
+// broken altogether.
+
+/// Put a file in the node's working directory and move it to the trash over
+/// the bus. Returns its trash id.
+async fn trashed(h: &Node, ws: &mut Ws, name: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::fs::write(h._dir.path().join(name), b"the operator's work").expect("a file to trash");
+    let moved = ws
+        .invoke(
+            &format!("trash{n}"),
+            "files.trash",
+            json!({ "paths": [format!("/{name}")] }),
+            false,
+        )
+        .await;
+    ok_value(&moved)["trashed"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a trash id: {moved}"))
+        .to_string()
+}
+
+/// Whether a trash item is still on disk, read from the filesystem rather
+/// than through the bus that is under test.
+fn in_trash(h: &Node, id: &str) -> bool {
+    h._dir
+        .path()
+        .join(deckjack_core::trash::TRASH_DIR)
+        .join("files")
+        .join(id)
+        .exists()
+}
+
+/// Ask for a call that needs confirming, and return the question and its
+/// ticket.
+async fn ask_to_confirm(ws: &mut Ws, id: &str, command: &str, params: Value) -> (Value, String) {
+    let answer = ws.invoke(id, command, params, false).await;
+    let value = ok_value(&answer).clone();
+    assert_eq!(
+        value["status"], "needs_confirmation",
+        "{command} should have asked first: {value}"
+    );
+    let ticket = value["ticket"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a ticket in the question: {value}"))
+        .to_string();
+    (value, ticket)
+}
+
+/// The refusal a spent, foreign or stale ticket gets.
+fn assert_ticket_refused(answer: &Value, why: &str) {
+    assert_eq!(answer["outcome"]["status"], "error", "{why}: {answer}");
+    assert_eq!(
+        answer["outcome"]["error"]["code"],
+        ws::CONFIRMATION_REFUSED,
+        "{why}: {answer}"
+    );
+}
+
+/// The hole this closes: a frame that says it was confirmed is refused, and
+/// what it asked to destroy is still on disk.
+#[tokio::test]
+async fn an_invoke_asserting_confirmed_is_refused_and_the_trash_is_unchanged_on_disk() {
+    let h = start().await;
+    let mut ws = h.socket().await;
+    let id = trashed(&h, &mut ws, "thesis.txt").await;
+    assert!(in_trash(&h, &id), "the fixture did not trash anything");
+
+    // Control: the same command, asked honestly, is a question.
+    ask_to_confirm(&mut ws, "honest", "files.trash.empty", json!({})).await;
+
+    ws.send_text(
+        &json!({
+            "type": "invoke",
+            "id": "forged",
+            "command": "files.trash.empty",
+            "params": {},
+            "confirmed": true,
+        })
+        .to_string(),
+    )
+    .await;
+    let answer = ws.response("forged").await;
+    assert_eq!(answer["outcome"]["status"], "error", "got {answer}");
+    assert_eq!(
+        answer["outcome"]["error"]["code"],
+        ws::CONFIRMED_REMOVED,
+        "got {answer}"
+    );
+    assert!(
+        in_trash(&h, &id),
+        "a client asserting its own confirmation emptied the trash"
+    );
+}
+
+/// The ticket is what runs the call, once. Presented again — even for the
+/// identical call — it is refused, and the item trashed since survives.
+#[tokio::test]
+async fn a_redeemed_ticket_runs_the_call_once_and_is_refused_on_reuse() {
+    let h = start().await;
+    let mut ws = h.socket().await;
+    let first = trashed(&h, &mut ws, "draft.txt").await;
+
+    let (_, ticket) = ask_to_confirm(&mut ws, "ask", "files.trash.empty", json!({})).await;
+    assert!(in_trash(&h, &first), "asking ran the command");
+    let ran = ws
+        .confirm("yes", &ticket, "files.trash.empty", json!({}))
+        .await;
+    assert_eq!(ok_value(&ran)["removed"], 1, "got {ran}");
+    assert!(
+        !in_trash(&h, &first),
+        "a redeemed ticket did not empty the trash"
+    );
+
+    let second = trashed(&h, &mut ws, "notes.txt").await;
+    let again = ws
+        .confirm("again", &ticket, "files.trash.empty", json!({}))
+        .await;
+    assert_ticket_refused(&again, "a ticket worked twice");
+    assert!(
+        in_trash(&h, &second),
+        "a spent ticket emptied the trash again"
+    );
+}
+
+/// A ticket names one call. Different parameters, or a different command,
+/// are refused — and the presentation burns it, so the original call cannot
+/// be run with it afterwards either.
+#[tokio::test]
+async fn a_ticket_does_not_run_other_params_or_another_command() {
+    let h = start().await;
+    let mut ws = h.socket().await;
+    let one = trashed(&h, &mut ws, "one.txt").await;
+    let two = trashed(&h, &mut ws, "two.txt").await;
+
+    // Control: a ticket for exactly these ids, redeemed for exactly them.
+    let only_one = json!({ "ids": [one] });
+    let (_, ticket) = ask_to_confirm(&mut ws, "ask1", "files.trash.empty", only_one.clone()).await;
+    let ran = ws
+        .confirm("yes1", &ticket, "files.trash.empty", only_one)
+        .await;
+    assert_eq!(ok_value(&ran)["removed"], 1, "got {ran}");
+    assert!(!in_trash(&h, &one) && in_trash(&h, &two));
+
+    // Asked about one item, presented for everything.
+    let only_two = json!({ "ids": [two] });
+    let (_, ticket) = ask_to_confirm(&mut ws, "ask2", "files.trash.empty", only_two.clone()).await;
+    let widened = ws
+        .confirm("widen", &ticket, "files.trash.empty", json!({}))
+        .await;
+    assert_ticket_refused(&widened, "a ticket for one item emptied everything");
+    assert!(in_trash(&h, &two), "altered params ran");
+    let burned = ws
+        .confirm("retry", &ticket, "files.trash.empty", only_two)
+        .await;
+    assert_ticket_refused(&burned, "a mismatched presentation left the ticket usable");
+    assert!(in_trash(&h, &two));
+
+    // Asked about the trash, presented for the recovery codes — with the same
+    // (empty) parameters, so only the command differs.
+    let before = h.lockdown.recovery_codes_left();
+    let (_, ticket) = ask_to_confirm(&mut ws, "ask3", "files.trash.empty", json!({})).await;
+    let switched = ws
+        .confirm("switch", &ticket, "system.recovery_codes", json!({}))
+        .await;
+    assert_ticket_refused(&switched, "a ticket ran a different command");
+    assert_eq!(h.lockdown.recovery_codes_left(), before);
+    assert!(in_trash(&h, &two));
+}
+
+/// A ticket is good only on the socket that was asked — even another socket
+/// of the same signed-in session, which is what a second tab, or an app
+/// frame with its own connection, would be.
+#[tokio::test]
+async fn a_ticket_is_refused_on_any_socket_but_the_one_it_was_issued_to() {
+    let h = start().await;
+    let cookie = h.sign_in().await;
+    let open = || async {
+        let mut ws = Ws::connect(h.addr, Some(&cookie))
+            .await
+            .expect("an upgraded socket");
+        assert_eq!(ws.hello().await["type"], "welcome");
+        ws
+    };
+    let mut asked = open().await;
+    let mut other = open().await;
+
+    // Control: on its own socket, it works.
+    let first = trashed(&h, &mut asked, "a.txt").await;
+    let (_, ticket) = ask_to_confirm(&mut asked, "ask1", "files.trash.empty", json!({})).await;
+    let ran = asked
+        .confirm("yes1", &ticket, "files.trash.empty", json!({}))
+        .await;
+    assert_eq!(ok_value(&ran)["removed"], 1, "got {ran}");
+    assert!(!in_trash(&h, &first));
+
+    let second = trashed(&h, &mut asked, "b.txt").await;
+    let (_, ticket) = ask_to_confirm(&mut asked, "ask2", "files.trash.empty", json!({})).await;
+    let elsewhere = other
+        .confirm("steal", &ticket, "files.trash.empty", json!({}))
+        .await;
+    assert_ticket_refused(&elsewhere, "another socket redeemed the ticket");
+    assert!(in_trash(&h, &second), "another socket emptied the trash");
+}
+
+/// Sixty seconds on the injected clock. The control redeems at 59 seconds;
+/// the refusal is at 61, with the item still on disk.
+#[tokio::test]
+async fn a_ticket_is_refused_once_its_minute_is_up() {
+    let h = start().await;
+    let mut ws = h.socket().await;
+
+    let first = trashed(&h, &mut ws, "fresh.txt").await;
+    let (_, ticket) = ask_to_confirm(&mut ws, "ask1", "files.trash.empty", json!({})).await;
+    h.ticket_clock.advance(Duration::from_secs(59));
+    let ran = ws
+        .confirm("yes1", &ticket, "files.trash.empty", json!({}))
+        .await;
+    assert_eq!(ok_value(&ran)["removed"], 1, "got {ran}");
+    assert!(!in_trash(&h, &first));
+
+    let second = trashed(&h, &mut ws, "stale.txt").await;
+    let (_, ticket) = ask_to_confirm(&mut ws, "ask2", "files.trash.empty", json!({})).await;
+    h.ticket_clock.advance(Duration::from_secs(61));
+    let late = ws
+        .confirm("late", &ticket, "files.trash.empty", json!({}))
+        .await;
+    assert_ticket_refused(&late, "an expired ticket ran");
+    assert!(
+        late["outcome"]["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("expired")),
+        "the refusal says why: {late}"
+    );
+    assert!(in_trash(&h, &second), "an expired ticket emptied the trash");
+}
+
+/// The prompt names what the call acts on, rendered by the server from the
+/// validated parameters — the original path of the trash item — with the
+/// bidi override and the zero-width space that would disguise it removed.
+#[tokio::test]
+async fn the_prompt_names_the_target_path_with_bidi_characters_stripped() {
+    let h = start().await;
+    let mut ws = h.socket().await;
+    // Renders as "invoiceexe.pdf" in a bidi-aware view if the override
+    // survives: the classic extension spoof.
+    let disguised = "invoice\u{202E}fdp\u{200B}.exe";
+    let id = trashed(&h, &mut ws, disguised).await;
+
+    let (value, _) =
+        ask_to_confirm(&mut ws, "ask", "files.trash.empty", json!({ "ids": [id] })).await;
+    let target = value["target"]
+        .as_str()
+        .expect("a target beside the prompt");
+    assert_eq!(target, "/invoicefdp.exe", "got {value}");
+    let prompt = value["prompt"].as_str().expect("a prompt");
+    assert!(
+        prompt.contains("/invoicefdp.exe"),
+        "the prompt names the target: {prompt}"
+    );
+    for hidden in ['\u{202E}', '\u{200B}'] {
+        assert!(
+            !prompt.contains(hidden) && !target.contains(hidden),
+            "{hidden:?} reached the prompt: {prompt:?}"
+        );
+    }
+
+    // Emptying everything says how much "everything" is: items, not whatever
+    // else happens to sit in the info directory, which emptying ignores.
+    trashed(&h, &mut ws, "second.txt").await;
+    std::fs::write(
+        h._dir
+            .path()
+            .join(deckjack_core::trash::TRASH_DIR)
+            .join("info")
+            .join("README"),
+        b"not an item",
+    )
+    .expect("a stray file");
+    let (value, _) = ask_to_confirm(&mut ws, "all", "files.trash.empty", json!({})).await;
+    assert_eq!(
+        value["target"], "everything in the trash (2 items)",
+        "got {value}"
+    );
+}
+
+/// `"confirmed": null` is still the removed field, present: refused like
+/// `true`, not read as absent and dispatched.
+#[tokio::test]
+async fn an_invoke_carrying_confirmed_null_is_refused_too() {
+    let h = start().await;
+    let mut ws = h.socket().await;
+    ws.send_text(
+        &json!({
+            "type": "invoke",
+            "id": "nulled",
+            "command": "files.trash.empty",
+            "params": {},
+            "confirmed": null,
+        })
+        .to_string(),
+    )
+    .await;
+    let answer = ws.response("nulled").await;
+    assert_eq!(
+        answer["outcome"]["error"]["code"],
+        ws::CONFIRMED_REMOVED,
+        "got {answer}"
+    );
+}
+
+/// The ticket is bound to what the dialog showed, not only to the
+/// parameters. "Empty everything" with one item in the trash, confirmed after
+/// something else landed there, is refused, and both items survive.
+#[tokio::test]
+async fn a_ticket_is_refused_when_what_it_named_has_changed() {
+    let h = start().await;
+    let mut ws = h.socket().await;
+
+    // Control: unchanged between question and answer, it runs.
+    let first = trashed(&h, &mut ws, "old.txt").await;
+    let (_, ticket) = ask_to_confirm(&mut ws, "ask1", "files.trash.empty", json!({})).await;
+    let ran = ws
+        .confirm("yes1", &ticket, "files.trash.empty", json!({}))
+        .await;
+    assert_eq!(ok_value(&ran)["removed"], 1, "got {ran}");
+    assert!(!in_trash(&h, &first));
+
+    let shown = trashed(&h, &mut ws, "junk.txt").await;
+    let (asked, ticket) = ask_to_confirm(&mut ws, "ask2", "files.trash.empty", json!({})).await;
+    assert_eq!(asked["target"], "everything in the trash (1 item)");
+    let slipped_in = trashed(&h, &mut ws, "thesis.txt").await;
+    let late = ws
+        .confirm("yes2", &ticket, "files.trash.empty", json!({}))
+        .await;
+    assert_ticket_refused(&late, "a ticket ran against a changed target");
+    assert!(
+        in_trash(&h, &shown) && in_trash(&h, &slipped_in),
+        "the trash was emptied past what the operator was shown"
+    );
+}
+
+/// Three long paths share the target's room: each keeps its own file name,
+/// and the bus never cuts the joined text through the middle one.
+#[tokio::test]
+async fn a_prompt_naming_several_long_paths_keeps_every_file_name() {
+    let h = start().await;
+    let mut ws = h.socket().await;
+    let mut ids = Vec::new();
+    for end in ["first", "second", "third", "fourth"] {
+        let name = format!("{}-{end}.txt", "x".repeat(50));
+        ids.push(trashed(&h, &mut ws, &name).await);
+    }
+    let (value, _) =
+        ask_to_confirm(&mut ws, "ask", "files.trash.empty", json!({ "ids": ids })).await;
+    let target = value["target"].as_str().expect("a target");
+    assert!(
+        target.chars().count() <= deckjack_core::command::TARGET_MAX_CHARS,
+        "got {target}"
+    );
+    for end in ["-first.txt", "-second.txt", "-third.txt"] {
+        assert!(target.contains(end), "{end} is not named: {target}");
+    }
+    assert!(target.ends_with(" and 1 more"), "got {target}");
+}
+
+/// Approving or revoking an app names the app, cleaned like any target.
+#[tokio::test]
+async fn approving_or_revoking_an_app_names_the_app() {
+    let h = start().await;
+    let mut ws = h.socket().await;
+    for (n, command) in ["system.app.approve", "system.app.revoke"]
+        .into_iter()
+        .enumerate()
+    {
+        let (value, _) = ask_to_confirm(
+            &mut ws,
+            &format!("app{n}"),
+            command,
+            json!({ "app": "notes\u{202E}txt.exe" }),
+        )
+        .await;
+        assert_eq!(value["target"], "notestxt.exe", "{command}: {value}");
+        assert!(
+            value["prompt"]
+                .as_str()
+                .is_some_and(|p| p.contains("notestxt.exe")),
+            "{command}: {value}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1721,4 +2251,848 @@ async fn revoking_every_session_finishes_rather_than_deadlocking_on_its_own_stor
         3,
         "the audit rows were not written, so nothing records whose sessions went"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation reaches the command
+// ---------------------------------------------------------------------------
+
+/// A cancel the shell sends stops the call it names, and the call answers.
+///
+/// The socket has always accepted `cancel` and flipped the call's signal, and
+/// `ws::Call` carries that signal to the dispatcher. `BusDispatch` never read
+/// it: the command ran to its own end whatever the client asked. For most
+/// commands that is a late answer; for `terminal.read`, which parks until the
+/// shell prints, it is a call that never answers at all — one in-flight slot
+/// gone per switched tab or reload, and a task holding the session for as
+/// long as the shell stays quiet, until the socket refuses new work.
+///
+/// Asked as the client sees it: a read parked on output that will never come,
+/// a cancel frame, and whether a response for that id arrives.
+#[tokio::test]
+async fn a_cancelled_terminal_read_answers_instead_of_parking_forever() {
+    let h = start().await;
+    let mut ws = h.socket().await;
+
+    let opened = ws.invoke("open", "terminal.open", json!({}), false).await;
+    let id = ok_value(&opened)["id"]
+        .as_str()
+        .expect("a terminal id")
+        .to_string();
+
+    // A cursor far past the end of the stream is "caught up": the read parks
+    // until the shell has printed past it, which it never will.
+    ws.send_text(
+        &json!({
+            "type": "invoke",
+            "id": "parked",
+            "command": "terminal.read",
+            "params": { "id": id, "cursor": 1u64 << 60 },
+        })
+        .to_string(),
+    )
+    .await;
+    ws.send_text(&json!({ "type": "cancel", "id": "parked" }).to_string())
+        .await;
+
+    let answered = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = ws.expect_json().await;
+            if frame["type"] == "response" && frame["id"] == "parked" {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("the cancelled read never answered: the cancel did not reach the command");
+
+    assert_eq!(answered["outcome"]["status"], "error", "got {answered}");
+    assert_eq!(
+        answered["outcome"]["error"]["code"], "cancelled",
+        "a cancel is reported as one, not as a failure of the command: {answered}"
+    );
+
+    // The terminal itself is untouched: cancelling a read is not closing the
+    // shell, and the same socket can go on using it.
+    let listed = ws.invoke("list", "terminal.list", json!({}), false).await;
+    assert!(
+        ok_value(&listed)
+            .as_array()
+            .expect("a list")
+            .iter()
+            .any(|t| t["id"] == id.as_str()),
+        "cancelling a read closed the terminal: {listed}"
+    );
+}
+
+/// Work on the blocking pool, held at a gate the test opens: the shape of
+/// `files.write`, `files.delete` and `system.lockdown`, whose futures can be
+/// dropped without stopping the thread doing the change.
+struct GatedWrite {
+    started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    gate: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    landed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl deckjack_core::command::Command for GatedWrite {
+    const ID: &'static str = "probe.gatedwrite";
+    const TITLE: &'static str = "Probe gated write";
+    const RISK: RiskLevel = RiskLevel::Write;
+
+    type Params = std::collections::HashMap<String, String>;
+    type Output = String;
+
+    async fn run(
+        &self,
+        _p: std::collections::HashMap<String, String>,
+        _cx: deckjack_core::command::Context,
+    ) -> Result<String, deckjack_core::command::CommandError> {
+        let started = self.started.lock().expect("started").take();
+        let gate = Arc::clone(&self.gate);
+        let landed = Arc::clone(&self.landed);
+        tokio::task::spawn_blocking(move || {
+            if let Some(tx) = started {
+                let _ = tx.send(());
+            }
+            let _ = gate.lock().expect("gate").recv();
+            landed.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await
+        .expect("the blocking work");
+        Ok("landed".to_string())
+    }
+}
+
+/// A cancel does not cut off a command whose work it cannot stop.
+///
+/// Dropping a future leaves a `spawn_blocking` task under it running, so a
+/// file write or a lockdown "cancelled" that way still lands. Answering
+/// `cancelled` — and journaling the dispatch as failed — would tell the
+/// client and the audit log the opposite of what happened. Such a command is
+/// answered with what it actually did.
+#[tokio::test]
+async fn a_cancel_does_not_report_blocking_work_as_cancelled_while_it_lands() {
+    let h = start().await;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let landed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    h.registry
+        .register(GatedWrite {
+            started: std::sync::Mutex::new(Some(started_tx)),
+            gate: Arc::new(std::sync::Mutex::new(gate)),
+            landed: Arc::clone(&landed),
+        })
+        .expect("the probe registers");
+    let mut ws = h.socket().await;
+
+    ws.send_text(
+        &json!({
+            "type": "invoke",
+            "id": "gated",
+            "command": "probe.gatedwrite",
+            "params": {},
+        })
+        .to_string(),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), started_rx)
+        .await
+        .expect("the probe never started")
+        .expect("the probe's start signal");
+
+    ws.send_text(&json!({ "type": "cancel", "id": "gated" }).to_string())
+        .await;
+    // A later call on the same socket answering means the cancel frame was
+    // handled; then give a dispatch that honors it time to answer early.
+    ws.send_text(
+        &json!({
+            "type": "invoke",
+            "id": "list",
+            "command": "terminal.list",
+            "params": {},
+        })
+        .to_string(),
+    )
+    .await;
+    loop {
+        let frame = ws.expect_json().await;
+        if frame["type"] == "response" && frame["id"] == "gated" {
+            panic!("answered while the work was still running, so not with what it did: {frame}");
+        }
+        if frame["type"] == "response" && frame["id"] == "list" {
+            break;
+        }
+    }
+    let early = tokio::time::timeout(Duration::from_millis(300), async {
+        loop {
+            let frame = ws.expect_json().await;
+            if frame["type"] == "response" && frame["id"] == "gated" {
+                return frame;
+            }
+        }
+    })
+    .await;
+    if let Ok(frame) = early {
+        panic!("answered while the work was still running, so not with what it did: {frame}");
+    }
+
+    release.send(()).expect("the probe is waiting at the gate");
+    let answered = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = ws.expect_json().await;
+            if frame["type"] == "response" && frame["id"] == "gated" {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("the call never answered");
+    assert!(
+        landed.load(std::sync::atomic::Ordering::SeqCst),
+        "the probe's work did not finish"
+    );
+    assert_eq!(
+        answered["outcome"]["status"], "ok",
+        "work that landed was reported as something else: {answered}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The cookie-route gate (docs/APP-UI-ISOLATION.md §4.9), at the assembly
+// ---------------------------------------------------------------------------
+
+/// A WebSocket handshake with exactly the given headers and no defaults, for
+/// the gate tests: `Ws::connect` sends a browser's Fetch Metadata, which is
+/// the thing under test here. Returns the status line's code.
+async fn upgrade_status(addr: SocketAddr, headers: &[(&str, &str)]) -> u16 {
+    let mut req = format!(
+        "GET {} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+        ws::PATH
+    );
+    for (name, value) in headers {
+        req.push_str(&format!("{name}: {value}\r\n"));
+    }
+    req.push_str("\r\n");
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .expect("send upgrade");
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0u8; 1];
+        if stream.read(&mut byte).await.expect("read the handshake") == 0 {
+            break;
+        }
+        head.push(byte[0]);
+    }
+    String::from_utf8_lossy(&head)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("a status code on the handshake")
+}
+
+fn gate_refused(r: &Response) -> bool {
+    r.status == 403 && r.body.contains(deckjack_core::fetchgate::REFUSED)
+}
+
+/// A borrowed session cannot be spent on a route that acts.
+///
+/// Every refusal is paired with the positive control from the same fixture,
+/// and every refusal is checked for its effect, not just its status: the
+/// handler's own answer never came, the session that `/logout` was asked to
+/// end still works, and a socket was not upgraded.
+#[tokio::test]
+async fn the_fetch_gate_refuses_a_borrowed_session_on_every_route_that_acts() {
+    let h = start().await;
+    let cookie = h.sign_in().await;
+    let me = format!("http://{}", h.addr);
+
+    // What each attack looks like on the wire. `""` omits the header, which
+    // the harness otherwise sends as a browser would.
+    let attacks: [(&str, Vec<(&str, &str)>); 5] = [
+        (
+            "a sandboxed frame",
+            vec![("origin", "null"), ("sec-fetch-site", "same-origin")],
+        ),
+        (
+            "another site's fetch",
+            vec![
+                ("sec-fetch-site", "cross-site"),
+                ("sec-fetch-dest", "empty"),
+            ],
+        ),
+        (
+            "a sibling subdomain's frame",
+            vec![
+                ("sec-fetch-site", "same-site"),
+                ("sec-fetch-dest", "iframe"),
+            ],
+        ),
+        ("no Fetch Metadata", vec![("sec-fetch-site", "")]),
+        (
+            "no Fetch Metadata, same-host Origin",
+            vec![("sec-fetch-site", ""), ("origin", me.as_str())],
+        ),
+    ];
+    // A top-level form POST is dest `document`, which rule 2 lets through
+    // for a navigation. It is not one, and the Strict cookie rides along on
+    // a same-site one, so the routes that act on a POST refuse it.
+    let form_posts: [(&str, Vec<(&str, &str)>); 2] = [
+        (
+            "a sibling host's top-level form post",
+            vec![
+                ("sec-fetch-site", "same-site"),
+                ("sec-fetch-dest", "document"),
+                ("sec-fetch-mode", "navigate"),
+            ],
+        ),
+        (
+            "another site's top-level form post",
+            vec![
+                ("sec-fetch-site", "cross-site"),
+                ("sec-fetch-dest", "document"),
+                ("sec-fetch-mode", "navigate"),
+            ],
+        ),
+    ];
+
+    // `/content`: the control reaches the handler's own refusal for a
+    // directory, which is the mark that the handler ran.
+    for (what, extra) in &attacks {
+        let mut headers = vec![("cookie", cookie.as_str())];
+        headers.extend(extra.iter().copied());
+        let r = h.get("/content?path=/", &headers).await;
+        assert!(
+            gate_refused(&r),
+            "/content let {what} through: {} {}",
+            r.status,
+            r.body
+        );
+    }
+    let r = h
+        .get(
+            "/content?path=/",
+            &[("cookie", cookie.as_str()), ("sec-fetch-dest", "script")],
+        )
+        .await;
+    assert!(
+        gate_refused(&r),
+        "/content served as shell script: {} {}",
+        r.status,
+        r.body
+    );
+    let control = h
+        .get(
+            "/content?path=/",
+            &[("cookie", cookie.as_str()), ("origin", me.as_str())],
+        )
+        .await;
+    assert_eq!(
+        control.status, 400,
+        "the control did not reach /content: {}",
+        control.body
+    );
+    assert!(
+        control.body.contains("that is a directory"),
+        "{}",
+        control.body
+    );
+
+    // `/passkey/credentials/remove`: the control reaches the handler's id
+    // check. (The credential surviving a refusal is pinned in
+    // tests/passkeyhttp.rs, which can enroll one.)
+    for (what, extra) in attacks.iter().chain(&form_posts) {
+        let mut headers = vec![("cookie", cookie.as_str())];
+        headers.extend(extra.iter().copied());
+        let r = h
+            .post("/passkey/credentials/remove", &headers, "{\"id\":\"!\"}")
+            .await;
+        assert!(
+            gate_refused(&r),
+            "/passkey let {what} through: {} {}",
+            r.status,
+            r.body
+        );
+    }
+    let control = h
+        .post(
+            "/passkey/credentials/remove",
+            &[("cookie", cookie.as_str()), ("origin", me.as_str())],
+            "{\"id\":\"!\"}",
+        )
+        .await;
+    assert!(
+        control.status == 400 && control.body.contains("not a credential id"),
+        "the control did not reach the passkey handler: {} {}",
+        control.status,
+        control.body
+    );
+
+    // `/ws`: nothing upgrades under an attack. The two controls are the two
+    // shapes real browsers send: Firefox's Fetch Metadata, and Chromium's
+    // bare same-host `Origin` (it sends no Fetch Metadata on a handshake).
+    for (what, headers) in [
+        (
+            "a sandboxed frame",
+            vec![("origin", "null"), ("sec-fetch-site", "same-origin")],
+        ),
+        (
+            "another site",
+            vec![
+                ("sec-fetch-site", "cross-site"),
+                ("sec-fetch-dest", "empty"),
+            ],
+        ),
+        ("no Fetch Metadata and no Origin", vec![]),
+        (
+            "no Fetch Metadata, foreign Origin",
+            vec![("origin", "https://evil.example")],
+        ),
+    ] {
+        let mut all = vec![("cookie", cookie.as_str())];
+        all.extend(headers);
+        assert_eq!(
+            upgrade_status(h.addr, &all).await,
+            403,
+            "/ws upgraded for {what}"
+        );
+    }
+    for (what, headers) in [
+        (
+            "Firefox",
+            vec![("sec-fetch-site", "same-origin"), ("origin", me.as_str())],
+        ),
+        ("Chromium", vec![("origin", me.as_str())]),
+    ] {
+        let mut all = vec![("cookie", cookie.as_str())];
+        all.extend(headers);
+        assert_eq!(
+            upgrade_status(h.addr, &all).await,
+            101,
+            "{what}'s handshake was refused"
+        );
+    }
+
+    // `/logout` last, because its control ends the session. Under attack the
+    // session must still be alive afterwards: a refused sign-out that signed
+    // out anyway is the bug.
+    for (what, extra) in attacks.iter().chain(&form_posts) {
+        let mut headers = vec![("cookie", cookie.as_str())];
+        headers.extend(extra.iter().copied());
+        let r = h.post("/logout", &headers, "").await;
+        assert!(
+            gate_refused(&r),
+            "/logout let {what} through: {} {}",
+            r.status,
+            r.body
+        );
+        let still = h.get("/", &[("cookie", cookie.as_str())]).await;
+        assert_eq!(
+            still.status, 200,
+            "{what} signed the operator out through a refusal"
+        );
+    }
+    let control = h
+        .post(
+            "/logout",
+            &[("cookie", cookie.as_str()), ("origin", me.as_str())],
+            "",
+        )
+        .await;
+    assert_eq!(
+        control.status, 303,
+        "the control could not sign out: {}",
+        control.body
+    );
+    let after = h.get("/", &[("cookie", cookie.as_str())]).await;
+    assert_eq!(after.status, 303, "the control's sign-out did not take");
+}
+
+/// A node on plain HTTP at a non-loopback address — `--listen 0.0.0.0:7878`
+/// opened at `http://100.x.y.z:7878` — gets no Fetch Metadata from any
+/// browser, because browsers send it only to potentially trustworthy URLs.
+/// The shell still has to read files and sign out there. The same request
+/// with anything saying the page was HTTPS, or to a loopback name, is one
+/// the browser would have labeled, so it stays refused.
+#[tokio::test]
+async fn the_fetch_gate_lets_a_browser_on_plain_remote_http_use_the_shell() {
+    let h = start().await;
+    let cookie = h.sign_in().await;
+    let remote = "100.70.30.57:7878";
+    let remote_origin = format!("http://{remote}");
+    let remote_page = format!("http://{remote}/");
+
+    // What Chromium sends there for the shell's `fetch` of a file, and for
+    // an `<img>` with no referrer: no `Sec-Fetch-*`, no `Origin`.
+    for extra in [vec![("referer", remote_page.as_str())], vec![]] {
+        let mut headers = vec![
+            ("cookie", cookie.as_str()),
+            ("host", remote),
+            ("sec-fetch-site", ""),
+        ];
+        headers.extend(extra);
+        let r = h.get("/content?path=/", &headers).await;
+        assert!(
+            r.status == 400 && r.body.contains("that is a directory"),
+            "the shell on plain remote HTTP could not reach /content: {} {}",
+            r.status,
+            r.body
+        );
+    }
+
+    // The same request, but something says the browser saw HTTPS (so it
+    // would have sent Fetch Metadata), or the host is loopback (likewise).
+    for (what, extra) in [
+        (
+            "an https Origin",
+            vec![("host", remote), ("origin", "https://100.70.30.57:7878")],
+        ),
+        (
+            "an https Referer",
+            vec![("host", remote), ("referer", "https://100.70.30.57:7878/")],
+        ),
+        (
+            "a proxy saying https",
+            vec![("host", remote), ("x-forwarded-proto", "https")],
+        ),
+        ("a loopback host", vec![("host", "localhost:7878")]),
+    ] {
+        let mut headers = vec![("cookie", cookie.as_str()), ("sec-fetch-site", "")];
+        headers.extend(extra);
+        let r = h.get("/content?path=/", &headers).await;
+        assert!(
+            gate_refused(&r),
+            "/content let a metadata-less request with {what} through: {} {}",
+            r.status,
+            r.body
+        );
+    }
+
+    // A sandboxed frame there still says `Origin: null`, and is refused.
+    let r = h
+        .post(
+            "/logout",
+            &[
+                ("cookie", cookie.as_str()),
+                ("host", remote),
+                ("sec-fetch-site", ""),
+                ("origin", "null"),
+            ],
+            "",
+        )
+        .await;
+    assert!(gate_refused(&r), "{} {}", r.status, r.body);
+    let still = h.get("/", &[("cookie", cookie.as_str())]).await;
+    assert_eq!(still.status, 200, "a null-origin sign-out took effect");
+
+    // And the shell's own sign-out works there.
+    let r = h
+        .post(
+            "/logout",
+            &[
+                ("cookie", cookie.as_str()),
+                ("host", remote),
+                ("sec-fetch-site", ""),
+                ("origin", remote_origin.as_str()),
+            ],
+            "",
+        )
+        .await;
+    assert_eq!(
+        r.status, 303,
+        "sign-out on plain remote HTTP failed: {}",
+        r.body
+    );
+    let after = h.get("/", &[("cookie", cookie.as_str())]).await;
+    assert_eq!(after.status, 303, "the sign-out did not take");
+}
+
+/// The rest of the cookie surface: the shell document, its assets (which
+/// live on the router's fallback, where a layer is easiest to miss) and the
+/// app UI mount. Another site may navigate to a document and load nothing.
+#[tokio::test]
+async fn the_fetch_gate_covers_the_shell_its_fallback_and_the_app_mount() {
+    let h = start().await;
+    let cookie = h.sign_in().await;
+    let c = ("cookie", cookie.as_str());
+
+    let link = h
+        .get(
+            "/",
+            &[
+                c,
+                ("sec-fetch-site", "cross-site"),
+                ("sec-fetch-dest", "document"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        link.status, 200,
+        "a link from elsewhere must still open the shell"
+    );
+
+    for (path, extra) in [
+        (
+            "/",
+            vec![
+                ("sec-fetch-site", "cross-site"),
+                ("sec-fetch-dest", "empty"),
+            ],
+        ),
+        ("/", vec![("origin", "null")]),
+        // A client route and an asset path, both on the fallback.
+        (
+            "/files/notes",
+            vec![
+                ("sec-fetch-site", "cross-site"),
+                ("sec-fetch-dest", "iframe"),
+            ],
+        ),
+        (
+            "/assets/index.js",
+            vec![
+                ("sec-fetch-site", "same-site"),
+                ("sec-fetch-dest", "script"),
+            ],
+        ),
+        (
+            "/apps/notes/",
+            vec![
+                ("sec-fetch-site", "cross-site"),
+                ("sec-fetch-dest", "iframe"),
+            ],
+        ),
+        (
+            "/apps/notes/sw.js",
+            vec![("sec-fetch-dest", "serviceworker")],
+        ),
+    ] {
+        let mut headers = vec![c];
+        headers.extend(extra);
+        let r = h.get(path, &headers).await;
+        assert!(
+            gate_refused(&r),
+            "{path} was not gated: {} {}",
+            r.status,
+            r.body
+        );
+    }
+
+    // Controls: the same paths from the shell itself are not refused by the
+    // gate. (`/apps/notes/` is not installed here, so its own answer is the
+    // UI router's 404.)
+    assert_eq!(h.get("/files/notes", &[c]).await.status, 200);
+    let app = h.get("/apps/notes/", &[c]).await;
+    assert!(
+        !gate_refused(&app) && app.status == 404,
+        "{} {}",
+        app.status,
+        app.body
+    );
+
+    // The routes with no cookie authority are not gated at all.
+    for path in ["/login", "/healthz", "/unlock", "/manifest.webmanifest"] {
+        let r = h
+            .get(path, &[("origin", "null"), ("sec-fetch-site", "")])
+            .await;
+        assert!(!gate_refused(&r), "{path} was gated: {}", r.body);
+    }
+}
+
+/// Nothing legitimate frames the shell, the sign-in page or the passkey
+/// pages, and each says so in both dialects. The shell's policy is still
+/// only `frame-ancestors`: the path-pinned `script-src` is stage 5.
+#[tokio::test]
+async fn the_shell_the_sign_in_page_and_the_passkey_pages_refuse_to_be_framed() {
+    let h = start().await;
+    let cookie = h.sign_in().await;
+
+    for path in ["/", "/files/notes", "/login", "/passkey", "/passkey/enroll"] {
+        let r = h.get(path, &[("cookie", cookie.as_str())]).await;
+        assert_eq!(r.status, 200, "{path}: {}", r.body);
+        assert_eq!(r.header("x-frame-options"), Some("DENY"), "{path}");
+        let csp = r.header("content-security-policy").unwrap_or_default();
+        assert!(csp.contains("frame-ancestors 'none'"), "{path}: {csp}");
+    }
+    let shell = h.get("/", &[("cookie", cookie.as_str())]).await;
+    assert!(
+        !shell
+            .header("content-security-policy")
+            .unwrap_or_default()
+            .contains("script-src"),
+        "the shell's script-src is stage 5, which can break the build"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tickets and `as_app` (APP-UI-ISOLATION §4.6 with §4.7)
+// ---------------------------------------------------------------------------
+//
+// A confirmation ticket is bound to the issuer of the call it was issued
+// for, and `as_app` decides that issuer: the shell, or one named app's
+// window. So a ticket issued to app A's window is refused when redeemed as
+// the shell's call or as app B's, and a ticket issued to the shell is refused
+// when redeemed under any `as_app`. Each refusal is checked on disk (the
+// trash item is still there) beside a control that redeems a ticket for the
+// same issuer successfully.
+//
+// The apps are made live the way `AppHost` does at a handshake:
+// `Registry::register_app` with their approved `[ui] invoke` list, here the
+// one destructive core command the tests confirm.
+
+/// Two apps whose windows may empty the trash, as if both had connected
+/// with that approved `[ui] invoke`.
+fn two_windows_that_may_empty_the_trash(h: &Node) {
+    for app in ["pim", "jot"] {
+        h.registry
+            .register_app(app, vec!["files.trash.empty".to_string()]);
+    }
+}
+
+/// Send an `invoke` with `as_app` set (or not), and wait for its answer.
+async fn invoke_as(ws: &mut Ws, id: &str, command: &str, as_app: Option<&str>) -> Value {
+    let mut frame = json!({ "type": "invoke", "id": id, "command": command, "params": {} });
+    if let Some(app) = as_app {
+        frame["as_app"] = json!(app);
+    }
+    ws.send_text(&frame.to_string()).await;
+    ws.response(id).await
+}
+
+/// Ask for `files.trash.empty` as `as_app`, and return its ticket.
+async fn ticket_for(ws: &mut Ws, id: &str, as_app: Option<&str>) -> String {
+    let answer = invoke_as(ws, id, "files.trash.empty", as_app).await;
+    let value = ok_value(&answer);
+    assert_eq!(
+        value["status"], "needs_confirmation",
+        "emptying the trash as {as_app:?} should have asked first: {value}"
+    );
+    value["ticket"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a ticket in the question: {value}"))
+        .to_string()
+}
+
+/// Redeem a ticket with `as_app` set (or not), and wait for its answer.
+async fn confirm_as(ws: &mut Ws, id: &str, ticket: &str, as_app: Option<&str>) -> Value {
+    let mut frame = json!({
+        "type": "confirm",
+        "id": id,
+        "ticket": ticket,
+        "command": "files.trash.empty",
+        "params": {},
+    });
+    if let Some(app) = as_app {
+        frame["as_app"] = json!(app);
+    }
+    ws.send_text(&frame.to_string()).await;
+    ws.response(id).await
+}
+
+#[tokio::test]
+async fn a_ticket_issued_to_an_apps_window_runs_only_as_that_window() {
+    let h = start().await;
+    two_windows_that_may_empty_the_trash(&h);
+    let mut ws = h.socket().await;
+
+    // Refused when redeemed as the shell's own call.
+    let kept = trashed(&h, &mut ws, "as-shell.txt").await;
+    let ticket = ticket_for(&mut ws, "pim-1", Some("pim")).await;
+    let answer = confirm_as(&mut ws, "pim-1-yes", &ticket, None).await;
+    assert_ticket_refused(&answer, "app pim's ticket redeemed as the shell");
+    assert!(in_trash(&h, &kept), "the refused confirm emptied the trash");
+
+    // Refused when redeemed as another app's window, one that could make the
+    // same call itself.
+    let ticket = ticket_for(&mut ws, "pim-2", Some("pim")).await;
+    let answer = confirm_as(&mut ws, "pim-2-yes", &ticket, Some("jot")).await;
+    assert_ticket_refused(&answer, "app pim's ticket redeemed as app jot");
+    assert!(in_trash(&h, &kept), "the refused confirm emptied the trash");
+
+    // Control: redeemed as the window it was issued to, it runs.
+    let ticket = ticket_for(&mut ws, "pim-3", Some("pim")).await;
+    let answer = confirm_as(&mut ws, "pim-3-yes", &ticket, Some("pim")).await;
+    ok_value(&answer);
+    assert!(!in_trash(&h, &kept), "the confirmed call did not run");
+}
+
+#[tokio::test]
+async fn a_ticket_issued_to_the_shell_does_not_run_as_an_apps_window() {
+    let h = start().await;
+    two_windows_that_may_empty_the_trash(&h);
+    let mut ws = h.socket().await;
+
+    let kept = trashed(&h, &mut ws, "as-window.txt").await;
+    let ticket = ticket_for(&mut ws, "shell-1", None).await;
+    let answer = confirm_as(&mut ws, "shell-1-yes", &ticket, Some("pim")).await;
+    assert_ticket_refused(&answer, "the shell's ticket redeemed as app pim");
+    assert!(in_trash(&h, &kept), "the refused confirm emptied the trash");
+
+    // Control: the shell's ticket, redeemed as the shell, runs.
+    let ticket = ticket_for(&mut ws, "shell-2", None).await;
+    let answer = confirm_as(&mut ws, "shell-2-yes", &ticket, None).await;
+    ok_value(&answer);
+    assert!(!in_trash(&h, &kept), "the confirmed call did not run");
+}
+
+#[tokio::test]
+async fn an_as_app_no_app_could_have_is_refused_before_the_ticket_is_spent() {
+    // The issuer is decided first, so a confirm naming something that is
+    // not an app name is refused as `not_permitted` and the ticket it
+    // carried is still good for the call it was issued to.
+    let h = start().await;
+    two_windows_that_may_empty_the_trash(&h);
+    let mut ws = h.socket().await;
+
+    let kept = trashed(&h, &mut ws, "bad-name.txt").await;
+    let ticket = ticket_for(&mut ws, "bad-1", Some("pim")).await;
+    let answer = confirm_as(&mut ws, "bad-1-yes", &ticket, Some("Not An App")).await;
+    assert_eq!(answer["outcome"]["status"], "error", "{answer}");
+    assert_eq!(
+        answer["outcome"]["error"]["code"],
+        wiring::NOT_PERMITTED,
+        "{answer}"
+    );
+    assert!(in_trash(&h, &kept), "the refused confirm emptied the trash");
+
+    let answer = confirm_as(&mut ws, "bad-1-again", &ticket, Some("pim")).await;
+    ok_value(&answer);
+    assert!(
+        !in_trash(&h, &kept),
+        "the ticket was spent by a refused name"
+    );
+}
+
+#[tokio::test]
+async fn an_invoke_naming_an_app_still_may_not_assert_confirmed() {
+    let h = start().await;
+    two_windows_that_may_empty_the_trash(&h);
+    let mut ws = h.socket().await;
+    let kept = trashed(&h, &mut ws, "forged-window.txt").await;
+
+    // Control: asked honestly as the window, it is a question.
+    ticket_for(&mut ws, "honest", Some("pim")).await;
+
+    ws.send_text(
+        &json!({
+            "type": "invoke",
+            "id": "forged",
+            "command": "files.trash.empty",
+            "params": {},
+            "as_app": "pim",
+            "confirmed": true,
+        })
+        .to_string(),
+    )
+    .await;
+    let answer = ws.response("forged").await;
+    assert_eq!(
+        answer["outcome"]["error"]["code"],
+        ws::CONFIRMED_REMOVED,
+        "{answer}"
+    );
+    assert!(in_trash(&h, &kept), "the forged invoke emptied the trash");
 }

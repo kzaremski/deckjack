@@ -1,4 +1,4 @@
-import { ref } from "vue";
+import { computed, ref, type ComputedRef, type Ref } from "vue";
 
 import type { Size } from "../shell/geometry.ts";
 
@@ -6,24 +6,21 @@ import type { Size } from "../shell/geometry.ts";
  * The app contract.
  *
  * Every app declares a compact layout, a wide layout and a minimum width, and
- * responds to whatever space it is given. The window manager needs those three
- * facts before an app's backend exists, so they live here as data rather than
- * inside each panel.
+ * responds to whatever space it is given. The window manager needs those
+ * facts before an app's backend answers, so they live here as data rather
+ * than inside each panel.
  *
- * This is the shell's view of an app, not the app's manifest. On a real
- * install the core scans `~/.deckjack/apps/<name>/app.toml` and sends the list
- * down the bus; this table is the built-in set plus a fallback, so the shell
- * is usable before any app binary is installed.
+ * Where they come from is the point of this module. They used to be a closed
+ * union compiled into the bundle, which meant an app installed after the
+ * shell was built could never reach the dock, the switcher or the palette.
+ * Now the table is the built-in entries below merged with what the core's
+ * `system.apps` reports from each installed `app.toml`, and the manifest wins
+ * wherever it says something.
  */
 
-export type AppId =
-  | "files"
-  | "terminal"
-  | "notes"
-  | "tasks"
-  | "mail"
-  | "calendar"
-  | "assistant";
+/** An app's name: the directory, the binary suffix, the URL segment and the
+ * command namespace. Any string the core reports, not a fixed list. */
+export type AppId = string;
 
 export interface AppContract {
   id: AppId;
@@ -40,20 +37,34 @@ export interface AppContract {
   /** Shows the Inbox count on the dock, per "pending approvals surface as a
    * dock badge and a notification". */
   badge?: "inbox";
+  /** Sorted after every other app in the dock. */
+  last?: boolean;
 }
 
-export const apps: Record<AppId, AppContract> = {
-  files: {
-    id: "files",
+/** What a new window gets when nothing says otherwise. */
+const DEFAULT_MIN: Size = { w: 320, h: 200 };
+const DEFAULT_SIZE: Size = { w: 640, h: 420 };
+
+/**
+ * The shell's own entries, in dock order.
+ *
+ * Two kinds. The terminal and the Assistant's Inbox are the core's, so they
+ * exist whatever is installed. The rest are apps the design names; they keep
+ * their dock slot so the desktop has the same shape before and after an app
+ * binary is installed, and an installed manifest overrides any field here.
+ */
+export const builtinApps: readonly AppContract[] = [
+  {
+    id: "filer",
     title: "Files",
     tag: "Fi",
-    summary: "The working directory, across nodes",
+    summary: "The working directory",
     minSize: { w: 360, h: 220 },
     defaultSize: { w: 680, h: 440 },
     compact: true,
     wide: true,
   },
-  terminal: {
+  {
     id: "terminal",
     title: "Terminal",
     tag: "Te",
@@ -65,7 +76,7 @@ export const apps: Record<AppId, AppContract> = {
     compact: true,
     wide: true,
   },
-  notes: {
+  {
     id: "notes",
     title: "Notes",
     tag: "No",
@@ -75,7 +86,7 @@ export const apps: Record<AppId, AppContract> = {
     compact: true,
     wide: true,
   },
-  tasks: {
+  {
     id: "tasks",
     title: "Tasks",
     tag: "Ta",
@@ -85,7 +96,7 @@ export const apps: Record<AppId, AppContract> = {
     compact: true,
     wide: true,
   },
-  mail: {
+  {
     id: "mail",
     title: "Mail",
     tag: "Ma",
@@ -95,7 +106,7 @@ export const apps: Record<AppId, AppContract> = {
     compact: true,
     wide: true,
   },
-  calendar: {
+  {
     id: "calendar",
     title: "Calendar",
     tag: "Ca",
@@ -105,7 +116,7 @@ export const apps: Record<AppId, AppContract> = {
     compact: true,
     wide: true,
   },
-  assistant: {
+  {
     id: "assistant",
     title: "Assistant",
     tag: "As",
@@ -115,92 +126,188 @@ export const apps: Record<AppId, AppContract> = {
     compact: true,
     wide: true,
     badge: "inbox",
+    // The Assistant is one app among many, so it sits at the end rather
+    // than first, and an installed app joins the dock before it.
+    last: true,
   },
-};
-
-/** Dock order. The Assistant sits last: it is one app among many. */
-export const dockOrder: AppId[] = [
-  "files",
-  "terminal",
-  "notes",
-  "tasks",
-  "mail",
-  "calendar",
-  "assistant",
 ];
 
-export function isAppId(value: string): value is AppId {
-  return value in apps;
-}
-
-/** For a window whose app the shell does not know: an installed app binary
- * the core told us about, or one that was uninstalled while open. */
-export function unknownApp(id: string): AppContract {
-  return {
-    id: "files",
-    title: id,
-    tag: id.slice(0, 2).padEnd(2, " "),
-    summary: "An installed app this shell has no built-in panel for",
-    minSize: { w: 320, h: 200 },
-    defaultSize: { w: 640, h: 420 },
-    compact: true,
-    wide: true,
-  };
-}
-
 /**
- * Apps the core has discovered on this node, by name.
+ * An app the core has discovered on this node, as `system.apps` reports it.
  *
- * The built-in table above is what the shell knows before any app binary is
- * installed; this is what is actually there. `system.apps` reports it, and a
- * window for one of these renders the app's own UI in a frame rather than a
- * built-in panel.
- *
- * A module-level ref rather than part of the windows store: the dock, the
- * palette and the window surface all want the same answer, and none of them
- * owns it.
+ * Optional fields are the manifest's own words: absent means the manifest
+ * said nothing, and the built-in entry or the shell's default applies.
  */
 export interface InstalledApp {
   name: string;
   title: string;
   version: string;
   lifecycle: "service" | "on-demand";
-  minWidth?: number;
   status: "live" | "reconnecting" | "unavailable";
+  minWidth?: number;
+  tag?: string;
+  summary?: string;
+  defaultWidth?: number;
+  defaultHeight?: number;
+  compact: boolean;
+  wide: boolean;
+  /**
+   * Where it stands with the operator's approval. `required` (never
+   * approved) and `stale` (approved for a different manifest, or before the
+   * fingerprint became SHA-256) mean it will not run until approved; the
+   * palette offers "Approve <title>" for those. `parseInstalled` always
+   * sets it; absent, as in an entry built by hand, means unknown.
+   */
+  approval?: AppApproval;
+  /** What it asks for, in the core's words, for the approval entry. */
+  asks?: string;
 }
 
-export const installed = ref<InstalledApp[]>([]);
+export type AppApproval = "not-needed" | "approved" | "required" | "stale" | "unknown";
 
-export function isInstalled(name: string): boolean {
-  return installed.value.some((app) => app.name === name);
+const APPROVALS: readonly AppApproval[] = ["not-needed", "approved", "required", "stale"];
+
+/** Whether the operator has to approve the app before it can run. */
+export function awaitsApproval(app: InstalledApp): boolean {
+  return app.approval === "required" || app.approval === "stale";
 }
 
-/**
- * Ask the core what is installed.
- *
- * Failure is not an error worth surfacing: `system.apps` is absent on a core
- * with no app host, and the honest result then is "no installed apps" rather
- * than a banner about a command the operator cannot do anything about.
- */
-export async function loadInstalled(
-  call: (command: string, params?: Record<string, unknown>) => Promise<unknown>,
-): Promise<void> {
-  try {
-    const result = (await call("system.apps")) as { apps?: unknown } | undefined;
-    const list = Array.isArray(result?.apps) ? result.apps : [];
-    installed.value = list
-      .filter((a): a is Record<string, unknown> => typeof a === "object" && a !== null)
-      .map<InstalledApp>((a) => ({
-        name: String(a.name ?? ""),
-        title: String(a.title ?? a.name ?? ""),
-        version: String(a.version ?? ""),
-        lifecycle: a.lifecycle === "service" ? "service" : "on-demand",
-        minWidth: typeof a.min_width === "number" ? a.min_width : undefined,
-        status:
-          a.status === "live" || a.status === "reconnecting" ? a.status : "unavailable",
-      }))
-      .filter((a) => a.name !== "");
-  } catch {
-    installed.value = [];
-  }
+/** Parse `system.apps`. Anything malformed is dropped, not guessed at. */
+export function parseInstalled(result: unknown): InstalledApp[] {
+  const list = (result as { apps?: unknown } | undefined)?.apps;
+  if (!Array.isArray(list)) return [];
+  const num = (v: unknown) => (typeof v === "number" && v > 0 ? v : undefined);
+  const str = (v: unknown) => (typeof v === "string" && v !== "" ? v : undefined);
+  return list
+    .filter((a): a is Record<string, unknown> => typeof a === "object" && a !== null)
+    .map<InstalledApp>((a) => ({
+      name: String(a.name ?? ""),
+      title: str(a.title) ?? String(a.name ?? ""),
+      version: String(a.version ?? ""),
+      lifecycle: a.lifecycle === "service" ? "service" : "on-demand",
+      status:
+        a.status === "live" || a.status === "reconnecting" ? a.status : "unavailable",
+      minWidth: num(a.min_width),
+      tag: str(a.tag),
+      summary: str(a.summary),
+      defaultWidth: num(a.default_width),
+      defaultHeight: num(a.default_height),
+      // Absent is "both", as the core's own default says. Only an explicit
+      // false takes a layout away.
+      compact: a.compact !== false,
+      wide: a.wide !== false,
+      // Anything this shell does not know is "unknown", which offers no
+      // approval entry: guessing "required" would put a button in front of
+      // the operator for a state the core never reported.
+      approval: APPROVALS.find((x) => x === a.approval) ?? "unknown",
+      asks: str(a.asks),
+    }))
+    .filter((a) => a.name !== "");
+}
+
+/** Two characters from a title: "Photos" is "Ph", "x" is "X". */
+export function tagFrom(title: string): string {
+  const letters = [...title.trim()].filter((c) => /[\p{L}\p{N}]/u.test(c));
+  if (letters.length === 0) return "?";
+  return letters[0]!.toUpperCase() + (letters[1]?.toLowerCase() ?? "");
+}
+
+/** The contract for one installed app, over its built-in entry if any. */
+function fromManifest(app: InstalledApp, base: AppContract | undefined): AppContract {
+  const minW = app.minWidth ?? base?.minSize.w ?? DEFAULT_MIN.w;
+  const minH = base?.minSize.h ?? DEFAULT_MIN.h;
+  const title = app.title || base?.title || app.name;
+  return {
+    id: app.name,
+    title,
+    tag: app.tag ?? base?.tag ?? tagFrom(title),
+    summary: app.summary ?? base?.summary ?? `${title} ${app.version}`.trim(),
+    minSize: { w: minW, h: minH },
+    defaultSize: {
+      // Never open narrower than the app says it can work at.
+      w: Math.max(app.defaultWidth ?? base?.defaultSize.w ?? DEFAULT_SIZE.w, minW),
+      h: Math.max(app.defaultHeight ?? base?.defaultSize.h ?? DEFAULT_SIZE.h, minH),
+    },
+    compact: app.compact,
+    wide: app.wide,
+    badge: base?.badge,
+    last: base?.last,
+  };
+}
+
+export interface AppTable {
+  /** What `system.apps` last reported. */
+  installed: Ref<InstalledApp[]>;
+  /** Every app the dock, the switcher and the palette offer, in dock order. */
+  dock: ComputedRef<AppContract[]>;
+  /** The contract for any app id, including one nothing knows: a window
+   * whose app was uninstalled while it was open still has to render. */
+  contract(id: AppId): AppContract;
+  /** Built-in or installed: something the operator can open. */
+  isKnown(id: string): boolean;
+  /** Installed on this node, so its window shows the app's own UI. */
+  isInstalled(id: string): boolean;
+  /**
+   * Ask the core what is installed.
+   *
+   * A refusal leaves the list empty rather than raising a banner:
+   * `system.apps` is absent on a core with no app host, and "no installed
+   * apps" is then the honest answer.
+   */
+  load(
+    call: (command: string, params?: Record<string, unknown>) => Promise<unknown>,
+  ): Promise<void>;
+}
+
+export function createAppTable(): AppTable {
+  const installed = ref<InstalledApp[]>([]);
+  const builtinById = new Map(builtinApps.map((a) => [a.id, a]));
+
+  const table = computed(() => {
+    const byId = new Map<string, AppContract>(builtinById);
+    for (const app of installed.value) {
+      byId.set(app.name, fromManifest(app, builtinById.get(app.name)));
+    }
+    return byId;
+  });
+
+  const dock = computed(() => {
+    const builtinOrder = builtinApps.map((a) => a.id);
+    const builtin = builtinOrder.map((id) => table.value.get(id)!);
+    // Installed apps the shell has no entry for, alphabetically by title, so
+    // two devices list them the same way.
+    const extra = [...table.value.values()]
+      .filter((a) => !builtinById.has(a.id))
+      .sort((a, b) => a.title.localeCompare(b.title));
+    const all = [...builtin, ...extra];
+    return [...all.filter((a) => !a.last), ...all.filter((a) => a.last)];
+  });
+
+  return {
+    installed,
+    dock,
+    contract(id) {
+      return (
+        table.value.get(id) ?? {
+          id,
+          title: id,
+          tag: tagFrom(id),
+          summary: "An app this node does not have installed",
+          minSize: { ...DEFAULT_MIN },
+          defaultSize: { ...DEFAULT_SIZE },
+          compact: true,
+          wide: true,
+        }
+      );
+    },
+    isKnown: (id) => table.value.has(id),
+    isInstalled: (id) => installed.value.some((a) => a.name === id),
+    async load(call) {
+      try {
+        installed.value = parseInstalled(await call("system.apps"));
+      } catch {
+        installed.value = [];
+      }
+    },
+  };
 }

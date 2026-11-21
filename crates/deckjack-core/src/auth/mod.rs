@@ -72,6 +72,9 @@ pub enum RevokeReason {
     /// Taken along with an address that has just been blocked for failed
     /// sign-ins.
     AddressBlocked,
+    /// Past its `session_max`. Announced like the others, because an expired
+    /// session owes the same cleanup: its row, and the shells it opened.
+    Expired,
 }
 
 impl RevokeReason {
@@ -81,6 +84,7 @@ impl RevokeReason {
         match self {
             RevokeReason::SessionsFull => "sessions_full",
             RevokeReason::AddressBlocked => "address_blocked",
+            RevokeReason::Expired => "expired",
         }
     }
 }

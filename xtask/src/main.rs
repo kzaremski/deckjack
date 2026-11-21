@@ -208,11 +208,43 @@ enum XtaskError {
         source: io::Error,
     },
 
+    #[error(
+        "{path} has no `name = \"...\"` under [app], so the app it describes has no \
+         name to build or install it under"
+    )]
+    NoAppName { path: String },
+
     #[error("unknown task `{0}`. Run `cargo xtask help` for the list.")]
     UnknownTask(String),
 
-    #[error("`cargo xtask {task}` takes no options, but got `{option}`.")]
+    #[error("`cargo xtask {task}` does not take `{option}`. Run `cargo xtask help`.")]
     UnknownOption { task: &'static str, option: String },
+
+    #[error("`{option}` needs a value: {what}.")]
+    MissingValue {
+        option: &'static str,
+        what: &'static str,
+    },
+
+    #[error("`{value}` is not a port number.")]
+    BadPort { value: String },
+
+    #[error(
+        "neither DECKJACK_HOME nor HOME is set, so there is no default install \
+         directory. Pass --prefix (install) or --home (dev)."
+    )]
+    NoHome,
+
+    #[error("cannot install {what} to {to}: {source}")]
+    Install {
+        what: String,
+        to: String,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("{0} was not built: expected it at {1}. The cargo build above should have made it.")]
+    NotBuilt(String, String),
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +294,15 @@ fn run(args: &[String]) -> Result<(), XtaskError> {
             task_check(&workspace)
         }
         "build" => task_build(&workspace, &tools, rest),
+        "install" => {
+            let opts =
+                InstallOptions::parse(rest, env::var_os("DECKJACK_HOME"), env::var_os("HOME"))?;
+            task_install(&workspace, &tools, &opts)
+        }
+        "dev" => {
+            let opts = DevOptions::parse(rest, env::var_os("HOME"))?;
+            task_dev(&workspace, &tools, &opts)
+        }
         other => Err(XtaskError::UnknownTask(other.to_string())),
     }
 }
@@ -285,6 +326,24 @@ cargo xtask — Deckjack build tasks
                     npm is available), then `cargo build`. Unrecognized
                     arguments go to cargo, so `cargo xtask build --release`
                     works. --no-web skips the web step.
+
+  install [--debug] [--prefix DIR]
+                    Build (release by default, web bundle first) and install
+                    into DIR, default $DECKJACK_HOME or ~/.deckjack: the core
+                    as bin/deckjack and every app as apps/<name>/ with its
+                    app.toml. Binaries are replaced by rename, so a running
+                    server is not disturbed; restart it to pick up the new
+                    core. An app picks up its new binary the next time it is
+                    started.
+
+  dev [--port N] [--home DIR]
+                    The core and Vite together, in the foreground. Builds a
+                    debug core and the apps, installs the apps into DIR
+                    (default ~/.deckjack-dev, its own working directory so it
+                    never contends with a real ~/.deckjack server), starts
+                    `deckjack --debug` on 127.0.0.1:N (default 8777) and
+                    `npm run dev` pointed at it. Open http://localhost:5273.
+                    Ctrl+C stops both; if either exits, the other is stopped.
 
 A machine without Node is not an error. If web/dist is already present it is
 used as it is, with a note; only a missing bundle that cannot be built is
@@ -836,5 +895,774 @@ fn format_gap(later: SystemTime, earlier: SystemTime) -> String {
         s if s < 90 * 60 => format!("{} minutes", s / 60),
         s if s < 48 * 3600 => format!("{} hours", s / 3600),
         s => format!("{} days", s / 86_400),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// install and dev
+// ---------------------------------------------------------------------------
+
+/// The default install directory: `$DECKJACK_HOME`, else `$HOME/.deckjack`.
+/// The same rule as `deckjack_core::node::install_dir`, restated because the
+/// xtask must not depend on the core.
+fn deckjack_home(
+    deckjack_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<PathBuf, XtaskError> {
+    if let Some(dir) = deckjack_home.filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    home.filter(|h| !h.is_empty())
+        .map(|h| PathBuf::from(h).join(".deckjack"))
+        .ok_or(XtaskError::NoHome)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InstallOptions {
+    release: bool,
+    prefix: PathBuf,
+}
+
+impl InstallOptions {
+    fn parse(
+        args: &[String],
+        deckjack_home_var: Option<OsString>,
+        home: Option<OsString>,
+    ) -> Result<InstallOptions, XtaskError> {
+        let mut release = true;
+        let mut prefix = None;
+        let mut it = args.iter();
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--debug" => release = false,
+                "--prefix" => {
+                    let value = it.next().ok_or(XtaskError::MissingValue {
+                        option: "--prefix",
+                        what: "the directory to install into",
+                    })?;
+                    prefix = Some(PathBuf::from(value));
+                }
+                other => {
+                    return Err(XtaskError::UnknownOption {
+                        task: "install",
+                        option: other.to_string(),
+                    });
+                }
+            }
+        }
+        let prefix = match prefix {
+            Some(p) => p,
+            None => deckjack_home(deckjack_home_var, home)?,
+        };
+        Ok(InstallOptions { release, prefix })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DevOptions {
+    port: u16,
+    home: PathBuf,
+}
+
+/// The dev core's port. Matches `web/vite.config.ts`'s default.
+const DEV_PORT: u16 = 8777;
+
+impl DevOptions {
+    fn parse(args: &[String], home: Option<OsString>) -> Result<DevOptions, XtaskError> {
+        let mut port = DEV_PORT;
+        let mut dir = None;
+        let mut it = args.iter();
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--port" => {
+                    let value = it.next().ok_or(XtaskError::MissingValue {
+                        option: "--port",
+                        what: "the port for the dev core",
+                    })?;
+                    port = value.parse().map_err(|_| XtaskError::BadPort {
+                        value: value.clone(),
+                    })?;
+                }
+                "--home" => {
+                    let value = it.next().ok_or(XtaskError::MissingValue {
+                        option: "--home",
+                        what: "the dev install and working directory",
+                    })?;
+                    dir = Some(PathBuf::from(value));
+                }
+                other => {
+                    return Err(XtaskError::UnknownOption {
+                        task: "dev",
+                        option: other.to_string(),
+                    });
+                }
+            }
+        }
+        // Deliberately not $DECKJACK_HOME: that names the real install, and
+        // the dev core must never take its lock or its port.
+        let home = match dir {
+            Some(d) => d,
+            None => home
+                .filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(".deckjack-dev"))
+                .ok_or(XtaskError::NoHome)?,
+        };
+        Ok(DevOptions { port, home })
+    }
+}
+
+/// One app crate in the repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppCrate {
+    /// The app's name, from its `app.toml`: what the binary is called
+    /// (`deckjack-<name>`) and where it installs (`apps/<name>/`).
+    name: String,
+    /// The crate's directory, which `deckjack install` reads the manifest
+    /// and the UI from.
+    dir: PathBuf,
+}
+
+/// Every app in the repository: a `crates/deckjack-*/` with an `app.toml`,
+/// which is exactly what makes a crate an app. Sorted by app name, so the
+/// output is the same every run.
+///
+/// The name comes from the manifest, not the directory. The two usually
+/// agree; they do not have to, and where they part it is the manifest that
+/// the core holds the binary to. `crates/deckjack-files` is the Files app,
+/// whose name is `filer` because `files` is the core's own namespace.
+fn find_apps(root: &Path) -> Result<Vec<AppCrate>, XtaskError> {
+    let crates = root.join("crates");
+    let entries = fs::read_dir(&crates).map_err(|source| XtaskError::Read {
+        path: crates.display().to_string(),
+        source,
+    })?;
+    let mut apps = Vec::new();
+    for entry in entries.flatten() {
+        let dir_name = entry.file_name().to_string_lossy().into_owned();
+        let manifest = entry.path().join("app.toml");
+        if dir_name.starts_with("deckjack-") && manifest.is_file() {
+            let text = fs::read_to_string(&manifest).map_err(|source| XtaskError::Read {
+                path: manifest.display().to_string(),
+                source,
+            })?;
+            let name = manifest_app_name(&text).ok_or_else(|| XtaskError::NoAppName {
+                path: manifest.display().to_string(),
+            })?;
+            apps.push(AppCrate {
+                name,
+                dir: entry.path(),
+            });
+        }
+    }
+    apps.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(apps)
+}
+
+/// `name` under `[app]` in an `app.toml`, read without a TOML parser because
+/// this crate has none (see Cargo.toml). Only the plain `name = "x"` form the
+/// in-tree manifests use; the core's `deckjack install` parses the manifest
+/// properly and refuses anything this reads wrong.
+fn manifest_app_name(text: &str) -> Option<String> {
+    let mut in_app = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_app = line == "[app]";
+            continue;
+        }
+        if !in_app {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("name") else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim();
+        let value = value.split('#').next().unwrap_or(value).trim();
+        return value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+    }
+    None
+}
+
+/// Where cargo puts its output: `$CARGO_TARGET_DIR`, else `target/`.
+fn target_dir(root: &Path, from_env: Option<OsString>) -> PathBuf {
+    match from_env.filter(|d| !d.is_empty()) {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            if dir.is_absolute() {
+                dir
+            } else {
+                root.join(dir)
+            }
+        }
+        None => root.join("target"),
+    }
+}
+
+/// Copy `from` to `to` by writing beside it and renaming over it.
+///
+/// A rename, not a write in place, because the destination may be a binary
+/// that is running: Linux refuses to open a running executable for writing
+/// ("text file busy"), and a rename leaves the running process its old file.
+fn install_file(from: &Path, to: &Path, mode: u32) -> Result<(), XtaskError> {
+    let fail = |source: io::Error| XtaskError::Install {
+        what: from.display().to_string(),
+        to: to.display().to_string(),
+        source,
+    };
+    let dir = to.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir).map_err(fail)?;
+    let name = to
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.xtask-new"));
+    let _ = fs::remove_file(&tmp);
+    fs::copy(from, &tmp).map_err(fail)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode)).map_err(fail)?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    fs::rename(&tmp, to).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        fail(e)
+    })
+}
+
+/// Install the built apps (and, with `core`, the core) into `prefix`.
+fn install_into(
+    workspace: &Workspace,
+    built: &Path,
+    prefix: &Path,
+    core: bool,
+) -> Result<Vec<String>, XtaskError> {
+    let mut installed = Vec::new();
+    if core {
+        let bin = built.join("deckjack");
+        if !bin.is_file() {
+            return Err(XtaskError::NotBuilt(
+                "deckjack".into(),
+                bin.display().to_string(),
+            ));
+        }
+        install_file(&bin, &prefix.join("bin").join("deckjack"), 0o755)?;
+        installed.push("bin/deckjack".to_string());
+    }
+    // Apps go through the core's own `deckjack install`, from the build just
+    // made, rather than a second copy of its rules here: it validates the
+    // manifest, checks the binary's architecture, swaps the directory
+    // atomically and says whether the app needs approving again. Linking the
+    // core into this crate to call it directly would cost the dependency tree
+    // this crate exists to avoid.
+    let core_bin = built.join("deckjack");
+    for AppCrate { name: app, dir } in find_apps(&workspace.root)? {
+        let binary = format!("deckjack-{app}");
+        let from = built.join(&binary);
+        if !from.is_file() {
+            return Err(XtaskError::NotBuilt(binary, from.display().to_string()));
+        }
+        if !core_bin.is_file() {
+            return Err(XtaskError::NotBuilt(
+                "deckjack".into(),
+                core_bin.display().to_string(),
+            ));
+        }
+        let mut install = Command::new(&core_bin);
+        install
+            .arg("install")
+            .arg(&dir)
+            .arg("--binary")
+            .arg(&from)
+            .env("DECKJACK_HOME", prefix);
+        exec(install, &workspace.root)?;
+        installed.push(format!("apps/{app}/"));
+        // An app installed under a name it has since given up: remove the old
+        // directory through the core's own `deckjack uninstall`, or it stays
+        // behind as a manifest that never validates again.
+        for (old, _) in RENAMED_APPS.iter().filter(|(_, new)| *new == app) {
+            if !prefix.join("apps").join(old).join("app.toml").is_file() {
+                continue;
+            }
+            let mut uninstall = Command::new(&core_bin);
+            uninstall
+                .arg("uninstall")
+                .arg(old)
+                .env("DECKJACK_HOME", prefix);
+            exec(uninstall, &workspace.root)?;
+            installed.push(format!("removed apps/{old}/ (now {app})"));
+        }
+    }
+    Ok(installed)
+}
+
+/// Apps that were renamed, old name first. `files` and `editor` became
+/// namespaces only the core may use (docs/APP-UI-ISOLATION.md §4.6), so the
+/// Files and Editor apps took new names; their old install directories are
+/// removed when the new ones are installed.
+const RENAMED_APPS: &[(&str, &str)] = &[("files", "filer"), ("editor", "scribe")];
+
+fn cargo_build(workspace: &Workspace, tools: &Tools, release: bool) -> Result<(), XtaskError> {
+    let mut cargo = Command::new(&tools.cargo);
+    cargo.arg("build").current_dir(&workspace.root);
+    if release {
+        cargo.arg("--release");
+    }
+    exec(cargo, &workspace.root)
+}
+
+fn task_install(
+    workspace: &Workspace,
+    tools: &Tools,
+    opts: &InstallOptions,
+) -> Result<(), XtaskError> {
+    web_before_cargo(workspace, tools)?;
+    cargo_build(workspace, tools, opts.release)?;
+    let profile = if opts.release { "release" } else { "debug" };
+    let built = target_dir(&workspace.root, env::var_os("CARGO_TARGET_DIR")).join(profile);
+    let installed = install_into(workspace, &built, &opts.prefix, true)?;
+    step(format!(
+        "installed a {profile} build into {}: {}",
+        opts.prefix.display(),
+        installed.join(", ")
+    ));
+    // The binary finds its home from DECKJACK_HOME or ~/.deckjack, not from
+    // where it was installed, so a custom prefix has to be named when it runs.
+    let bin = opts.prefix.join("bin").join("deckjack");
+    let default = deckjack_home(env::var_os("DECKJACK_HOME"), env::var_os("HOME")).ok();
+    let start = if default.as_deref() == Some(opts.prefix.as_path()) {
+        format!("`{}`", bin.display())
+    } else {
+        format!(
+            "`DECKJACK_HOME={} {}`",
+            opts.prefix.display(),
+            bin.display()
+        )
+    };
+    step(format!(
+        "start it with {start}; a server already running keeps its old binary \
+         until it is restarted"
+    ));
+    Ok(())
+}
+
+fn task_dev(workspace: &Workspace, tools: &Tools, opts: &DevOptions) -> Result<(), XtaskError> {
+    let npm = tools.npm()?.to_path_buf();
+    if !workspace.web.join("node_modules").exists() {
+        step("web/node_modules is missing; running npm ci");
+        let mut install = Command::new(&npm);
+        install.arg("ci").current_dir(&workspace.web);
+        exec(install, &workspace.web)?;
+    }
+    // The core embeds web/dist, so it has to exist to compile, even though
+    // Vite serves the shell in development.
+    web_before_cargo(workspace, tools)?;
+    cargo_build(workspace, tools, false)?;
+    let built = target_dir(&workspace.root, env::var_os("CARGO_TARGET_DIR")).join("debug");
+    let installed = install_into(workspace, &built, &opts.home, false)?;
+    step(format!(
+        "dev apps installed into {}: {}",
+        opts.home.display(),
+        installed.join(", ")
+    ));
+
+    let listen = format!("127.0.0.1:{}", opts.port);
+    let mut core_cmd = Command::new(built.join("deckjack"));
+    core_cmd
+        .args(["--debug", "--listen", &listen, "--dir"])
+        .arg(&opts.home)
+        .env("DECKJACK_HOME", &opts.home)
+        .current_dir(&opts.home);
+    let mut core = core_cmd.spawn().map_err(|source| XtaskError::Spawn {
+        command: show_command(&core_cmd),
+        source,
+    })?;
+
+    let mut vite_cmd = Command::new(&npm);
+    vite_cmd
+        .args(["run", "dev"])
+        .env("DECKJACK_CORE", format!("http://{listen}"))
+        .current_dir(&workspace.web);
+    let mut vite = match vite_cmd.spawn() {
+        Ok(child) => child,
+        Err(source) => {
+            stop(&mut core);
+            return Err(XtaskError::Spawn {
+                command: show_command(&vite_cmd),
+                source,
+            });
+        }
+    };
+
+    step(format!(
+        "dev running: shell at http://localhost:5273 (sign in with the code the \
+         core printed), core at http://{listen}, debug session cookie in {}. \
+         Ctrl+C stops both.",
+        opts.home.join("debug-session.cookie").display()
+    ));
+
+    // Whichever exits first takes the other down with it: half a dev setup
+    // is a shell that cannot reach its core, or a core nothing is viewing.
+    loop {
+        if let Ok(Some(status)) = core.try_wait() {
+            step(format!(
+                "the core exited ({}); stopping Vite",
+                describe_status(&status)
+            ));
+            stop(&mut vite);
+            return Ok(());
+        }
+        if let Ok(Some(status)) = vite.try_wait() {
+            step(format!(
+                "Vite exited ({}); stopping the core",
+                describe_status(&status)
+            ));
+            stop(&mut core);
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// SIGTERM, then a few seconds' grace, then SIGKILL. TERM first because the
+/// core releases its lock and checkpoints its database on a clean shutdown;
+/// a kill leaves the next start to recover from an unclean one.
+fn stop(child: &mut std::process::Child) {
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    for _ in 0..50 {
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn the_install_directory_is_deckjack_home_then_dot_deckjack() {
+        assert_eq!(
+            deckjack_home(Some("/opt/dj".into()), Some("/home/u".into())).unwrap(),
+            PathBuf::from("/opt/dj")
+        );
+        assert_eq!(
+            deckjack_home(None, Some("/home/u".into())).unwrap(),
+            PathBuf::from("/home/u/.deckjack")
+        );
+        // Set but empty is unset, not "the current directory".
+        assert_eq!(
+            deckjack_home(Some("".into()), Some("/home/u".into())).unwrap(),
+            PathBuf::from("/home/u/.deckjack")
+        );
+        assert!(matches!(deckjack_home(None, None), Err(XtaskError::NoHome)));
+    }
+
+    #[test]
+    fn install_is_a_release_into_the_default_home_unless_told_otherwise() {
+        let home = || Some(OsString::from("/home/u"));
+        assert_eq!(
+            InstallOptions::parse(&[], None, home()).unwrap(),
+            InstallOptions {
+                release: true,
+                prefix: "/home/u/.deckjack".into()
+            }
+        );
+        assert_eq!(
+            InstallOptions::parse(&s(&["--debug", "--prefix", "/tmp/x"]), None, home()).unwrap(),
+            InstallOptions {
+                release: false,
+                prefix: "/tmp/x".into()
+            }
+        );
+        assert!(matches!(
+            InstallOptions::parse(&s(&["--prefix"]), None, home()),
+            Err(XtaskError::MissingValue { .. })
+        ));
+        assert!(matches!(
+            InstallOptions::parse(&s(&["--relase"]), None, home()),
+            Err(XtaskError::UnknownOption { .. })
+        ));
+    }
+
+    #[test]
+    fn dev_never_defaults_to_the_real_install() {
+        // DECKJACK_HOME is the real install; dev takes no notice of it.
+        let opts = DevOptions::parse(&[], Some("/home/u".into())).unwrap();
+        assert_eq!(
+            opts,
+            DevOptions {
+                port: 8777,
+                home: "/home/u/.deckjack-dev".into()
+            }
+        );
+        assert_ne!(opts.home, PathBuf::from("/home/u/.deckjack"));
+        let opts = DevOptions::parse(&s(&["--port", "9000", "--home", "/tmp/d"]), None).unwrap();
+        assert_eq!(
+            opts,
+            DevOptions {
+                port: 9000,
+                home: "/tmp/d".into()
+            }
+        );
+        assert!(matches!(
+            DevOptions::parse(&s(&["--port", "x"]), Some("/h".into())),
+            Err(XtaskError::BadPort { .. })
+        ));
+    }
+
+    #[test]
+    fn the_dev_port_matches_the_vite_proxy_default() {
+        let vite =
+            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../web/vite.config.ts"))
+                .unwrap();
+        assert!(
+            vite.contains(&format!("http://127.0.0.1:{DEV_PORT}")),
+            "web/vite.config.ts no longer proxies to the dev core's port {DEV_PORT}"
+        );
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("xtask-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn apps_are_the_crates_with_a_manifest_named_by_the_manifest() {
+        let root = scratch("apps");
+        for (dir, manifest) in [
+            ("deckjack-notes", Some("notes")),
+            // The directory and the app's name part: the manifest decides.
+            ("deckjack-files", Some("filer")),
+            ("deckjack-core", None),
+            ("deckjack-protocol", None),
+            ("other", Some("other")),
+        ] {
+            fs::create_dir_all(root.join("crates").join(dir)).unwrap();
+            if let Some(name) = manifest {
+                fs::write(
+                    root.join("crates").join(dir).join("app.toml"),
+                    format!("# an app\n[app]\nname = \"{name}\" # its name\nversion = \"1\"\n"),
+                )
+                .unwrap();
+            }
+        }
+        let found = find_apps(&root).unwrap();
+        let names: Vec<&str> = found.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["filer", "notes"]);
+        assert_eq!(found[0].dir, root.join("crates").join("deckjack-files"));
+        // And the real repository's set, so a new app is noticed here.
+        let real = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let names: Vec<String> = find_apps(&real)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        assert_eq!(names, vec!["filer", "notes", "scribe", "tasks"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_app_name_is_read_from_the_app_table_only() {
+        assert_eq!(
+            manifest_app_name("[package]\nname = \"x\"\n[app]\nname = \"y\"\n"),
+            Some("y".to_string())
+        );
+        assert_eq!(manifest_app_name("[app]\nversion = \"1\"\n"), None);
+        assert_eq!(manifest_app_name("[app]\nnamespace = \"z\"\n"), None);
+    }
+
+    #[test]
+    fn the_target_directory_follows_cargo_target_dir() {
+        let root = Path::new("/repo");
+        assert_eq!(target_dir(root, None), PathBuf::from("/repo/target"));
+        assert_eq!(target_dir(root, Some("/t".into())), PathBuf::from("/t"));
+        assert_eq!(
+            target_dir(root, Some("out".into())),
+            PathBuf::from("/repo/out")
+        );
+    }
+
+    /// An executable shell script at `to`. Written by `install(1)` in its
+    /// own process, so no descriptor open for writing can leak into a fork
+    /// made by another test thread and make the exec fail "text file busy".
+    fn script(to: &Path, body: &str) {
+        let src = to.with_extension("src");
+        fs::write(&src, body).unwrap();
+        let status = Command::new("install")
+            .args(["-m", "755"])
+            .arg(&src)
+            .arg(to)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn apps_are_installed_by_the_freshly_built_core_into_the_prefix() {
+        // `make install` and `xtask dev` hand each app to the core's own
+        // `deckjack install`. A stand-in core records how it was called, which
+        // is the whole contract: the crate directory holding app.toml, the
+        // built binary via --binary, and the prefix as DECKJACK_HOME so the
+        // apps land beside the core being installed rather than in ~/.deckjack.
+        let dir = scratch("via-core");
+        let root = dir.join("ws");
+        fs::create_dir_all(root.join("crates/deckjack-clock")).unwrap();
+        fs::write(
+            root.join("crates/deckjack-clock/app.toml"),
+            "[app]\nname = \"clock\"\n",
+        )
+        .unwrap();
+        // A crate without a manifest is not an app.
+        fs::create_dir_all(root.join("crates/deckjack-core")).unwrap();
+        let built = dir.join("built");
+        fs::create_dir_all(&built).unwrap();
+        fs::write(built.join("deckjack-clock"), "").unwrap();
+        let log = dir.join("calls.log");
+        script(
+            &built.join("deckjack"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" \"home=$DECKJACK_HOME\" >> '{}'\n",
+                log.display()
+            ),
+        );
+        let prefix = dir.join("prefix");
+
+        let installed =
+            install_into(&Workspace::new(root.clone()), &built, &prefix, false).unwrap();
+        assert_eq!(installed, s(&["apps/clock/"]));
+        let calls = fs::read_to_string(&log).unwrap();
+        let expected = [
+            "install".to_string(),
+            root.join("crates/deckjack-clock").display().to_string(),
+            "--binary".to_string(),
+            built.join("deckjack-clock").display().to_string(),
+            format!("home={}", prefix.display()),
+        ];
+        assert_eq!(calls.lines().collect::<Vec<_>>(), expected);
+
+        // A core that refuses the app fails the whole install, loudly.
+        script(&built.join("deckjack"), "#!/bin/sh\nexit 3\n");
+        assert!(matches!(
+            install_into(&Workspace::new(root), &built, &prefix, false),
+            Err(XtaskError::Tool { .. })
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn installing_removes_an_app_left_under_its_old_name() {
+        // Files became `filer` and Editor became `scribe` when their old
+        // names were reserved for the core's namespaces. A node that had
+        // the old ones installed would otherwise keep `apps/files/` and
+        // `apps/editor/` as manifests that never validate again.
+        let dir = scratch("renamed");
+        let root = dir.join("ws");
+        fs::create_dir_all(root.join("crates/deckjack-files")).unwrap();
+        fs::write(
+            root.join("crates/deckjack-files/app.toml"),
+            "[app]\nname = \"filer\"\n",
+        )
+        .unwrap();
+        let built = dir.join("built");
+        fs::create_dir_all(&built).unwrap();
+        fs::write(built.join("deckjack-filer"), "").unwrap();
+        let log = dir.join("calls.log");
+        script(
+            &built.join("deckjack"),
+            &format!(
+                "#!/bin/sh\nprintf '%s ' \"$@\" >> '{}'\necho >> '{}'\n",
+                log.display(),
+                log.display()
+            ),
+        );
+        let prefix = dir.join("prefix");
+        fs::create_dir_all(prefix.join("apps/files")).unwrap();
+        fs::write(
+            prefix.join("apps/files/app.toml"),
+            "[app]\nname = \"files\"\n",
+        )
+        .unwrap();
+
+        let installed =
+            install_into(&Workspace::new(root.clone()), &built, &prefix, false).unwrap();
+        let calls = fs::read_to_string(&log).unwrap();
+        let calls: Vec<&str> = calls.lines().map(str::trim_end).collect();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[0].starts_with("install "), "{calls:?}");
+        assert_eq!(calls[1], "uninstall files", "{calls:?}");
+        assert!(
+            installed.iter().any(|i| i.contains("apps/files/")),
+            "{installed:?}"
+        );
+
+        // The control: with nothing under the old name, nothing is removed,
+        // and `editor` (never installed here) is not asked about.
+        fs::remove_file(&log).unwrap();
+        fs::remove_dir_all(prefix.join("apps/files")).unwrap();
+        install_into(&Workspace::new(root), &built, &prefix, false).unwrap();
+        let calls = fs::read_to_string(&log).unwrap();
+        assert_eq!(calls.lines().count(), 1, "{calls}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn installing_replaces_a_binary_that_is_running() {
+        // A running executable cannot be opened for writing on Linux, so a
+        // copy in place would fail with "text file busy". Run one and
+        // replace it while it runs.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("busy");
+        let target = dir.join("prog");
+        // Copied by `install(1)` in its own process, as `script` does: a
+        // descriptor this thread held open for writing could be inherited by
+        // another test's fork and make the spawn below fail "text file busy".
+        let status = Command::new("install")
+            .args(["-m", "755", "/bin/sleep"])
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut running = Command::new(&target).arg("5").spawn().unwrap();
+
+        let new = dir.join("new");
+        fs::write(&new, b"#!/bin/sh\necho new\n").unwrap();
+        install_file(&new, &target, 0o755).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"#!/bin/sh\necho new\n");
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        assert!(
+            running.try_wait().unwrap().is_none(),
+            "the running program was disturbed"
+        );
+        let _ = running.kill();
+        let _ = running.wait();
+        // No temporary file is left beside it.
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(!names.iter().any(|n| n.contains("xtask-new")), "{names:?}");
+        let _ = fs::remove_dir_all(dir);
     }
 }

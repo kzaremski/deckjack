@@ -141,6 +141,11 @@ pub enum Issuer {
     Cli,
     /// Deckjack itself: a reminder firing, a sync service, lockdown.
     System,
+    /// An installed app's window, calling through the shell on the
+    /// operator's browser. Recorded as `app-ui:<app>` so a timeline can tell
+    /// an app's frame from the shell (docs/APP-UI-ISOLATION.md §4.6); which
+    /// browser is in the row's session tag, as for the operator.
+    AppUi { app: String },
 }
 
 impl Issuer {
@@ -174,6 +179,7 @@ impl Issuer {
             } => format!("{session} via window {w}"),
             Issuer::Cli => "the CLI".to_string(),
             Issuer::System => "Deckjack".to_string(),
+            Issuer::AppUi { app } => format!("app-ui:{app}"),
         }
     }
 
@@ -183,12 +189,14 @@ impl Issuer {
             Issuer::Agent { .. } => "agent",
             Issuer::Cli => "cli",
             Issuer::System => "system",
+            Issuer::AppUi { .. } => "app_ui",
         }
     }
 
     fn name(&self) -> Option<&str> {
         match self {
             Issuer::Agent { session, .. } => Some(session.as_str()),
+            Issuer::AppUi { app } => Some(app.as_str()),
             _ => None,
         }
     }
@@ -500,9 +508,15 @@ pub struct Entry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IssuerFilter {
     Operator,
-    Agent { session: Option<String> },
+    Agent {
+        session: Option<String>,
+    },
     Cli,
     System,
+    /// App windows: one app's when `app` is set, every app's otherwise.
+    AppUi {
+        app: Option<String>,
+    },
 }
 
 impl IssuerFilter {
@@ -523,12 +537,14 @@ impl IssuerFilter {
             IssuerFilter::Agent { .. } => "agent",
             IssuerFilter::Cli => "cli",
             IssuerFilter::System => "system",
+            IssuerFilter::AppUi { .. } => "app_ui",
         }
     }
 
     fn name(&self) -> Option<&str> {
         match self {
             IssuerFilter::Agent { session } => session.as_deref(),
+            IssuerFilter::AppUi { app } => app.as_deref(),
             _ => None,
         }
     }
@@ -965,6 +981,12 @@ impl RawRow {
                     .clone()
                     .ok_or_else(|| bad("issuer_name", "NULL".to_string()))?,
                 window: self.issuer_window.clone(),
+            },
+            "app_ui" => Issuer::AppUi {
+                app: self
+                    .issuer_name
+                    .clone()
+                    .ok_or_else(|| bad("issuer_name", "NULL".to_string()))?,
             },
             other => return Err(bad("issuer_kind", other.to_string())),
         };

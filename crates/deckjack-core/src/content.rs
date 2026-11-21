@@ -57,13 +57,18 @@ use serde::Deserialize;
 /// the working directory.
 pub const MOUNT: &str = "/content";
 
-/// How much of a file one response will buffer.
+/// How much of a file is read per piece of a streamed body.
 ///
-/// Not a limit on what can be *served* — a browser asks for a window at a
-/// time and this is the window. It exists so one request cannot ask the node
-/// to hold a 4 GB file in memory, which is the failure the old
-/// `files.read` path had no way to avoid.
-const CHUNK: u64 = 8 * 1024 * 1024;
+/// Not a limit on what can be *served*. The body is streamed in pieces this
+/// size, so one request for a 4 GB file holds a quarter of a megabyte at a
+/// time and the socket's back-pressure decides how fast the rest is read.
+///
+/// It used to be a cap on the whole answer: the route read one 8 MiB window
+/// and sent it with a 200, or with a `Content-Range` that still claimed the
+/// whole span. So any file larger than the window arrived truncated while
+/// looking complete, and a `<video>`'s opening `Range: bytes=0-` got a header
+/// that disagreed with its own body.
+const PIECE: u64 = 256 * 1024;
 
 #[derive(Clone)]
 struct Ctx {
@@ -142,10 +147,11 @@ async fn serve(State(ctx): State<Ctx>, Query(ask): Query<Ask>, headers: HeaderMa
 
     let real = resolved.real_path().to_path_buf();
     // `std::fs` on a blocking task rather than `tokio::fs`: this workspace
-    // does not enable tokio's `fs` feature, and a stat plus one bounded read
-    // is exactly the shape `spawn_blocking` is for.
-    let meta = match blocking(&real, |p| std::fs::metadata(p)).await {
-        Ok(m) => m,
+    // does not enable tokio's `fs` feature. Opened first and judged by the
+    // open descriptor, so what is checked is what is served: a stat followed
+    // by an open by name could be raced by a FIFO swapped in between.
+    let (file, meta) = match blocking(&real, open_examined).await {
+        Ok(opened) => opened,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return refuse(StatusCode::NOT_FOUND, "there is no file at that address");
         }
@@ -155,6 +161,14 @@ async fn serve(State(ctx): State<Ctx>, Query(ask): Query<Ask>, headers: HeaderMa
         return refuse(
             StatusCode::BAD_REQUEST,
             "that is a directory, so there is nothing to show; list it instead",
+        );
+    }
+    // A FIFO, socket or device has no length and no end. Its open did not
+    // wait (see `open_examined`), and nothing is ever read from it.
+    if !meta.is_file() {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "that is not a regular file, so there is nothing to show",
         );
     }
 
@@ -205,8 +219,12 @@ async fn serve(State(ctx): State<Ctx>, Query(ask): Query<Ask>, headers: HeaderMa
     let (start, end) = range.unwrap_or((0, size.saturating_sub(1)));
     let length = if size == 0 { 0 } else { end - start + 1 };
 
-    let bytes = match blocking(&real, move |p| read_window_sync(p, start, length)).await {
-        Ok(b) => b,
+    // Opened and positioned before any header is written, so a file that
+    // vanished or cannot be read is a status code rather than a body that
+    // stops after the headers promised it.
+    let opened = match tokio::task::spawn_blocking(move || seek_to(file, start)).await {
+        Ok(Ok(f)) => f,
+        Ok(Err(e)) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
 
@@ -223,7 +241,7 @@ async fn serve(State(ctx): State<Ctx>, Query(ask): Query<Ask>, headers: HeaderMa
             StatusCode::OK
         })
         .header(header::CONTENT_TYPE, mime)
-        .header(header::CONTENT_LENGTH, bytes.len())
+        .header(header::CONTENT_LENGTH, length)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::ETAG, etag)
         .header(header::CACHE_CONTROL, "private, no-cache")
@@ -238,12 +256,14 @@ async fn serve(State(ctx): State<Ctx>, Query(ask): Query<Ask>, headers: HeaderMa
         response = response.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
     }
 
-    response.body(Body::from(bytes)).unwrap_or_else(|_| {
-        refuse(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "the response could not be built",
-        )
-    })
+    response
+        .body(stream_body(opened, length))
+        .unwrap_or_else(|_| {
+            refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the response could not be built",
+            )
+        })
 }
 
 fn etag_for(meta: &std::fs::Metadata, size: u64) -> String {
@@ -310,14 +330,89 @@ where
     }
 }
 
-fn read_window_sync(path: &std::path::Path, start: u64, length: u64) -> std::io::Result<Vec<u8>> {
-    use std::io::{Read as _, Seek as _};
+fn seek_to(mut file: std::fs::File, start: u64) -> std::io::Result<std::fs::File> {
+    use std::io::Seek as _;
 
-    let mut file = std::fs::File::open(path)?;
     if start > 0 {
         file.seek(std::io::SeekFrom::Start(start))?;
     }
-    let want = length.min(CHUNK) as usize;
+    Ok(file)
+}
+
+/// Opens `path` for reading without ever waiting on it, and says what it is.
+///
+/// A plain `open(2)` of a FIFO for reading blocks until a writer appears, on a
+/// thread nothing can cancel. `O_NONBLOCK` makes that open return at once;
+/// `O_NOCTTY` keeps a terminal device from becoming the core's controlling
+/// terminal. The type then comes from `fstat` on the descriptor that was
+/// opened, never from a separate stat by name, so a file swapped for a FIFO
+/// between the two cannot slip through.
+///
+/// The caller decides what to refuse. For a regular file `O_NONBLOCK` is
+/// cleared before it is returned, so reads behave exactly as they would from
+/// `File::open`.
+pub(crate) fn open_examined(
+    path: &std::path::Path,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::io::AsRawFd as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if meta.is_file() {
+        let fd = file.as_raw_fd();
+        // SAFETY: `fd` is owned by `file` for the whole call; F_GETFL and
+        // F_SETFL only read and set its status flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        // SAFETY: as above.
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok((file, meta))
+}
+
+/// Exactly `length` bytes from where `file` is positioned, a [`PIECE`] at a
+/// time, each read on the blocking pool.
+///
+/// A file that shrinks while it is being sent ends the stream with an error
+/// rather than with fewer bytes than `Content-Length` promised: hyper then
+/// drops the connection, which a browser reports as a failed load. Quietly
+/// finishing short would hand a player a body it believes is complete.
+fn stream_body(file: std::fs::File, length: u64) -> Body {
+    if length == 0 {
+        return Body::empty();
+    }
+    let pieces =
+        futures_util::stream::try_unfold((file, length), |(mut file, remaining)| async move {
+            if remaining == 0 {
+                return Ok(None);
+            }
+            let want = remaining.min(PIECE) as usize;
+            let (file, piece) = tokio::task::spawn_blocking(move || {
+                let piece = read_piece(&mut file, want)?;
+                Ok::<_, std::io::Error>((file, piece))
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            if piece.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the file got shorter while it was being sent",
+                ));
+            }
+            let left = remaining - piece.len() as u64;
+            Ok(Some((piece, (file, left))))
+        });
+    Body::from_stream(pieces)
+}
+
+fn read_piece(file: &mut std::fs::File, want: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
     let mut buf = vec![0u8; want];
     let mut filled = 0;
     while filled < want {

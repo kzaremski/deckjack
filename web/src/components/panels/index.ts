@@ -1,6 +1,6 @@
 import type { Component } from "vue";
 
-import { isInstalled, type AppId } from "../../stores/apps.ts";
+import type { AppId } from "../../stores/apps.ts";
 import AppFramePanel from "./AppFramePanel.vue";
 import PlaceholderPanel from "./PlaceholderPanel.vue";
 import TerminalPanel from "./TerminalPanel.vue";
@@ -27,13 +27,13 @@ export const panels: Partial<Record<AppId, Component>> = {
  * the placeholder, which is what an app named in the built-in table but not
  * installed honestly is.
  *
- * `appId` and not `app`: the first is what the server called it, and an
- * installed app is not one of the shell's own `AppId`s.
+ * `isInstalled` is the shell's app table's answer, passed in rather than
+ * imported, because the table belongs to one shell and not to the module.
  */
-export function panelFor(app: AppId, appId?: string): Component {
+export function panelFor(app: AppId, isInstalled: (id: AppId) => boolean): Component {
   const builtin = panels[app];
   if (builtin) return builtin;
-  if (appId && isInstalled(appId)) return AppFramePanel;
+  if (isInstalled(app)) return AppFramePanel;
   return PlaceholderPanel;
 }
 

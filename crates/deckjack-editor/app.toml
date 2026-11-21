@@ -1,0 +1,45 @@
+# The Editor app: text and code in the working directory.
+#
+# Like Files, it declares no commands, and for the same reason: the file API
+# is the core's. The editor's own commands --
+# `editor.open`, `editor.save`, `editor.revert`, `editor.find` -- are
+# registered by the core beside `files.*`, on the same namespace, because an
+# app process cannot be granted the working directory as a whole (the
+# manifest validator refuses it: Landlock would hand over `.deckjack/` with
+# it) and an app calling `files.*` over the bus would need an agent grant
+# that nothing issues. See `crates/deckjack-core/src/editor.rs`.
+#
+# So this app is its UI: CodeMirror 6, vendored as one ES module in
+# `ui/vendor/` so the binary serves it offline with no build step at runtime.
+# Its process is as unprivileged as a process here can be; what its window
+# may call is the [ui] list below, which the operator approves once.
+#
+# Its name is `scribe`, not `editor`, because `editor` is the core's own
+# namespace (the commands above), and no app may take a core namespace as its
+# name (docs/APP-UI-ISOLATION.md §4.6). The title the operator sees is still
+# "Editor". The crate directory keeps its old name; the binary follows the
+# manifest (`deckjack-scribe`), because that is what the core runs.
+
+[app]
+name = "scribe"
+version = "0.1.0"
+protocol = 1
+title = "Editor"
+lifecycle = "on-demand"
+# The toolbar wraps to two rows below this and the gutter keeps its tap
+# width; under it the text column is too narrow to read code in.
+min_width = 320
+tag = "Ed"
+summary = "Text and code in the working directory"
+default_width = 760
+default_height = 520
+
+# What this app's window calls: all of it the core's, so every id is exact.
+[ui]
+invoke = [
+  "editor.open",
+  "editor.save",
+  "editor.revert",
+  "files.stat",
+  "files.list",
+]

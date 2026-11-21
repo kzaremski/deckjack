@@ -197,7 +197,7 @@ impl AuthState {
         if let Some(r) = self.refusal(ip) {
             return Err(r);
         }
-        self.prune(now.wall);
+        self.expire(now.wall, events);
         self.evict_to_fit(RevokeReason::SessionsFull, events);
         let session = Session::new(ip, now.wall, now.wall + self.limits.session_max);
         self.sessions.insert(new_session.hash(), session.clone());
@@ -324,7 +324,7 @@ impl AuthState {
         if ok {
             self.code = CodeState::Consumed;
             self.failures_by_ip.remove(&ip);
-            self.prune(now.wall);
+            self.expire(now.wall, events);
             let revoked = self.evict_to_fit(RevokeReason::SessionsFull, events);
             self.sessions.insert(
                 new_session.hash(),
@@ -441,9 +441,33 @@ impl AuthState {
         now.mono.saturating_duration_since(self.last_activity)
     }
 
-    /// Drop expired sessions.
-    pub fn prune(&mut self, now: SystemTime) {
-        self.sessions.retain(|_, s| now < s.expires);
+    /// Drop expired sessions, announcing each as [`Event::SessionRevoked`]
+    /// with [`RevokeReason::Expired`]. Returns how many went.
+    ///
+    /// Announced for the reason `evict_to_fit`'s are: the caller owes an
+    /// expired session a deleted row and reaped ptys, and `http::Ctx::apply`
+    /// does both for exactly this event. Dropping them in silence left every
+    /// shell an expired session opened running as the host user, owned by a
+    /// session nobody could present again. Run by both sign-in paths and on
+    /// a timer by `wiring::spawn_session_expiry`, so a node nobody signs in
+    /// to still reaps on time.
+    pub fn expire(&mut self, now: SystemTime, events: &mut Vec<Event>) -> usize {
+        let expired: Vec<SessionHash> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| now >= s.expires)
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in &expired {
+            if let Some(s) = self.sessions.remove(hash) {
+                events.push(Event::SessionRevoked {
+                    hash: *hash,
+                    ip: s.ip,
+                    reason: RevokeReason::Expired,
+                });
+            }
+        }
+        expired.len()
     }
 }
 
@@ -1030,6 +1054,102 @@ mod tests {
         assert_eq!(
             login(&mut s, v6, CODE, 1, t0()),
             LoginOutcome::Refused(Refusal::IpBlocked)
+        );
+    }
+
+    // -- expiry ---------------------------------------------------------------
+
+    #[test]
+    fn expiry_announces_each_expired_session_and_keeps_the_live_ones() {
+        // An expired session used to vanish from the map in silence, so the
+        // caller never deleted its row or reaped its ptys: its shells ran on
+        // as the host user with no session left that could reach them.
+        let mut s = AuthState::new(
+            Limits {
+                max_sessions: 4,
+                ..limits()
+            },
+            Code::parse(CODE).unwrap(),
+            t0(),
+        );
+        let old = sid(1);
+        s.admit(ip(2), &old, t0(), &mut Vec::new()).unwrap();
+        let fresh = sid(2);
+        s.admit(ip(3), &fresh, later(t0(), 3600), &mut Vec::new())
+            .unwrap();
+
+        let past_the_first = later(t0(), 12 * 3600 + 1).wall;
+        let mut ev = Vec::new();
+        assert_eq!(s.expire(past_the_first, &mut ev), 1);
+
+        assert_eq!(
+            ev,
+            vec![Event::SessionRevoked {
+                hash: old.hash(),
+                ip: ip(2),
+                reason: RevokeReason::Expired,
+            }]
+        );
+        assert!(s.session(&old).is_none());
+        assert!(s.session(&fresh).is_some(), "a live session was expired");
+
+        let mut again = Vec::new();
+        assert_eq!(s.expire(past_the_first, &mut again), 0);
+        assert!(again.is_empty(), "an expiry was announced twice");
+    }
+
+    #[test]
+    fn a_sign_in_that_finds_an_expired_session_announces_it() {
+        // The sign-in paths drop expired sessions before counting toward the
+        // cap. They have to say which, or the next operator signs in to a
+        // node still running the last session's shells.
+        let mut s = AuthState::new(
+            Limits {
+                max_sessions: 4,
+                ..limits()
+            },
+            Code::parse(CODE).unwrap(),
+            t0(),
+        );
+        let old = sid(1);
+        s.admit(ip(2), &old, t0(), &mut Vec::new()).unwrap();
+
+        let mut by_passkey = Vec::new();
+        s.admit(ip(3), &sid(2), later(t0(), 12 * 3600 + 1), &mut by_passkey)
+            .unwrap();
+        assert_eq!(
+            by_passkey,
+            vec![Event::SessionRevoked {
+                hash: old.hash(),
+                ip: ip(2),
+                reason: RevokeReason::Expired,
+            }]
+        );
+
+        let mut s = AuthState::new(
+            Limits {
+                max_sessions: 4,
+                ..limits()
+            },
+            Code::parse(CODE).unwrap(),
+            t0(),
+        );
+        s.admit(ip(2), &old, t0(), &mut Vec::new()).unwrap();
+        let mut by_code = Vec::new();
+        s.login(
+            ip(3),
+            CODE,
+            sid(2),
+            later(t0(), 12 * 3600 + 1),
+            &mut by_code,
+        );
+        assert!(
+            by_code.contains(&Event::SessionRevoked {
+                hash: old.hash(),
+                ip: ip(2),
+                reason: RevokeReason::Expired,
+            }),
+            "{by_code:?}"
         );
     }
 }

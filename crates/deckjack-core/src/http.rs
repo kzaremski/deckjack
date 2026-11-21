@@ -10,9 +10,10 @@
 //! Caddy always sat in front and overwrote whatever the client sent.
 //! Deckjack serves directly here, so the address comes from the socket
 //! instead. That matters: it is what the lockout counts against, and a
-//! header a client can set is not an identity. No proxy header is trusted,
-//! which means running this behind a reverse proxy would attribute every
-//! request to the proxy until that is made explicit.
+//! header a client can set is not an identity. Proxy headers are believed
+//! from exactly two places: a request that arrived on the proxy's Unix
+//! socket ([`crate::proxy`], the one `tailscale serve unix:/...` talks to),
+//! and a TCP peer listed in `trusted_proxies`.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -240,7 +241,7 @@ impl Ctx {
     /// client, and taking the leftmost — the usual mistake — would let anyone
     /// choose their own identity and so dodge the per-address lockout.
     pub fn client_ip(&self, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
-        if !self.trusts(peer.ip()) {
+        if !self.trusts(peer) {
             return peer.ip();
         }
         headers
@@ -258,7 +259,7 @@ impl Ctx {
     /// say so; otherwise it is whatever we are actually serving, which here
     /// is plain HTTP.
     pub fn is_https(&self, peer: SocketAddr, headers: &HeaderMap) -> bool {
-        if !self.trusts(peer.ip()) {
+        if !self.trusts(peer) {
             return false;
         }
         headers
@@ -267,8 +268,25 @@ impl Ctx {
             .is_some_and(|v| v.eq_ignore_ascii_case("https"))
     }
 
-    fn trusts(&self, ip: IpAddr) -> bool {
-        self.trusted_proxies.contains(&ip)
+    /// A request off the proxy socket is marked with
+    /// [`crate::proxy::SOCKET_PEER`], an address no TCP connection can have,
+    /// so it is trusted without any address being listed. Everything else is
+    /// trusted only by address.
+    fn trusts(&self, peer: SocketAddr) -> bool {
+        peer == crate::proxy::SOCKET_PEER || self.trusted_proxies.contains(&peer.ip())
+    }
+
+    /// The session cookie this request presented, read under the name that
+    /// goes with its scheme: `__Host-dj_session` over HTTPS, `dj_session`
+    /// otherwise. See [`session::from_cookie_headers`].
+    pub fn session_cookie(&self, peer: SocketAddr, headers: &HeaderMap) -> Option<SessionId> {
+        session::from_cookie_headers(
+            self.is_https(peer, headers),
+            headers
+                .get_all(header::COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok()),
+        )
     }
 
     /// Transitions are small and leave the state consistent even if a holder
@@ -293,6 +311,7 @@ fn page(status: StatusCode, body: String) -> Response {
         [
             (header::CACHE_CONTROL, "no-store"),
             (header::CONTENT_SECURITY_POLICY, html::CSP),
+            (header::X_FRAME_OPTIONS, "DENY"),
         ],
         Html(body),
     )
@@ -317,15 +336,6 @@ fn origin_ok(headers: &HeaderMap) -> bool {
     authority.is_some_and(|a| a.eq_ignore_ascii_case(host))
 }
 
-fn cookie_session(headers: &HeaderMap) -> Option<SessionId> {
-    session::from_cookie_headers(
-        headers
-            .get_all(header::COOKIE)
-            .iter()
-            .filter_map(|v| v.to_str().ok()),
-    )
-}
-
 fn redirect_to_login() -> Response {
     (
         StatusCode::SEE_OTHER,
@@ -343,7 +353,7 @@ async fn index(
     headers: HeaderMap,
 ) -> Response {
     let ip = ctx.client_ip(peer, &headers);
-    let id = cookie_session(&headers);
+    let id = ctx.session_cookie(peer, &headers);
     let signed_in = {
         let mut st = ctx.state();
         matches!(
@@ -371,7 +381,7 @@ async fn index(
 /// already say out loud, and `..` is refused so the list cannot be walked out
 /// of. The shell document, its JavaScript and its CSS stay behind the gate,
 /// which is the property this module's doc describes.
-fn is_public_install_asset(path: &str) -> bool {
+pub(crate) fn is_public_install_asset(path: &str) -> bool {
     if path.contains("..") {
         return false;
     }
@@ -392,7 +402,7 @@ async fn shell_asset(
         return crate::shell::serve(uri.path());
     }
     let ip = ctx.client_ip(peer, &headers);
-    let id = cookie_session(&headers);
+    let id = ctx.session_cookie(peer, &headers);
     let signed_in = {
         let mut st = ctx.state();
         matches!(
@@ -424,7 +434,7 @@ pub async fn require_session(
     next: axum::middleware::Next,
 ) -> Response {
     let ip = ctx.client_ip(peer, request.headers());
-    let id = cookie_session(request.headers());
+    let id = ctx.session_cookie(peer, request.headers());
     let signed_in = {
         let mut st = ctx.state();
         matches!(
@@ -556,7 +566,7 @@ async fn logout(
     if !origin_ok(&headers) {
         return (StatusCode::FORBIDDEN, "cross-origin request refused\n").into_response();
     }
-    if let Some(id) = cookie_session(&headers)
+    if let Some(id) = ctx.session_cookie(peer, &headers)
         && ctx.state().logout(&id)
     {
         ctx.forget(&id.hash());

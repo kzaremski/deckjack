@@ -1721,6 +1721,104 @@ fn a_progress_fraction_outside_zero_to_one_is_clamped_rather_than_reported() {
 }
 
 // ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+
+/// Set when the parked command's future is dropped, which is how a backend
+/// learns it was cancelled.
+struct DroppedFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DroppedFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A command that waits forever, the way `terminal.read` does on a quiet
+/// shell.
+struct Parked(Arc<std::sync::atomic::AtomicBool>);
+
+impl Command for Parked {
+    const ID: &'static str = "probe.parked";
+    const TITLE: &'static str = "Probe parked";
+    const RISK: RiskLevel = RiskLevel::ReadOnly;
+
+    type Params = HashMap<String, String>;
+    type Output = String;
+
+    async fn run(&self, _p: HashMap<String, String>, _cx: Context) -> Result<String, CommandError> {
+        let _guard = DroppedFlag(Arc::clone(&self.0));
+        std::future::pending::<()>().await;
+        unreachable!("pending never resolves")
+    }
+}
+
+/// A cancelled dispatch stops the work, says it was cancelled, and closes its
+/// audit row.
+///
+/// The cancel is honored by dropping the command's future, so the
+/// completion — and the journal row it writes — has to come from the bus,
+/// not from the command. Without it the log shows a `Ran` that nothing ever
+/// finished, which reads as a command still running.
+#[test]
+fn a_cancelled_dispatch_drops_the_work_and_journals_the_cancellation() {
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let registry = Arc::new(Registry::new());
+    registry.register(Parked(Arc::clone(&dropped))).expect("id");
+    let log = Log::new();
+    let bus = Bus::new(Arc::clone(&registry), NodeId::new(NODE), TestEnv::new())
+        .with_journal(Arc::clone(&log) as Arc<dyn Journal>);
+
+    let running = expect_running(
+        bus.dispatch(from("probe.parked", Issuer::operator()))
+            .expect("runs"),
+    );
+    let (_progress, finish) = running.split_until(std::future::ready(()));
+    let done = block_on(finish);
+
+    assert!(
+        matches!(done.outcome, Err(CommandError::Cancelled { .. })),
+        "a cancel is reported as a cancel: {:?}",
+        done.outcome
+    );
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the command's work was not dropped, so it never learned it was cancelled"
+    );
+    assert_eq!(
+        log.decisions().last(),
+        Some(&Decision::Failed),
+        "the dispatch was left open in the journal"
+    );
+    assert!(
+        log.entries()
+            .last()
+            .and_then(|e| e.detail.clone())
+            .is_some_and(|d| d.contains("cancelled")),
+        "the closing row does not say why: {:?}",
+        log.entries().last().map(|e| e.detail.clone())
+    );
+}
+
+/// Work that finishes is never reported as cancelled, even when the cancel
+/// is already there by the time it is first polled.
+#[test]
+fn work_that_completes_is_not_overwritten_by_a_late_cancel() {
+    let h = harness();
+    let running = expect_running(
+        h.bus
+            .dispatch(from("probe.read", Issuer::operator()))
+            .expect("runs"),
+    );
+    let (_progress, finish) = running.split_until(std::future::ready(()));
+    let done = block_on(finish);
+    assert!(
+        done.succeeded(),
+        "a finished command lost its result to a cancel"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The palette
 // ---------------------------------------------------------------------------
 

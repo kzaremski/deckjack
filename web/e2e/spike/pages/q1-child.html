@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Q1 child</title>
+<body>
+  <script>
+    // Every kind of request a frame makes to the parent's origin, each
+    // tagged so the server can say which carried a cookie.
+    const p = new URLSearchParams(location.search).get("p");
+    const A = "{{A}}";
+    const img = new Image();
+    img.src = `${A}/probe/i.gif?tag=${p}-img`;
+    document.body.append(img);
+    const script = document.createElement("script");
+    script.src = `${A}/probe/s.js?tag=${p}-script`;
+    document.head.append(script);
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = `${A}/probe/c.css?tag=${p}-style`;
+    document.head.append(link);
+    fetch(`${A}/probe/f.gif?tag=${p}-fetch-nocors`, { credentials: "include", mode: "no-cors" }).catch(() => {});
+    fetch(`${A}/probe/f.gif?tag=${p}-fetch-cors`, { credentials: "include" }).catch(() => {});
+    // Last: the frame navigates itself.
+    setTimeout(() => {
+      location.href = `${A}/probe/nav.html?tag=${p}-nav`;
+    }, 400);
+  </script>
+</body>

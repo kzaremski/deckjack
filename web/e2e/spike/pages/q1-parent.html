@@ -1,0 +1,10 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Q1: cookies from a sandboxed frame</title>
+<!-- The parent's own subresource: the control that the cookies exist and are
+     sent same-site at all. -->
+<img src="/probe/p.gif?tag=q1-parent-img" alt="" />
+<!-- The shape of APP-UI-ISOLATION §4.1: scripts and forms, no same-origin. -->
+<iframe sandbox="allow-scripts allow-forms" src="/q1-child.html?tag=q1-sbx-doc&p=q1-sbx"></iframe>
+<!-- Control: the same child, not sandboxed. -->
+<iframe src="/q1-child.html?tag=q1-plain-doc&p=q1-plain"></iframe>

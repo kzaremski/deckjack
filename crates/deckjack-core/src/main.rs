@@ -27,16 +27,28 @@ use deckjack_core::wiring::{self, BusDispatch};
 use deckjack_core::ws;
 
 fn main() -> anyhow::Result<()> {
+    // Read before logging starts, because debug mode's one effect on logging
+    // is the default level; the flag is parsed properly below.
+    let debug = std::env::args().skip(1).any(|a| a == "--debug");
+    let default_filter = if debug {
+        deckjack_core::debugmode::LOG_FILTER
+    } else {
+        "deckjack=info,deckjack_core=info"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "deckjack=info,deckjack_core=info".into()),
+                .unwrap_or_else(|_| default_filter.into()),
         )
         .init();
 
     let mut args = std::env::args().skip(1).peekable();
     let mut listen: Option<SocketAddr> = None;
-    let mut working_dir = PathBuf::from(".");
+    // The install directory by default: `~/.deckjack`, or `$DECKJACK_HOME`.
+    // One place for a single-machine setup to live, so plain `deckjack`
+    // serves the same directory every time instead of wherever the shell
+    // happened to be.
+    let mut working_dir = node::install_dir();
     let mut force = false;
 
     // `deckjack unlock` is not a server start, so it is handled before any of
@@ -58,6 +70,25 @@ fn main() -> anyhow::Result<()> {
         return agent(args);
     }
 
+    // `deckjack install`, `uninstall` and `apps` manage the install
+    // directory's apps/ and touch nothing a running server holds: no lock,
+    // no database, and never an approval (see `install.rs`).
+    match args.peek().map(String::as_str) {
+        Some("install") => {
+            args.next();
+            return install_cmd(args);
+        }
+        Some("uninstall") => {
+            args.next();
+            return uninstall_cmd(args);
+        }
+        Some("apps") => {
+            args.next();
+            return apps_cmd(args);
+        }
+        _ => {}
+    }
+
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => {
@@ -66,21 +97,34 @@ fn main() -> anyhow::Result<()> {
             }
             "--dir" => working_dir = args.next().context("--dir needs a path")?.into(),
             "--force" => force = true,
+            // Read above, before logging started.
+            "--debug" => {}
             "-h" | "--help" => {
                 println!(
-                    "deckjack [--listen ADDR] [--dir PATH] [--force]\n\
+                    "deckjack [--listen ADDR] [--dir PATH] [--force] [--debug]\n\
                      deckjack unlock --recovery-code CODE [--dir PATH]\n\
-                     deckjack agent SESSION [--dir PATH]\n\n\
+                     deckjack agent SESSION [--dir PATH]\n\
+                     deckjack install APP_DIR [--binary FILE] [--dir PATH]\n\
+                     deckjack uninstall NAME\n\
+                     deckjack apps\n\n\
                      --listen  address to serve on, overriding the config file\n\
-                     --dir     working directory (default .)\n\
-                     --force   take the lock from another node\n\n\
+                     --dir     working directory (default ~/.deckjack, or $DECKJACK_HOME)\n\
+                     --force   take the lock from another node\n\
+                     --debug   for tools, not people: loopback only, verbose logs, and a\n\
+                     \x20         session written to <install>/debug-session.cookie so a\n\
+                     \x20         script can call the node without the sign-in code\n\n\
                      unlock    end a lockdown on the server running in this directory;\n\
                      \x20         needs a recovery code, and reads the host token from\n\
                      \x20         .deckjack/unlock.token, which only the host can\n\
                      agent     speak MCP to the node serving this directory, as SESSION.\n\
                      \x20         For an MCP client's config; reads and writes stdio.\n\
                      \x20         SESSION must be listed in [agents] and is granted\n\
-                     \x20         separately"
+                     \x20         separately\n\
+                     install   install or update an app into <install>/apps/<name>/ from\n\
+                     \x20         a directory holding its app.toml and deckjack-<name>;\n\
+                     \x20         never approves it (see `deckjack install --help`)\n\
+                     uninstall remove an installed app\n\
+                     apps      list installed apps, and any the node will not run"
                 );
                 return Ok(());
             }
@@ -119,6 +163,9 @@ fn main() -> anyhow::Result<()> {
 
     let config = Config::load_or_init(&working_dir)?;
     let listen = listen.unwrap_or(config.server.listen);
+    if debug {
+        deckjack_core::debugmode::check_listen(listen)?;
+    }
 
     // One connection, shared: the auth context persists sessions through it
     // and the bus writes the command log through it. A second connection to
@@ -164,6 +211,29 @@ fn main() -> anyhow::Result<()> {
         tracing::info!(count = restored_count, "sessions restored");
     }
 
+    // Debug mode's session, minted after the restored ones so the cap counts
+    // them. Not written to the store: it ends with this process. A normal
+    // start removes the file an earlier debug start left.
+    let debug_cookie = if debug {
+        let (id, evicted) = {
+            let mut st = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            deckjack_core::debugmode::mint(&mut st, Now::current())?
+        };
+        for event in evicted {
+            tracing::warn!(?event, "minting the debug session evicted a session");
+        }
+        let path = deckjack_core::debugmode::write_cookie(&install, &id)?;
+        tracing::warn!(cookie = %path.display(), "DEBUG MODE: a session is on disk; anyone who can read it is signed in");
+        Some(path)
+    } else {
+        if let Err(e) = deckjack_core::debugmode::remove_cookie(&install) {
+            tracing::warn!(error = %e, "cannot remove a leftover debug session cookie");
+        }
+        None
+    };
+
     // The bus, and the first commands on it. The working directory is the
     // terminal's cwd because that is what the design means by apps seeing the
     // working directory as their filesystem root — the shell opens where the
@@ -178,8 +248,15 @@ fn main() -> anyhow::Result<()> {
     // Named rather than discarded: the HTTP file routes, WebDAV, previews and
     // downloads must all cross this same boundary. Opening a second Root for
     // them is exactly how the predecessor's configured root became decorative.
-    let files = deckjack_core::files::register_commands(&registry, &working_dir, &node_id)
-        .context("cannot register the file commands")?;
+    //
+    // Given the install directory, not a path derived from it: the namespace
+    // keeps the install directory's own entries out (by default the working
+    // directory *is* the install directory, so `bin/deckjack`, `apps/` and
+    // the debug cookie are top-level names in it), and keeps its thumbnails
+    // in `<install>/cache/files`.
+    let files =
+        deckjack_core::files::register_commands(&registry, &working_dir, &node_id, &install)
+            .context("cannot register the file commands")?;
     // ---- the kill switch ------------------------------------------------
     //
     // Built before the bus, because the bus's journal is what counts refused
@@ -421,16 +498,48 @@ fn main() -> anyhow::Result<()> {
         )),
     };
 
+    // Read from the store rather than the app host, which has not
+    // discovered anything yet. A grant that no longer matches its manifest
+    // still counts: it is what the operator approved.
+    let network_apps = match store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .app_grants()
+    {
+        Ok(grants) => deckjack_core::proxy::network_grant_holders(&grants),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot read the app approvals for the proxy check");
+            Vec::new()
+        }
+    };
+    let proxy_socket = config
+        .server
+        .unix_socket_path(&install)
+        .map_err(anyhow::Error::msg)?;
     banner(
         &code_text,
         listen,
         &node_id,
         &working_dir,
         &config,
+        Proxy {
+            socket: proxy_socket.as_deref(),
+            network_apps: &network_apps,
+        },
         restored_count,
         &lockdown.status(),
         &fresh_codes,
     );
+    if let Some(path) = &debug_cookie {
+        println!("  DEBUG MODE: loopback only, verbose logs. A session is on disk:");
+        println!("    {}", path.display());
+        println!(
+            "  curl -H \"Cookie: $(cat {})\" -H \"Sec-Fetch-Site: same-origin\" ...",
+            path.display()
+        );
+        // `fetchgate` refuses /content, /passkey/* and /logout without it.
+        println!();
+    }
 
     // ---- the app host ---------------------------------------------------
     //
@@ -447,6 +556,9 @@ fn main() -> anyhow::Result<()> {
         apps::Host::new(
             install.clone(),
             working_dir.clone(),
+            // So approval and launch can refuse a grant that reaches this
+            // node's own front door (D2). Required, not configured later.
+            apps::CoreDoor::new(listen, config.server.trusted_proxies.clone()),
             apps::OsEnv::new(),
             // `Confinement::Enforced` is the default, and stays: an app whose
             // `[needs]` this kernel cannot enforce does not launch, rather
@@ -473,7 +585,10 @@ fn main() -> anyhow::Result<()> {
 
     let ws_ctx = ws::WsCtx::new(
         Arc::clone(&ctx),
-        BusDispatch::new(Arc::clone(&bus)),
+        BusDispatch::new(
+            Arc::clone(&bus),
+            deckjack_core::ticket::Tickets::new(Arc::new(ws::SystemClock)),
+        ),
         ws::Hub::new(Arc::new(ws::SystemClock)),
         Arc::new(ws::SystemClock),
         node_id.clone(),
@@ -489,6 +604,7 @@ fn main() -> anyhow::Result<()> {
     let unlock_ctx = lockdown::UnlockCtx::new(Arc::clone(&lockdown), host_token);
     let result = rt.block_on(serve(
         listen,
+        proxy_socket.map(|path| (path, config.server.unix_socket_peer_uid)),
         Arc::clone(&ctx),
         ws_ctx,
         unlock_ctx,
@@ -541,6 +657,7 @@ struct AgentDoors {
 #[allow(clippy::too_many_arguments)]
 async fn serve(
     listen: SocketAddr,
+    proxy_socket: Option<(PathBuf, u32)>,
     ctx: Arc<Ctx>,
     ws_ctx: Arc<ws::WsCtx>,
     unlock_ctx: Arc<lockdown::UnlockCtx>,
@@ -555,6 +672,24 @@ async fn serve(
     let tcp = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot listen on {listen}"))?;
+
+    // Bound beside the TCP listener, before anything is served, so a node
+    // whose proxy socket is taken fails to start rather than starting
+    // unreachable through `tailscale serve`. The guard removes the file on
+    // the way out of this function, which is a clean shutdown.
+    let proxy = match &proxy_socket {
+        None => None,
+        Some((path, uid)) => {
+            let socket = deckjack_core::proxy::bind(path, *uid)
+                .context("cannot open the proxy socket (server.unix_socket)")?;
+            tracing::info!(path = %socket.path().display(), peer_uid = uid, "proxy socket open");
+            Some(socket.into_parts())
+        }
+    };
+    let (proxy_listener, _proxy_guard) = match proxy {
+        Some((listener, guard)) => (Some(listener), Some(guard)),
+        None => (None, None),
+    };
 
     tracing::info!(%listen, "deckjack ready");
 
@@ -625,10 +760,24 @@ async fn serve(
         files,
     );
 
+    // The same router on the proxy socket, marked so that only requests
+    // arriving there have their forwarded headers believed.
+    let proxied = proxy_listener.map(|listener| {
+        axum::serve(
+            listener,
+            deckjack_core::proxy::router(app.clone()).into_make_service(),
+        )
+    });
     let http = axum::serve(tcp, app.into_make_service_with_connect_info::<SocketAddr>());
 
     tokio::select! {
         r = http.into_future() => r.context("HTTP server failed"),
+        r = async {
+            match proxied {
+                Some(server) => server.into_future().await,
+                None => std::future::pending().await,
+            }
+        } => r.context("the proxy socket's server failed"),
         () = async {
             loop {
                 beat.tick().await;
@@ -683,6 +832,14 @@ async fn shutdown_signal() {
     }
 }
 
+/// What the banner says about proxies beyond the config itself.
+struct Proxy<'a> {
+    /// The resolved `server.unix_socket`, if one is configured.
+    socket: Option<&'a std::path::Path>,
+    /// Approved apps holding a network grant, for the loopback warning.
+    network_apps: &'a [String],
+}
+
 #[allow(clippy::too_many_arguments)]
 fn banner(
     code_text: &str,
@@ -690,6 +847,7 @@ fn banner(
     node_id: &str,
     dir: &std::path::Path,
     config: &Config,
+    proxy: Proxy<'_>,
     restored: usize,
     lockdown: &lockdown::Status,
     fresh_codes: &[String],
@@ -727,10 +885,20 @@ fn banner(
         }
         println!();
     }
+    if let Some(path) = proxy.socket {
+        println!("  proxy socket   {}", path.display());
+        println!(
+            "    believed: X-Forwarded-For/-Proto/-Host, from uid {} only. Serve with:",
+            config.server.unix_socket_peer_uid
+        );
+        println!("    sudo tailscale serve --bg unix:{}", path.display());
+    }
     if config.server.trusted_proxies.is_empty() {
-        println!("  no trusted proxies: every request is attributed to the socket it");
-        println!("  arrived on. Behind a proxy that is one address for everyone, so");
-        println!("  one person's wrong codes would lock out all of them.");
+        if proxy.socket.is_none() {
+            println!("  no trusted proxies: every request is attributed to the socket it");
+            println!("  arrived on. Behind a proxy that is one address for everyone, so");
+            println!("  one person's wrong codes would lock out all of them.");
+        }
     } else {
         let list: Vec<String> = config
             .server
@@ -739,6 +907,15 @@ fn banner(
             .map(|p| p.to_string())
             .collect();
         println!("  trusting X-Forwarded-For from: {}", list.join(", "));
+    }
+    if let Some(warning) = deckjack_core::proxy::local_trust_warning(
+        &config.server.trusted_proxies,
+        listen,
+        proxy.network_apps,
+    ) {
+        println!();
+        println!("  {warning}");
+        tracing::warn!("{warning}");
     }
     println!();
     println!(
@@ -798,7 +975,11 @@ fn banner(
 /// lock; this is a client of that node.
 fn agent(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let mut args = args.peekable();
-    let mut working_dir = PathBuf::from(".");
+    // The install directory by default: `~/.deckjack`, or `$DECKJACK_HOME`.
+    // One place for a single-machine setup to live, so plain `deckjack`
+    // serves the same directory every time instead of wherever the shell
+    // happened to be.
+    let mut working_dir = node::install_dir();
     let mut session: Option<String> = None;
 
     while let Some(arg) = args.next() {
@@ -860,9 +1041,102 @@ fn agent(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     })
 }
 
+const INSTALL_HELP: &str = "deckjack install APP_DIR [--binary FILE] [--dir PATH]\n\n\
+Installs, or updates in place, the app in APP_DIR: its app.toml and its\n\
+deckjack-<name> executable (or FILE). The manifest is validated, the binary\n\
+must be an ELF executable for this machine, and the swap into\n\
+<install>/apps/<name>/ is atomic, so it is safe while the old version runs.\n\
+<install> is $DECKJACK_HOME, or ~/.deckjack.\n\n\
+An install never approves anything. The output says whether the approval\n\
+recorded in the working directory (PATH, default <install>, as for the\n\
+server) covers this version; if not, approve it from the shell's command\n\
+palette (\"Approve <app>\"). Approvals recorded before the fingerprint became\n\
+SHA-256 are asked for once more.\n\
+Binaries are not signed or verified: install only what you built or trust.";
+
+fn install_cmd(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    use deckjack_core::install;
+    let mut args = args.peekable();
+    let mut dir: Option<PathBuf> = None;
+    let mut binary: Option<PathBuf> = None;
+    // Whose approvals the report is about: the server's working directory.
+    // Without --dir that is the install directory, as for the server, but
+    // only guessed: `install` says so rather than misreport when no server
+    // has recorded approvals there.
+    let mut working_dir: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--binary" => binary = Some(args.next().context("--binary needs a path")?.into()),
+            "--dir" => working_dir = Some(args.next().context("--dir needs a path")?.into()),
+            "-h" | "--help" => {
+                println!("{INSTALL_HELP}");
+                return Ok(());
+            }
+            other if other.starts_with('-') => bail!("unknown argument to install: {other}"),
+            other => {
+                if dir.replace(other.into()).is_some() {
+                    bail!("give one app directory to install, not several");
+                }
+            }
+        }
+    }
+    let dir = dir.context("deckjack install needs an app directory holding app.toml")?;
+    let source = install::Source::from_dir(&dir, binary)?;
+    let report = match &working_dir {
+        Some(working_dir) => install::install_in(&node::install_dir(), working_dir, &source)?,
+        None => install::install(&node::install_dir(), &source)?,
+    };
+    println!("{}", report.render());
+    Ok(())
+}
+
+fn uninstall_cmd(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let mut name: Option<String> = None;
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!(
+                    "deckjack uninstall NAME\n\n\
+                     Removes <install>/apps/NAME/. A server already running keeps the app\n\
+                     until it restarts. An approval stays recorded, and applies again only\n\
+                     to a reinstall asking for exactly what was approved."
+                );
+                return Ok(());
+            }
+            other if other.starts_with('-') => bail!("unknown argument to uninstall: {other}"),
+            other => {
+                if name.replace(other.to_string()).is_some() {
+                    bail!("give one app name, not several");
+                }
+            }
+        }
+    }
+    let name = name.context("deckjack uninstall needs an app name")?;
+    let removed = deckjack_core::install::uninstall(&node::install_dir(), &name)?;
+    println!("removed {name} from {}", removed.display());
+    Ok(())
+}
+
+fn apps_cmd(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    if let Some(arg) = args.next() {
+        if arg == "-h" || arg == "--help" {
+            println!("deckjack apps\n\nLists the apps installed in <install>/apps/.");
+            return Ok(());
+        }
+        bail!("unknown argument to apps: {arg}");
+    }
+    let found = apps::discover(&node::install_dir(), &apps::OsEnv::new());
+    print!("{}", deckjack_core::install::render_listing(&found));
+    Ok(())
+}
+
 fn unlock(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let mut args = args.peekable();
-    let mut working_dir = PathBuf::from(".");
+    // The install directory by default: `~/.deckjack`, or `$DECKJACK_HOME`.
+    // One place for a single-machine setup to live, so plain `deckjack`
+    // serves the same directory every time instead of wherever the shell
+    // happened to be.
+    let mut working_dir = node::install_dir();
     let mut code: Option<String> = None;
     let mut listen: Option<SocketAddr> = None;
 

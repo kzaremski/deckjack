@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Q4: Origin on a WebSocket from an opaque-origin frame</title>
+<body>
+  <script>
+    // Control: the parent's own socket, which must carry its real origin.
+    window.parentSocket = new WebSocket("{{A}}".replace(/^http/, "ws") + "/ws?tag=q4-parent");
+  </script>
+  <!-- A sandboxed frame with no CSP of its own: what does the server see? -->
+  <iframe sandbox="allow-scripts allow-forms" src="/q4-child.html?tag=q4-child-doc&p=q4-child"></iframe>
+  <!-- The same frame under the §4.2 `connect-src 'none'` (set by the test):
+       the socket should never reach the server at all. -->
+  <iframe sandbox="allow-scripts allow-forms" src="/q4-child-csp.html?tag=q4-csp-doc&p=q4-csp"></iframe>
+</body>

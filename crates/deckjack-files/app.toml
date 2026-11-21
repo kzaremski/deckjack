@@ -1,26 +1,50 @@
 # The Files app.
 #
-# It declares no commands and asks for nothing, which is unusual enough to say
-# why: the file API is the core's. `files.list`, `files.read`, `files.write`,
-# `files.rename` and `files.delete` are registered by the core at startup,
-# rooted at the working directory, and they are what enforce that an address
-# never escapes it. A Files app that registered its own would be a second
-# implementation of the one boundary that matters most.
+# It declares no commands, which is unusual enough to say why: the file API
+# is the core's. `files.list`, `files.move`, `files.trash` and the rest are
+# registered by the core at startup, rooted at the working directory, and
+# they are what enforce that an address never escapes it. A Files app that
+# registered its own would be a second implementation of the one boundary
+# that matters most.
 #
-# So this app is its UI and nothing else. Its web UI runs on the core's origin
-# and calls the core's commands over the bus, exactly as the shell's own
-# panels do.
+# So this app is its UI and nothing else, and its process is the least
+# privileged in the suite: it cannot read a single file itself. Everything it
+# shows came through a command that was logged and attributed.
 #
-# The consequence worth knowing: an empty [needs] means there is nothing for
-# the operator to approve, so this app launches without an approval dialog —
-# and it is also the least privileged process in the suite. It cannot read a
-# single file itself. Everything it shows came through a command that was
-# logged and attributed.
+# Its name is `filer`, not `files`, and that is not a typo. `files` is the
+# core's own namespace, and no app may take a core namespace as its name
+# (docs/APP-UI-ISOLATION.md §4.6): an app called `files` would look as if it
+# owned `files.*`. The title the operator sees is still "Files". The crate
+# directory keeps its old name; the binary follows the manifest
+# (`deckjack-filer`), because that is what the core runs.
 
 [app]
-name = "files"
+name = "filer"
 version = "0.1.0"
 protocol = 1
 title = "Files"
 lifecycle = "on-demand"
 min_width = 360
+tag = "Fi"
+summary = "The working directory"
+default_width = 680
+default_height = 440
+
+# What this app's window calls. None of these is its own command, so each is
+# named exactly, and the operator approves the list once (D1 in
+# docs/APP-UI-ISOLATION.md: calling commands outside its own scope is a need).
+# Nothing here deletes for good: emptying the trash is the palette's, from the
+# shell, and is deliberately absent.
+[ui]
+invoke = [
+  "files.list",
+  "files.space",
+  "files.thumbnail",
+  "files.mkdir",
+  "files.rename",
+  "files.copy",
+  "files.move",
+  "files.trash",
+  "files.trash.list",
+  "files.trash.restore",
+]

@@ -1,4 +1,5 @@
-//! Session identifiers and the `dj_session` cookie.
+//! Session identifiers and the session cookie: `__Host-dj_session` over
+//! HTTPS, `dj_session` over plain HTTP.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -10,7 +11,26 @@ use sha2::{Digest, Sha256};
 
 use super::code::{RandomError, os_random};
 
+/// The cookie's name over plain HTTP: loopback, debug mode, a TCP proxy that
+/// does not say it terminated TLS.
 pub const COOKIE_NAME: &str = "dj_session";
+
+/// The cookie's name whenever it is marked `Secure` (D2 in
+/// docs/APP-UI-ISOLATION.md). The `__Host-` prefix makes the browser refuse
+/// it unless it is `Secure`, has `Path=/` and has no `Domain`, so nothing on
+/// another subdomain and nothing served over plain HTTP can plant or
+/// overwrite it. Renaming it costs every browser one sign-in.
+pub const SECURE_COOKIE_NAME: &str = "__Host-dj_session";
+
+/// The name that goes with a request: [`SECURE_COOKIE_NAME`] when the
+/// browser reached us over HTTPS, [`COOKIE_NAME`] otherwise.
+pub fn cookie_name(secure: bool) -> &'static str {
+    if secure {
+        SECURE_COOKIE_NAME
+    } else {
+        COOKIE_NAME
+    }
+}
 
 /// 256 random bits. Sessions are looked up by hash-map key on the full value;
 /// with this much entropy, timing differences in the lookup do not help an
@@ -173,7 +193,8 @@ impl Session {
 /// the browser session; the server enforces `session_max_hours`.
 pub fn set_cookie(id: &SessionId, secure: bool) -> String {
     let mut s = format!(
-        "{COOKIE_NAME}={}; HttpOnly; SameSite=Strict; Path=/",
+        "{}={}; HttpOnly; SameSite=Strict; Path=/",
+        cookie_name(secure),
         id.encode()
     );
     if secure {
@@ -184,20 +205,31 @@ pub fn set_cookie(id: &SessionId, secure: bool) -> String {
 
 /// `Set-Cookie` value that removes the session cookie.
 pub fn clear_cookie(secure: bool) -> String {
-    let mut s = format!("{COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+    let mut s = format!(
+        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+        cookie_name(secure)
+    );
     if secure {
         s.push_str("; Secure");
     }
     s
 }
 
-/// Find `dj_session` in one or more `Cookie` header values.
-pub fn from_cookie_headers<'a>(headers: impl IntoIterator<Item = &'a str>) -> Option<SessionId> {
+/// Find the session cookie in one or more `Cookie` header values.
+///
+/// Only the name that matches the request: over HTTPS a plain `dj_session`
+/// is ignored, because accepting it would undo what the `__Host-` prefix
+/// guarantees about where the cookie came from.
+pub fn from_cookie_headers<'a>(
+    secure: bool,
+    headers: impl IntoIterator<Item = &'a str>,
+) -> Option<SessionId> {
+    let name = cookie_name(secure);
     headers
         .into_iter()
         .flat_map(cookie::Cookie::split_parse)
         .filter_map(Result::ok)
-        .filter(|c| c.name() == COOKIE_NAME)
+        .filter(|c| c.name() == name)
         .find_map(|c| SessionId::decode(c.value()))
 }
 
@@ -258,23 +290,50 @@ mod tests {
     fn cookie_attributes() {
         let id = SessionId::from_bytes([7; 32]);
         let c = set_cookie(&id, true);
-        assert!(c.starts_with(&format!("dj_session={}", id.encode())));
+        assert!(c.starts_with(&format!("__Host-dj_session={}", id.encode())));
         assert!(c.contains("HttpOnly") && c.contains("SameSite=Strict") && c.contains("Path=/"));
         assert!(c.ends_with("; Secure"));
         assert!(!c.contains("Max-Age"));
-        assert!(!set_cookie(&id, false).contains("Secure"));
+        let plain = set_cookie(&id, false);
+        assert!(plain.starts_with(&format!("dj_session={}", id.encode())));
+        assert!(!plain.contains("Secure"));
+        assert!(clear_cookie(false).starts_with("dj_session=;"));
         assert!(clear_cookie(false).contains("Max-Age=0"));
+        // Clearing has to name the cookie that was set, or a sign-out over
+        // HTTPS leaves the real one in the browser.
+        let cleared = clear_cookie(true);
+        assert!(cleared.starts_with("__Host-dj_session=;"), "{cleared}");
+        assert!(cleared.contains("Max-Age=0") && cleared.ends_with("; Secure"));
     }
 
     #[test]
     fn parse_cookie_header() {
         let id = SessionId::from_bytes([9; 32]);
         let h = format!("a=b; dj_session={}; c=d", id.encode());
-        assert_eq!(from_cookie_headers([h.as_str()]), Some(id.clone()));
-        assert_eq!(from_cookie_headers(["x=1", h.as_str()]), Some(id));
-        assert_eq!(from_cookie_headers(["dj_session=junk"]), None);
-        assert_eq!(from_cookie_headers(["other=1"]), None);
-        assert_eq!(from_cookie_headers([]), None);
+        assert_eq!(from_cookie_headers(false, [h.as_str()]), Some(id.clone()));
+        assert_eq!(
+            from_cookie_headers(false, ["x=1", h.as_str()]),
+            Some(id.clone())
+        );
+        assert_eq!(from_cookie_headers(false, ["dj_session=junk"]), None);
+        assert_eq!(from_cookie_headers(false, ["other=1"]), None);
+        assert_eq!(from_cookie_headers(false, []), None);
+    }
+
+    #[test]
+    fn only_the_name_that_matches_the_request_is_read() {
+        let id = SessionId::from_bytes([9; 32]);
+        let plain = format!("dj_session={}", id.encode());
+        let host = format!("__Host-dj_session={}", id.encode());
+        // HTTPS reads the prefixed name and nothing else.
+        assert_eq!(from_cookie_headers(true, [host.as_str()]), Some(id.clone()));
+        assert_eq!(from_cookie_headers(true, [plain.as_str()]), None);
+        // Plain HTTP reads the bare name and nothing else.
+        assert_eq!(
+            from_cookie_headers(false, [plain.as_str()]),
+            Some(id.clone())
+        );
+        assert_eq!(from_cookie_headers(false, [host.as_str()]), None);
     }
 
     #[test]

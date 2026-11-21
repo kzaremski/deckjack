@@ -5,8 +5,12 @@
 //! directory beside it. That matters most where it is hardest: a phone in
 //! Termux can host the shell without a JavaScript toolchain anywhere on it.
 //!
-//! In debug builds `rust-embed` reads from disk instead, so `vite dev` edits
-//! appear on reload without recompiling Rust.
+//! Debug builds embed too (`debug-embed` in the workspace manifest). They
+//! used to read `web/dist` from disk, but rust-embed's mode is one switch for
+//! the whole build, and the app binaries cannot read their UI from disk: they
+//! run under Landlock, which does not grant the source tree. So a changed
+//! `web/dist` needs a Rust rebuild, which `cargo xtask build` does in order;
+//! for working on the shell itself, `vite dev` serves it directly.
 //!
 //! # Caching
 //!
@@ -84,7 +88,17 @@ pub fn serve(path: &str) -> Response {
     index()
 }
 
-/// The entry document, never cached.
+/// The shell document's policy, for now only who may frame it.
+///
+/// Nothing may: a shell inside another page is a desktop someone else can
+/// make you click, and `'self'` would still let a same-origin document (a
+/// file opened through `/content`, an app UI) frame it. This is the header
+/// half of docs/APP-UI-ISOLATION.md §4.10 that cannot break the build; the
+/// path-pinned `script-src` is stage 5, which will extend this string, so it
+/// deliberately says nothing about scripts yet.
+pub const DOCUMENT_CSP: &str = "frame-ancestors 'none'";
+
+/// The entry document, never cached, and never framed.
 pub fn index() -> Response {
     match Assets::get(INDEX) {
         Some(file) => (
@@ -92,6 +106,9 @@ pub fn index() -> Response {
             [
                 (header::CONTENT_TYPE, "text/html; charset=utf-8"),
                 (header::CACHE_CONTROL, "no-store"),
+                (header::CONTENT_SECURITY_POLICY, DOCUMENT_CSP),
+                // For engines that predate CSP 2's `frame-ancestors`.
+                (header::X_FRAME_OPTIONS, "DENY"),
             ],
             file.data.into_owned(),
         )

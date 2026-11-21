@@ -3,6 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   contentUrl,
   createQuickLook,
+  formatBytes,
+  formatDuration,
+  openAppVia,
+  resolveRelative,
   viewerFor,
   type QuickLookEnv,
 } from "./quicklook.ts";
@@ -17,8 +21,21 @@ import {
  * is a blank frame with no explanation, which is worse than saying no.
  */
 
-function env(): QuickLookEnv {
-  return { online: () => true };
+/** What the hand-off saw: every app it was asked to open, with the path. */
+type Opened = Array<{ app: string; path: string }>;
+
+function env(options: { online?: boolean; apps?: string[]; opened?: Opened } = {}): QuickLookEnv {
+  const known = new Set(options.apps ?? []);
+  return {
+    online: () => options.online ?? true,
+    apps: {
+      isKnown: (id) => known.has(id),
+      contract: (id) => ({ title: id === "scribe" ? "Editor" : id }),
+    },
+    openApp: (app, path) => {
+      options.opened?.push({ app, path });
+    },
+  };
 }
 
 describe("choosing a viewer", () => {
@@ -29,7 +46,7 @@ describe("choosing a viewer", () => {
     expect(viewerFor("clip.mp4").kind).toBe("video");
     expect(viewerFor("song.mp3").kind).toBe("audio");
     expect(viewerFor("report.pdf").kind).toBe("pdf");
-    expect(viewerFor("notes.md").kind).toBe("text");
+    expect(viewerFor("notes.txt").kind).toBe("text");
     expect(viewerFor("main.rs").kind).toBe("text");
     expect(viewerFor("Makefile").kind).toBe("text");
   });
@@ -51,6 +68,29 @@ describe("choosing a viewer", () => {
     const v = viewerFor("archive.7z");
     expect(v.kind).toBe("none");
     expect(v.why).toBeTruthy();
+  });
+
+  it("renders Markdown as a document, not as its source", () => {
+    expect(viewerFor("README.md").kind).toBe("markdown");
+    expect(viewerFor("notes.markdown").kind).toBe("markdown");
+    expect(viewerFor("x.bin", "text/markdown").kind).toBe("markdown");
+  });
+
+  it("lists an archive the node can read, and names the ones it cannot", () => {
+    for (const name of ["src.zip", "release.tar", "release.tar.gz", "release.tgz", "server.log.gz"]) {
+      expect(viewerFor(name).kind, `${name} is listable`).toBe("archive");
+    }
+    // The refusal names the format, so the operator knows it is the format
+    // and not the file that is the problem.
+    for (const [name, format] of [
+      ["bundle.7z", /7-?zip|7z/i],
+      ["old.rar", /rar/i],
+      ["release.tar.xz", /xz/i],
+    ] as const) {
+      const v = viewerFor(name);
+      expect(v.kind, `${name} was promised a listing`).toBe("none");
+      expect(v.why, `${name}'s refusal does not name it`).toMatch(format);
+    }
   });
 
   it("does not decide from a name a file merely happens to have", () => {
@@ -103,6 +143,39 @@ describe("the address the browser fetches", () => {
   it("offers a download as a different request, not a different viewer", () => {
     const url = contentUrl("/report.pdf", { download: true });
     expect(new URLSearchParams(url.split("?")[1]!).get("download")).toBe("1");
+  });
+});
+
+describe("a Markdown file's own images", () => {
+  it("are found next to the file, the way the file's author meant", () => {
+    expect(resolveRelative("/docs/README.md", "img/shot.png")).toBe("/docs/img/shot.png");
+    expect(resolveRelative("/docs/README.md", "./shot.png")).toBe("/docs/shot.png");
+    expect(resolveRelative("/docs/guide/intro.md", "../assets/a.png")).toBe("/docs/assets/a.png");
+    expect(resolveRelative("/docs/README.md", "/logo.png")).toBe("/logo.png");
+    expect(resolveRelative("/README.md", "my%20shot.png?raw=1#top")).toBe("/my shot.png");
+  });
+
+  it("are not looked for above the working directory or on another host", () => {
+    expect(resolveRelative("/README.md", "../../etc/passwd")).toBeNull();
+    expect(resolveRelative("/README.md", "https://example.com/a.png")).toBeNull();
+    expect(resolveRelative("/README.md", "//example.com/a.png")).toBeNull();
+    expect(resolveRelative("/README.md", "data:image/png;base64,AAAA")).toBeNull();
+  });
+});
+
+describe("numbers worth reading", () => {
+  it("gives sizes in the units a file manager uses", () => {
+    expect(formatBytes(1)).toBe("1 byte");
+    expect(formatBytes(999)).toBe("999 bytes");
+    expect(formatBytes(1_500)).toBe("1.5 KB");
+    expect(formatBytes(2_400_000_000)).toBe("2.4 GB");
+    expect(formatBytes(524_288)).toBe("524 KB");
+  });
+
+  it("gives durations as a clock", () => {
+    expect(formatDuration(65)).toBe("1:05");
+    expect(formatDuration(3723)).toBe("1:02:03");
+    expect(formatDuration(Number.NaN)).toBe("");
   });
 });
 
@@ -168,7 +241,7 @@ describe("with no node to fetch from", () => {
     // The content route is on the node. Offline, the <img> would simply fail
     // and the operator would be looking at a blank overlay wondering whether
     // the file is corrupt.
-    const ql = createQuickLook({ online: () => false });
+    const ql = createQuickLook(env({ online: false }));
     ql.open("/a.jpg");
 
     expect(ql.visible.value, "the overlay should still open to explain itself").toBe(true);
@@ -179,5 +252,74 @@ describe("with no node to fetch from", () => {
     const ql = createQuickLook(env());
     ql.open("/a.jpg");
     expect(ql.unavailable.value).toBeNull();
+  });
+});
+
+describe("opening the file fully", () => {
+  it("hands a text file to the editor, with its path, and gets out of the way", () => {
+    const opened: Opened = [];
+    const ql = createQuickLook(env({ apps: ["scribe"], opened }));
+    ql.open("/src/main.rs", ["/src/lib.rs", "/src/main.rs"]);
+
+    expect(ql.handoff.value?.app).toBe("scribe");
+    expect(ql.handoff.value?.title).toBe("Editor");
+    expect(ql.openFully()).toBe(true);
+
+    expect(opened).toEqual([{ app: "scribe", path: "/src/main.rs" }]);
+    expect(ql.visible.value, "the preview stayed over the editor it opened").toBe(false);
+  });
+
+  it("follows the file the operator has stepped to, not the one they opened", () => {
+    const opened: Opened = [];
+    const ql = createQuickLook(env({ apps: ["scribe"], opened }));
+    ql.open("/a.md", ["/a.md", "/b.md"]);
+    ql.next();
+    ql.openFully();
+    expect(opened).toEqual([{ app: "scribe", path: "/b.md" }]);
+  });
+
+  it("offers nothing when no editor is installed, rather than a button that fails", () => {
+    const opened: Opened = [];
+    const ql = createQuickLook(env({ apps: ["filer", "notes"], opened }));
+    ql.open("/README.md");
+
+    expect(ql.handoff.value).toBeNull();
+    expect(ql.openFully()).toBe(false);
+    expect(opened).toEqual([]);
+    expect(ql.visible.value).toBe(true);
+  });
+
+  it("does not send a photograph to a text editor", () => {
+    const opened: Opened = [];
+    const ql = createQuickLook(env({ apps: ["scribe"], opened }));
+    ql.open("/holiday.jpg");
+    expect(ql.handoff.value).toBeNull();
+    expect(ql.openFully()).toBe(false);
+    expect(opened).toEqual([]);
+  });
+
+  it("opens the app on the file through the window store's open-app entry", async () => {
+    const calls: unknown[][] = [];
+    const open = openAppVia({
+      open: async (app) => void calls.push(["open", app]),
+      openApp: async (app, options) => void calls.push(["openApp", app, options]),
+    });
+    await open("scribe", "/src/main.rs");
+    expect(calls).toEqual([["openApp", "scribe", { path: "/src/main.rs" }]]);
+  });
+
+  it("still opens the app when the window store cannot carry a file yet", async () => {
+    const calls: unknown[][] = [];
+    const open = openAppVia({ open: async (app) => void calls.push(["open", app]) });
+    await open("scribe", "/src/main.rs");
+    expect(calls).toEqual([["open", "scribe"]]);
+  });
+
+  it("offers the source of an HTML page to the editor too", () => {
+    // The preview of a web page is sandboxed and inert; editing it is what
+    // "open fully" means for a file someone is writing.
+    const ql = createQuickLook(env({ apps: ["scribe"] }));
+    ql.open("/site/index.html");
+    expect(ql.handoff.value?.app).toBe("scribe");
   });
 });

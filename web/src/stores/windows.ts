@@ -12,7 +12,7 @@ import {
 } from "../shell/geometry.ts";
 import { safeStorage } from "../tokens/runtime.ts";
 import type { WireWindow } from "../protocol.ts";
-import { apps, isAppId, unknownApp, type AppContract, type AppId } from "./apps.ts";
+import type { AppContract, AppId, AppTable } from "./apps.ts";
 import type { Bus } from "./bus.ts";
 
 /**
@@ -33,7 +33,9 @@ import type { Bus } from "./bus.ts";
 export interface ShellWindow {
   id: string;
   app: AppId;
-  /** The app's own id as the server named it, which may not be a known app. */
+  /** The same id as `app`. Kept because panels and tests read both; before
+   * the app table was built from manifests, `app` was coerced into a closed
+   * list and this was the server's word. */
   appId: string;
   title: string;
   rect: Rect;
@@ -47,6 +49,19 @@ export interface ShellWindow {
   /** True until the panel has real content: the window shows a skeleton. */
   loading: boolean;
   minSize: Size;
+  /**
+   * The file this window was last asked to open, for an app opened on a file
+   * (`shell.app.open`). `seq` changes on every request, so asking twice for
+   * the same file still reaches the app. Kept on this device only: it is a
+   * request to the app, and the app keeps what it opened.
+   */
+  launch?: AppLaunch | null;
+}
+
+/** A request for an app's window to open a file. */
+export interface AppLaunch {
+  path: string;
+  seq: number;
 }
 
 /**
@@ -70,7 +85,22 @@ export interface WindowsEnv {
    * reason `runtime.ts` gives: `localStorage` is not merely missing in a
    * private window, reading it throws.
    */
-  storage: { read(key: string): string | null; write(key: string, value: string): void };
+  storage: {
+    read(key: string): string | null;
+    write(key: string, value: string): void;
+    /** Optional so existing environments stay valid; without it a closed
+     * window's own storage is simply not cleared. */
+    remove?(key: string): void;
+  };
+}
+
+/**
+ * The one storage key an app may keep per window on this device (the
+ * Editor keeps unsaved text there). The store removes it when the window
+ * closes, so what an app kept for a window does not outlive the window.
+ */
+export function windowStorageKey(windowId: string): string {
+  return `deckjack.window.${windowId}`;
 }
 
 export function browserWindowsEnv(): WindowsEnv {
@@ -79,7 +109,16 @@ export function browserWindowsEnv(): WindowsEnv {
       typeof crypto.randomUUID === "function"
         ? crypto.randomUUID()
         : `w${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
-    storage: safeStorage(),
+    storage: {
+      ...safeStorage(),
+      remove(key) {
+        try {
+          window.localStorage.removeItem(key);
+        } catch {
+          // Nothing could have been stored there either.
+        }
+      },
+    },
   };
 }
 
@@ -106,7 +145,14 @@ export interface WindowsStore {
   layout: Ref<LayoutMode>;
   contract(window: ShellWindow): AppContract;
 
-  open(app: AppId): Promise<string>;
+  open(app: AppId, options?: { path?: string }): Promise<string>;
+  /**
+   * Open `app` on a file: focus its window if one is open (restoring it if
+   * minimized) and hand it the path, else open a new one with it. Returns
+   * the window's id. The caller validates `app` and `path`; see
+   * `parseAppOpen`.
+   */
+  openApp(app: AppId, options?: { path?: string }): Promise<string>;
   close(id: string): Promise<void>;
   focus(id: string): void;
   minimize(id: string): void;
@@ -139,7 +185,13 @@ export interface WindowsStore {
 /** Gap between tiled and snapped windows, in CSS pixels. */
 const SNAP_GAP = 6;
 
-export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
+/**
+ * `apps` is required, and not a module the store imports, on purpose: the
+ * app table is built from what the node has installed, so each shell owns
+ * one, and a test harness that forgot to pass it would otherwise be testing a
+ * different table from the product's without a compile error to say so.
+ */
+export function createWindows(bus: Bus, env: WindowsEnv, apps: AppTable): WindowsStore {
   const byId = reactive(new Map<string, ShellWindow>());
   const order = ref<string[]>([]);
   const focusHistory = ref<string[]>([]);
@@ -152,6 +204,7 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
   // half-written value lands on the default rather than on a mode the
   // operator never chose.
   const layout = ref<LayoutMode>(env.storage.read(LAYOUT_KEY) === "tiling" ? "tiling" : "floating");
+  let launches = 0;
 
   function list(): ShellWindow[] {
     return order.value.flatMap((id) => {
@@ -223,7 +276,7 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
   }
 
   function contract(window: ShellWindow): AppContract {
-    return isAppId(window.appId) ? apps[window.appId] : unknownApp(window.appId);
+    return apps.contract(window.appId);
   }
 
   /**
@@ -282,7 +335,7 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
     }
   }
 
-  return {
+  const store: WindowsStore = {
     all: computed(() => list()),
     visible: computed(() => list().filter((w) => !w.minimized)),
     recent: computed(() =>
@@ -300,9 +353,9 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
     layout,
     contract,
 
-    async open(app) {
+    async open(app, options) {
       if (noNode("opened")) return "";
-      const spec = apps[app];
+      const spec = apps.contract(app);
       const id = env.id();
       const rect = cascade(byId.size, workArea.value, spec.defaultSize);
       byId.set(id, {
@@ -320,6 +373,9 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
         // would say "busy"; the skeleton says what is arriving.
         loading: true,
         minSize: spec.minSize,
+        // Set before the panel exists, so its frame loads with the path
+        // rather than loading empty and being told afterwards.
+        launch: options?.path ? { path: options.path, seq: ++launches } : null,
       });
       focusWindow(id);
       // The cascade position above is still computed and still recorded: it is
@@ -335,6 +391,19 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
       return id;
     },
 
+    async openApp(app, options) {
+      if (noNode("opened")) return "";
+      // The most recently focused window of that app, else any of them.
+      const mine = (id: string) => byId.get(id)?.appId === app;
+      const existing = focusHistory.value.find(mine) ?? order.value.find(mine);
+      const w = existing ? byId.get(existing) : undefined;
+      if (!w) return store.open(app, options);
+      if (options?.path) w.launch = { path: options.path, seq: ++launches };
+      if (w.minimized) store.restore(w.id);
+      else focusWindow(w.id);
+      return w.id;
+    },
+
     async close(id) {
       if (noNode("closed")) return;
       const existed = byId.delete(id);
@@ -344,6 +413,7 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
         split.value = null;
       }
       if (focusedId.value === id) focusedId.value = focusHistory.value[0] ?? null;
+      if (existed) env.storage.remove?.(windowStorageKey(id));
       if (existed) await record("shell.window.close", { id });
       // The survivors grow into the freed slot, which is the whole point of a
       // tiling mode: a gap where a window used to be is a floating layout.
@@ -524,7 +594,7 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
         }
         byId.set(w.id, {
           id: w.id,
-          app: isAppId(w.app) ? w.app : "files",
+          app: w.app,
           appId: w.app,
           title: w.title,
           rect,
@@ -547,4 +617,5 @@ export function createWindows(bus: Bus, env: WindowsEnv): WindowsStore {
       }
     },
   };
+  return store;
 }

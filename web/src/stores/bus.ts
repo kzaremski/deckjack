@@ -42,11 +42,19 @@ import {
 
 export type BusStatus = "connecting" | "open" | "detached" | "closed";
 
-/** Shows the bus's own prompt and resolves true when the operator accepts. */
+/**
+ * Shows the bus's own prompt and resolves true when the operator accepts.
+ *
+ * `target` is what the call acts on, as the node rendered it. Plain text:
+ * show it as text, never as markup. The ticket is deliberately not passed:
+ * whoever draws the dialog has no use for it, and the bus is the only thing
+ * that redeems one.
+ */
 export type ConfirmAsker = (input: {
   command: string;
   prompt: string;
   risk: string;
+  target?: string;
 }) => Promise<boolean>;
 
 /** A socket, injected so the bus can be driven without a server. */
@@ -128,6 +136,13 @@ export interface Bus {
     params?: Record<string, unknown>,
     node?: string,
     onProgress?: (progress: Progress, seq: number) => void,
+    /**
+     * `signal` aborting asks the node to cancel the call, the same as
+     * `cancel` with its correlation id, which a caller does not otherwise
+     * learn until the call is over. A response still arrives and resolves
+     * the promise. Aborted before the call starts, nothing is sent.
+     */
+    options?: { signal?: AbortSignal },
   ): Promise<CallResult>;
   /** Ask a running call to stop. A response still arrives for it. */
   cancel(correlation: CorrelationId): void;
@@ -163,11 +178,16 @@ function flatten(id: CorrelationId, outcome: import("../protocol.ts").Outcome): 
   if (v && typeof v === "object") {
     if (v.status === "queued") return { id, status: "queued", inboxId: v.pending ?? "" };
     if (v.status === "needs_confirmation") {
+      const asked = v as { prompt?: string; risk?: string; target?: unknown; ticket?: unknown };
       return {
         id,
         status: "confirm",
-        prompt: String((v as { prompt?: string }).prompt ?? "Run this command?"),
-        risk: String((v as { risk?: string }).risk ?? "destructive"),
+        prompt: String(asked.prompt ?? "Run this command?"),
+        risk: String(asked.risk ?? "destructive"),
+        target: typeof asked.target === "string" ? asked.target : undefined,
+        // Empty when the node sent none, which `call` treats as nothing to
+        // redeem rather than redeeming nothing.
+        ticket: typeof asked.ticket === "string" ? asked.ticket : "",
       };
     }
   }
@@ -475,9 +495,14 @@ export function createBus(env: BusEnv): Bus {
       retryAt.value = null;
       connect();
     },
-    async call(id, params, _target, onProgress) {
+    async call(id, params, _target, onProgress, options) {
       seq += 1;
       const correlation = `c${seq}`;
+      const signal = options?.signal;
+
+      if (signal?.aborted) {
+        return { id: correlation, status: "error", message: `${id} was cancelled before it ran` };
+      }
 
       if (status.value !== "open" || !socket) {
         // No exception for `shell.*`. Those are exactly the window opens,
@@ -495,20 +520,34 @@ export function createBus(env: BusEnv): Bus {
         };
       }
 
-      const invoke = (corr: CorrelationId, confirmed: boolean) =>
+      /**
+       * Send one frame for this call and await its answer. The first is an
+       * invoke; a confirmation is the same call again, as a `confirm` frame
+       * carrying the node's ticket. There is no other way to say "the
+       * operator agreed": the node refuses an invoke that claims it.
+       */
+      const exchange = (corr: CorrelationId, ticket: string | null) =>
         new Promise<CommandOutcome>((resolve) => {
-          pending.set(corr, resolve);
-          if (onProgress) progressHandlers.set(corr, onProgress);
-          send({
-            type: "invoke",
-            id: corr,
-            command: id,
-            params: params ?? {},
-            confirmed,
+          // Only while this call is still waiting: the listener goes when
+          // the call is answered, so a cancel never names an id the node
+          // has finished with.
+          const onAbort = () => {
+            if (status.value === "open") send({ type: "cancel", id: corr });
+          };
+          signal?.addEventListener("abort", onAbort, { once: true });
+          pending.set(corr, (outcome) => {
+            signal?.removeEventListener("abort", onAbort);
+            resolve(outcome);
           });
+          if (onProgress) progressHandlers.set(corr, onProgress);
+          send(
+            ticket === null
+              ? { type: "invoke", id: corr, command: id, params: params ?? {} }
+              : { type: "confirm", id: corr, ticket, command: id, params: params ?? {} },
+          );
         });
 
-      const first: CommandOutcome = await invoke(correlation, false);
+      const first: CommandOutcome = await exchange(correlation, null);
 
       // The bus asked rather than refused. Show ITS prompt — the backend
       // declared the risk and wrote the wording, and a client that invented
@@ -517,16 +556,36 @@ export function createBus(env: BusEnv): Bus {
         if (!askToConfirm) {
           return { id: correlation, status: "refused", message: first.prompt };
         }
+        if (!first.ticket) {
+          return {
+            id: correlation,
+            status: "error",
+            message: `the node asked to confirm ${id} but sent nothing to confirm it with; nothing was run`,
+          };
+        }
+        const askedOn = socket;
         const ok = await askToConfirm({
           command: id,
           prompt: first.prompt,
           risk: first.risk,
+          target: first.target,
         });
         if (!ok) {
           return { id: correlation, status: "refused", message: "not confirmed" };
         }
+        // The dialog may have sat open past the connection that was asked,
+        // even one the bus has since replaced with a fresh socket. A ticket
+        // is good only on the socket it was issued to, so redeeming it on
+        // another would be refused anyway; say what happened instead.
+        if (status.value !== "open" || !socket || socket !== askedOn) {
+          return {
+            id: correlation,
+            status: "error",
+            message: `the connection closed while ${id} was being confirmed; nothing was run. Run it again`,
+          };
+        }
         seq += 1;
-        const second = await invoke(`c${seq}`, true);
+        const second = await exchange(`c${seq}`, first.ticket);
         // A confirmed invoke that still asks would be a server bug, and
         // looping on it would ask the operator forever. Fail instead.
         return second.status === "confirm"

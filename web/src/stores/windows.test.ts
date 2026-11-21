@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { computed, ref } from "vue";
 
 import { createWindows, type WindowsEnv } from "./windows.ts";
+import { createAppTable } from "./apps.ts";
 import type { Bus, BusStatus } from "./bus.ts";
 
 /**
@@ -59,7 +60,7 @@ function env(): WindowsEnv {
 describe("with no node to record them", () => {
   it("does not open a window", async () => {
     const { bus } = stubBus("connecting");
-    const windows = createWindows(bus, env());
+    const windows = createWindows(bus, env(), createAppTable());
 
     await windows.open("terminal");
 
@@ -70,7 +71,7 @@ describe("with no node to record them", () => {
 
   it("says why, rather than failing silently", async () => {
     const { bus } = stubBus("connecting");
-    const windows = createWindows(bus, env());
+    const windows = createWindows(bus, env(), createAppTable());
 
     await windows.open("terminal");
 
@@ -80,7 +81,7 @@ describe("with no node to record them", () => {
 
   it("names the device's own network when that is the problem", async () => {
     const { bus } = stubBus("connecting", false);
-    const windows = createWindows(bus, env());
+    const windows = createWindows(bus, env(), createAppTable());
 
     await windows.open("terminal");
 
@@ -95,7 +96,7 @@ describe("with no node to record them", () => {
     // Added after a mutation survived: forcing the offline branch for every
     // failure went unnoticed, because only the offline wording was asserted.
     const { bus } = stubBus("connecting", true);
-    const windows = createWindows(bus, env());
+    const windows = createWindows(bus, env(), createAppTable());
 
     await windows.open("terminal");
 
@@ -106,7 +107,7 @@ describe("with no node to record them", () => {
   it("does not close a window either", async () => {
     // Opened while connected, then the node goes away.
     const { bus, status } = stubBus("open");
-    const windows = createWindows(bus, env());
+    const windows = createWindows(bus, env(), createAppTable());
     const id = await windows.open("terminal");
     expect(windows.all.value).toHaveLength(1);
 
@@ -118,7 +119,7 @@ describe("with no node to record them", () => {
 
   it("does not move a window", async () => {
     const { bus, status } = stubBus("open");
-    const windows = createWindows(bus, env());
+    const windows = createWindows(bus, env(), createAppTable());
     const id = await windows.open("terminal");
     const before = { ...windows.all.value[0]!.rect };
 
@@ -132,7 +133,7 @@ describe("with no node to record them", () => {
 describe("with a node", () => {
   it("opens a window and tells the node", async () => {
     const { bus, calls } = stubBus("open");
-    const windows = createWindows(bus, env());
+    const windows = createWindows(bus, env(), createAppTable());
 
     await windows.open("terminal");
 
@@ -144,15 +145,15 @@ describe("with a node", () => {
 describe("the layout the operator chose", () => {
   it("floats by default, because that is what was not asked for", () => {
     const { bus } = stubBus("open");
-    expect(createWindows(bus, env()).layout.value).toBe("floating");
+    expect(createWindows(bus, env(), createAppTable()).layout.value).toBe("floating");
   });
 
   it("is remembered on this device", async () => {
     const shared = env();
     const { bus } = stubBus("open");
-    createWindows(bus, shared).setLayout("tiling");
+    createWindows(bus, shared, createAppTable()).setLayout("tiling");
 
-    expect(createWindows(stubBus("open").bus, shared).layout.value).toBe("tiling");
+    expect(createWindows(stubBus("open").bus, shared, createAppTable()).layout.value).toBe("tiling");
   });
 
   it("falls back to floating rather than trusting a damaged setting", () => {
@@ -160,12 +161,12 @@ describe("the layout the operator chose", () => {
     const broken = env();
     broken.storage.write("deckjack.layout", "¯\\_(ツ)_/¯");
 
-    expect(createWindows(bus, broken).layout.value).toBe("floating");
+    expect(createWindows(bus, broken, createAppTable()).layout.value).toBe("floating");
   });
 
   it("arranges the open windows the moment tiling is turned on", async () => {
     const { bus } = stubBus("open");
-    const windows = createWindows(bus, env());
+    const windows = createWindows(bus, env(), createAppTable());
     windows.workArea.value = { w: 1600, h: 900 };
     await windows.open("terminal");
     await windows.open("files");
@@ -183,7 +184,7 @@ describe("the layout the operator chose", () => {
 
   it("puts each window back where it floated when tiling is turned off", async () => {
     const { bus } = stubBus("open");
-    const windows = createWindows(bus, env());
+    const windows = createWindows(bus, env(), createAppTable());
     windows.workArea.value = { w: 1600, h: 900 };
     await windows.open("terminal");
     await windows.open("files");
@@ -200,7 +201,7 @@ describe("the layout the operator chose", () => {
 
   it("does not let a tiled window be dragged out of its slot", async () => {
     const { bus } = stubBus("open");
-    const windows = createWindows(bus, env());
+    const windows = createWindows(bus, env(), createAppTable());
     windows.workArea.value = { w: 1600, h: 900 };
     const id = await windows.open("terminal");
     await windows.open("files");
@@ -214,7 +215,7 @@ describe("the layout the operator chose", () => {
 
   it("re-tiles when a window closes, instead of leaving a hole", async () => {
     const { bus } = stubBus("open");
-    const windows = createWindows(bus, env());
+    const windows = createWindows(bus, env(), createAppTable());
     windows.workArea.value = { w: 1600, h: 900 };
     await windows.open("terminal");
     const second = await windows.open("files");
@@ -235,7 +236,7 @@ describe("a tiled window the operator did not drag", () => {
   // ways in, found by mutation testing: both bypassed it entirely.
   async function twoTiled() {
     const { bus } = stubBus("open");
-    const windows = createWindows(bus, env());
+    const windows = createWindows(bus, env(), createAppTable());
     windows.workArea.value = { w: 1600, h: 900 };
     const first = await windows.open("terminal");
     const second = await windows.open("files");

@@ -72,8 +72,11 @@ pub const ENROLL_SCRIPT_PATH: &str = "/passkey/enroll.js";
 /// two `fetch` calls a ceremony makes — without it `default-src 'none'`
 /// blocks them and the rest is decoration. Everything else stays denied:
 /// no images, no fonts, no frames, no outbound anything.
+///
+/// `frame-ancestors 'none'` for the reason the login page's policy gives:
+/// a ceremony page in a frame is a page someone else can make you click.
 pub const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; \
-                       connect-src 'self'; form-action 'self'";
+                       connect-src 'self'; form-action 'self'; frame-ancestors 'none'";
 
 /// What the page says when no `rp_id` a browser would accept can be
 /// determined — a node on a non-loopback address with no `[passkey]`
@@ -345,6 +348,7 @@ fn html() -> Response {
             (header::CACHE_CONTROL, "no-store"),
             (header::CONTENT_SECURITY_POLICY, CSP),
             (header::REFERRER_POLICY, "no-referrer"),
+            (header::X_FRAME_OPTIONS, "DENY"),
         ],
         page(),
     )
@@ -361,6 +365,7 @@ fn off() -> Response {
             (header::CACHE_CONTROL, "no-store"),
             (header::CONTENT_SECURITY_POLICY, crate::auth::html::CSP),
             (header::REFERRER_POLICY, "no-referrer"),
+            (header::X_FRAME_OPTIONS, "DENY"),
         ],
         unavailable(),
     )
@@ -653,6 +658,7 @@ fn enroll_html() -> Response {
             (header::CACHE_CONTROL, "no-store"),
             (header::CONTENT_SECURITY_POLICY, CSP),
             (header::REFERRER_POLICY, "no-referrer"),
+            (header::X_FRAME_OPTIONS, "DENY"),
         ],
         enroll_page(),
     )
@@ -887,5 +893,8 @@ mod tests {
             r.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
             crate::auth::html::CSP
         );
+        // Nothing frames it, for the reason the login page gives.
+        assert_eq!(r.headers().get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+        assert!(crate::auth::html::CSP.contains("frame-ancestors 'none'"));
     }
 }

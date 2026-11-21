@@ -517,13 +517,11 @@ describe("the layout the shell is in", () => {
   });
 
   it("publishes both axes of the measured size, not the width twice", () => {
-    // `height` is published API with real callers: it is what sizes a sheet
-    // and a compact pane, and it is the axis `visualViewport` shrinks when a
-    // soft keyboard opens. Two same-typed fields next to each other are easy
-    // to swap, and a shell that reads the width as its height runs compact
-    // content off the bottom of the rotated portrait panel while a phone with
-    // the keyboard up never shrinks at all. Asserted as a pair so a swap in
-    // either direction shows up.
+    // `height` is published API with real callers: it is what decides
+    // whether a compact split stacks. Two same-typed fields next to each
+    // other are easy to swap, and a shell that reads the width as its height
+    // lays a portrait phone out as if it were in landscape. Asserted as a
+    // pair so a swap in either direction shows up.
     const measured = { w: widthIn("desktop"), h: 820 };
     const r = viewportRig({ size: measured });
     const viewport = createViewport(r.env);

@@ -46,19 +46,77 @@ use crate::ws;
 // ---------------------------------------------------------------------------
 
 /// Carries WebSocket calls to the command bus.
+///
+/// It also holds the operator's confirmations: the bus says a call needs
+/// one, this issues the ticket, and only a `confirm` frame presenting that
+/// ticket on the same socket runs the call. See [`crate::ticket`].
 pub struct BusDispatch {
     bus: Arc<Bus>,
+    tickets: Arc<crate::ticket::Tickets>,
 }
 
 impl BusDispatch {
-    pub fn new(bus: Arc<Bus>) -> Arc<BusDispatch> {
-        Arc::new(BusDispatch { bus })
+    /// `tickets` is required, not defaulted: a dispatcher built without the
+    /// table could not confirm anything, and one that built its own would
+    /// not share the node's clock.
+    pub fn new(bus: Arc<Bus>, tickets: Arc<crate::ticket::Tickets>) -> Arc<BusDispatch> {
+        Arc::new(BusDispatch { bus, tickets })
+    }
+}
+
+/// The longest ticket text looked up. A real one is 32 characters; anything
+/// longer is refused without touching the table.
+const TICKET_MAX_LEN: usize = 64;
+
+/// Commands a client's cancel may stop by dropping their future.
+///
+/// Only work that is a pure wait with nothing behind it: dropping a future
+/// does not stop a `spawn_blocking` task under it, so a file write or a
+/// lockdown "cancelled" this way would still land, after the audit row and
+/// the client had both been told it did not — and its blocking thread would
+/// outlive the in-flight slot that was meant to bound it. `terminal.read`
+/// only parks on the session's output notifier, so dropping it is complete.
+const DROPPED_ON_CANCEL: &[&str] = &[<Read as Command>::ID];
+
+fn drops_on_cancel(command: &crate::command::CommandId) -> bool {
+    DROPPED_ON_CANCEL.contains(&command.as_str())
+}
+
+/// The bus issuer for a socket call: the operator at this browser, or, when
+/// the frame names `as_app`, that app's window on this browser.
+///
+/// A name that could not be an app's is refused here with `not_permitted`
+/// rather than handed to the bus, so the audit log and the journal never
+/// carry a string a frame chose and no app could have.
+fn issuer_for(call: &ws::Call) -> Result<Issuer, ws::CommandError> {
+    let session = call.issuer.session().clone();
+    match &call.as_app {
+        None => Ok(Issuer::browser(session)),
+        Some(app) if deckjack_protocol::valid_name(app) => Ok(Issuer::app_ui(app.clone(), session)),
+        Some(_) => Err(ws::CommandError::new(
+            NOT_PERMITTED,
+            "as_app does not name an app: an app name is 1-32 characters of a-z, 0-9 and '-'",
+        )),
+    }
+}
+
+/// The socket's code for a call refused by an app window's scope. Its own
+/// code, so the shell and the tests can tell "this window may not" from a
+/// malformed call or any other refusal.
+pub const NOT_PERMITTED: &str = "not_permitted";
+
+/// The stable code a refusal goes out under.
+fn refusal_code(refused: &crate::command::Refused) -> &'static str {
+    match refused {
+        crate::command::Refused::NotPermitted { .. } => NOT_PERMITTED,
+        _ => "refused",
     }
 }
 
 impl ws::Dispatch for BusDispatch {
     fn dispatch(&self, call: ws::Call, progress: ws::ProgressSink) -> ws::Dispatched {
         let bus = Arc::clone(&self.bus);
+        let tickets = Arc::clone(&self.tickets);
 
         Box::pin(async move {
             let id = match crate::command::CommandId::new(call.command.to_string()) {
@@ -72,20 +130,57 @@ impl ws::Dispatch for BusDispatch {
             // their own browser. An agent reaches the bus through the MCP
             // path with its own session identity, never through here, so
             // there is no way for a browser to claim to be one.
-            let mut request = Request::new(
-                id,
-                call.params,
-                Issuer::browser(call.issuer.session().clone()),
-            );
-            if call.confirmed {
-                request = request.confirmed();
+            //
+            // `as_app` is the one thing a frame may say about who is asking,
+            // and it can only make the answer smaller: the call becomes that
+            // app's window, held to the app's approved scope. The shell is
+            // trusted to name the app truthfully (it is the trust root,
+            // docs/APP-UI-ISOLATION.md §7.2); nothing it names here can reach
+            // further than the operator already could. Decided before any
+            // ticket is looked at, so a name no app could have never spends
+            // one, and the issuer it yields is the one the ticket is bound to.
+            let issuer = match issuer_for(&call) {
+                Ok(issuer) => issuer,
+                Err(e) => return ws::Outcome::error(e),
+            };
+            let connection = call.issuer.connection();
+            let digest = crate::ticket::params_digest(&call.params);
+            let bind = |target: Option<&str>| {
+                crate::ticket::Binding::new(connection, issuer.clone(), id.clone(), digest, target)
+            };
+
+            // The only way a browser's call is ever confirmed: a ticket this
+            // dispatcher issued, for this socket, this issuer (the shell, or
+            // one named app's window: a ticket issued to one is refused when
+            // presented as another), this command, these exact parameters and
+            // the target it showed, presented once within its minute.
+            let redeeming = call.ticket.is_some();
+            let spent = call.ticket.map(|ticket| {
+                if ticket.len() > TICKET_MAX_LEN {
+                    Err(crate::ticket::Refusal::Unknown)
+                } else {
+                    let now = bus.target(&id, &call.params);
+                    tickets.redeem(&ticket, &bind(now.as_deref()))
+                }
+            });
+            let mut request = Request::new(id.clone(), call.params, issuer.clone());
+            match spent {
+                None => {}
+                Some(Ok(())) => request = request.confirmed(),
+                Some(Err(refusal)) => {
+                    tracing::info!(%connection, command = %request.command, %refusal, "confirmation refused");
+                    return ws::Outcome::error(ws::CommandError::new(
+                        ws::CONFIRMATION_REFUSED,
+                        refusal.to_string(),
+                    ));
+                }
             }
 
             let admitted = match bus.dispatch(request) {
                 Ok(a) => a,
                 Err(refused) => {
                     return ws::Outcome::error(ws::CommandError::new(
-                        "refused",
+                        refusal_code(&refused),
                         refused.to_string(),
                     ));
                 }
@@ -93,7 +188,22 @@ impl ws::Dispatch for BusDispatch {
 
             match admitted {
                 Admitted::Running(running) => {
-                    let (mut rx, done) = running.split();
+                    // The client's cancel, carried through — but only to a
+                    // command whose work can be dropped mid-flight. `ws`
+                    // flips this signal on a `cancel` frame and when the
+                    // socket goes away; ignoring it left a cancelled
+                    // `terminal.read` parked until the shell next printed
+                    // (forever, for a quiet one), holding an in-flight slot.
+                    // Every other command runs to its end: most do their
+                    // work on the blocking pool, which dropping the future
+                    // does not stop, so the change would land while the
+                    // journal and the client were told it was cancelled.
+                    let (mut rx, done) = if drops_on_cancel(running.command()) {
+                        let cancel = call.cancel.clone();
+                        running.split_until(async move { cancel.canceled().await })
+                    } else {
+                        running.split()
+                    };
 
                     // Forward whatever the command reports while it runs.
                     // Lossy on purpose; see the module note.
@@ -108,6 +218,12 @@ impl ws::Dispatch for BusDispatch {
 
                     match completion.outcome {
                         Ok(value) => ws::Outcome::ok(value),
+                        // Its own code: the client asked for this, and a
+                        // panel that cancelled its own read must be able to
+                        // tell that apart from the command failing.
+                        Err(e @ crate::command::CommandError::Cancelled { .. }) => {
+                            ws::Outcome::error(ws::CommandError::new("cancelled", e.to_string()))
+                        }
                         Err(e) => {
                             ws::Outcome::error(ws::CommandError::new("failed", e.to_string()))
                         }
@@ -120,16 +236,39 @@ impl ws::Dispatch for BusDispatch {
                     "pending": pending.to_string(),
                     "risk": risk.as_str(),
                 })),
+                // A redeemed ticket marks the request confirmed, so the bus
+                // asking again would be a bug here or there. Issuing a second
+                // ticket would ask the operator forever; refuse instead.
+                Admitted::NeedsConfirmation { .. } if redeeming => {
+                    ws::Outcome::error(ws::CommandError::new(
+                        ws::CONFIRMATION_REFUSED,
+                        "the node asked for a confirmation it had just been given; \
+                         nothing was run. This is a fault on the node, not something \
+                         to retry",
+                    ))
+                }
                 // Not a failure: the operator has not been asked yet. The
-                // prompt is the bus's, so the client shows that text rather
-                // than inventing its own, then re-invokes with `confirmed`.
-                Admitted::NeedsConfirmation { risk, prompt, .. } => {
-                    ws::Outcome::ok(serde_json::json!({
+                // prompt and target are the bus's, so the client shows that
+                // text rather than inventing its own, then answers with a
+                // `confirm` frame carrying the ticket.
+                Admitted::NeedsConfirmation {
+                    risk,
+                    prompt,
+                    target,
+                    ..
+                } => match tickets.issue(bind(target.as_deref())) {
+                    Ok(ticket) => ws::Outcome::ok(serde_json::json!({
                         "status": "needs_confirmation",
                         "prompt": prompt,
+                        "target": target,
                         "risk": risk.as_str(),
-                    }))
-                }
+                        "ticket": ticket.reveal(),
+                    })),
+                    Err(e) => ws::Outcome::error(ws::CommandError::new(
+                        "failed",
+                        format!("could not issue a confirmation, so nothing was run: {e}"),
+                    )),
+                },
             }
         })
     }
@@ -311,6 +450,11 @@ pub struct Chunk {
     pub data: String,
     pub cursor: u64,
     pub exited: bool,
+    /// The read began before the oldest byte the scrollback still holds, so
+    /// `data` starts somewhere in the middle of the stream — possibly inside
+    /// an escape sequence. The client clears its emulator before writing it.
+    /// A reattach from cursor zero after a busy shell is the usual case.
+    pub reset: bool,
 }
 
 impl Command for Read {
@@ -334,6 +478,7 @@ impl Command for Read {
             data: String::from_utf8_lossy(&out.bytes).into_owned(),
             cursor: out.cursor,
             exited,
+            reset: out.skipped > 0,
         })
     }
 }
@@ -453,6 +598,90 @@ impl Command for List {
     }
 }
 
+/// How often expired browser sessions are looked for, so their shells are
+/// reaped on time rather than at the next sign-in.
+pub const SESSION_SWEEP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often exited terminals past their grace are let go when nobody is
+/// opening or listing terminals to do it in passing.
+pub const TERMINAL_SWEEP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Revoke every expired browser session the way any other revocation is
+/// handled: row deleted, the session's terminals closed, an audit row
+/// written. Returns how many expired.
+///
+/// The sign-in paths already expire sessions as they go, but a node nobody
+/// signs in to would otherwise keep an expired session's shells running for
+/// as long as nobody came back — reachable by no one, since the cookie that
+/// owned them no longer verifies and a new sign-in is a new owner.
+pub fn expire_sessions(ctx: &crate::http::Ctx) -> usize {
+    let mut events = Vec::new();
+    // The guard is dropped before `apply`, which takes the store and runs the
+    // reapers; neither belongs under the auth lock.
+    let expired = ctx
+        .state()
+        .expire(std::time::SystemTime::now(), &mut events);
+    if expired > 0 {
+        ctx.apply(events);
+    }
+    expired
+}
+
+/// Run [`expire_sessions`] every `every`, for as long as `ctx` lives.
+///
+/// Holds a `Weak`, so a dropped context (a test's, or a server shutting
+/// down) ends the loop. Outside a Tokio runtime there is nothing to spawn on
+/// and nothing to do.
+pub fn spawn_session_expiry(ctx: &Arc<crate::http::Ctx>, every: std::time::Duration) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let weak = Arc::downgrade(ctx);
+    runtime.spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some(ctx) = weak.upgrade() else { break };
+            // A store write and pty hangups: blocking work, kept off the
+            // runtime's workers.
+            if tokio::task::spawn_blocking(move || expire_sessions(&ctx))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
+/// Run [`terminal::Registry::reap_exited`] every `every`, for as long as the
+/// registry lives. Opening and listing terminals reap in passing; this is for
+/// the node nobody is using, whose exited shells would otherwise keep their
+/// pty masters until someone came back.
+fn spawn_terminal_reaper(terminals: &Arc<terminal::Registry>, every: std::time::Duration) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let weak = Arc::downgrade(terminals);
+    runtime.spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some(terminals) = weak.upgrade() else {
+                break;
+            };
+            if tokio::task::spawn_blocking(move || terminals.reap_exited())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
 /// Put the terminal commands on the bus.
 ///
 /// Returns the terminal registry so the caller can close sessions when a
@@ -462,11 +691,29 @@ pub fn register_terminal(
     registry: &Registry,
     cwd: std::path::PathBuf,
 ) -> Result<Arc<terminal::Registry>, crate::command::RegistryError> {
-    let terminals = Arc::new(terminal::Registry::new(
-        Arc::new(terminal::OsEnv),
-        Arc::new(terminal::NativeBackend),
-        terminal::Limits::default(),
-    ));
+    register_terminal_with(
+        registry,
+        cwd,
+        terminal::Registry::new(
+            Arc::new(terminal::OsEnv),
+            Arc::new(terminal::NativeBackend),
+            terminal::Limits::default(),
+        ),
+        TERMINAL_SWEEP,
+    )
+}
+
+/// [`register_terminal`] around a terminal registry the caller built, with
+/// exited terminals swept every `sweep`. The server uses the host's ptys,
+/// the wall clock and [`TERMINAL_SWEEP`]; a test passes its own.
+pub fn register_terminal_with(
+    registry: &Registry,
+    cwd: std::path::PathBuf,
+    terminals: terminal::Registry,
+    sweep: std::time::Duration,
+) -> Result<Arc<terminal::Registry>, crate::command::RegistryError> {
+    let terminals = Arc::new(terminals);
+    spawn_terminal_reaper(&terminals, sweep);
 
     registry.register(Open {
         terminals: Arc::clone(&terminals),
@@ -593,6 +840,30 @@ impl Windows {
         // that could not be launched at all.
         let status = self.starting(&p.app);
         if status == Some(crate::apps::WindowStatus::Unavailable) {
+            // An app awaiting the operator's approval is the common case, and
+            // the one the operator can fix from here, so it says how instead
+            // of pointing at a log.
+            if let Some(host) = self.host.get()
+                && let Some((Ok(state), asks)) = host.approval(&p.app)
+                && state.awaits_operator()
+            {
+                let title = host
+                    .installed()
+                    .into_iter()
+                    .find(|a| a.name == p.app)
+                    .and_then(|a| a.title)
+                    .unwrap_or_else(|| p.app.clone());
+                let why = if state == crate::apps::ApprovalState::Stale {
+                    "its approval no longer covers what it asks for"
+                } else {
+                    "it has not been approved"
+                };
+                return Err(failed(format!(
+                    "{} cannot run yet: {why}. It asks for {asks}. {}",
+                    p.app,
+                    crate::install::how_to_approve(&title)
+                )));
+            }
             return Err(failed(format!(
                 "{} is installed but cannot run on this node; see the log for why",
                 p.app
@@ -1255,6 +1526,10 @@ impl Command for Lockdown {
             // trigger: `Trigger::HostCommand`, not `Operator`.
             Issuer::Cli => false,
             Issuer::Agent { .. } => false,
+            // An app's window runs on a signed-in session but is not the
+            // operator. `system.*` is hard-denied to it before dispatch; this
+            // keeps the answer right even without that.
+            Issuer::AppUi { .. } => false,
         };
         let trigger = if signed_in {
             let surface = match params.surface.as_deref() {
@@ -1490,6 +1765,10 @@ pub fn app(
     // predecessor project ended up with a root that was decorative.
     files: Arc<crate::files::Namespace>,
 ) -> axum::Router {
+    // Here, in the one assembly `main` and the test harnesses share, so a
+    // node cannot be built that forgets to reap expired sessions.
+    spawn_session_expiry(&ctx, SESSION_SWEEP);
+
     // Each app's own web build, served from the core's origin at
     // `/apps/<name>/`. Behind `require_session`, which is the point: an app's
     // UI must not be reachable without signing in, and serving it here rather
@@ -1565,6 +1844,13 @@ pub fn app(
         })
         .merge(crate::passkeypage::page_router(passkeys.is_some()))
         .merge(app_ui)
+        // The cookie-route gate (docs/APP-UI-ISOLATION.md §4.9): `Origin:
+        // null`, another site's subresource, and a missing `Sec-Fetch-Site`
+        // on the routes that act are refused before any handler runs. A
+        // layer over everything, with its exemptions a closed list inside
+        // `fetchgate`, so a route merged later is gated by default. Inside
+        // the lockdown gate, which stays outermost.
+        .layer(axum::middleware::from_fn(crate::fetchgate::gate))
         // A `layer`, not a check inside each handler: the one handler that
         // forgot it would be the hole. `/unlock` and `/healthz` are what it
         // lets through — see `lockdown::ALLOWED_WHILE_LOCKED`.
@@ -1602,6 +1888,15 @@ impl Command for ListApps {
             .into_iter()
             .map(|info| {
                 let status = self.host.window_status(&info.name);
+                // Whether the operator still has to approve it, so the shell
+                // can offer "Approve <app>" before a window fails to open.
+                // `unknown` when the approvals could not be read; the launch
+                // refuses in that case, and says why.
+                let (approval, asks) = match self.host.approval(&info.name) {
+                    Some((Ok(state), asks)) => (state.as_str(), Some(asks)),
+                    Some((Err(_), asks)) => ("unknown", Some(asks)),
+                    None => ("unknown", None),
+                };
                 serde_json::json!({
                     "name": info.name,
                     "title": info.title.clone().unwrap_or_else(|| info.name.clone()),
@@ -1611,11 +1906,24 @@ impl Command for ListApps {
                         crate::apps::Lifecycle::OnDemand => "on-demand",
                     },
                     "min_width": info.min_width,
+                    // The rest of the app contract, so the shell's dock is
+                    // built from what is installed rather than from a list
+                    // compiled into the bundle. Absent stays null: the shell
+                    // owns the defaults, and a core inventing them here would
+                    // be a second place to change them.
+                    "tag": info.tag,
+                    "summary": info.summary,
+                    "default_width": info.default_width,
+                    "default_height": info.default_height,
+                    "compact": info.compact,
+                    "wide": info.wide,
                     "status": match status {
                         crate::apps::WindowStatus::Live => "live",
                         crate::apps::WindowStatus::Reconnecting => "reconnecting",
                         crate::apps::WindowStatus::Unavailable => "unavailable",
                     },
+                    "approval": approval,
+                    "asks": asks,
                 })
             })
             .collect();
@@ -1647,6 +1955,10 @@ impl Command for ApproveApp {
     type Params = AppRef;
     type Output = Value;
 
+    fn subject(&self, p: &AppRef) -> Option<String> {
+        Some(p.app.clone())
+    }
+
     async fn run(&self, p: AppRef, _cx: Context) -> Result<Value, CommandError> {
         let grant = self
             .host
@@ -1673,6 +1985,10 @@ impl Command for RevokeApp {
 
     type Params = AppRef;
     type Output = ();
+
+    fn subject(&self, p: &AppRef) -> Option<String> {
+        Some(p.app.clone())
+    }
 
     async fn run(&self, p: AppRef, _cx: Context) -> Result<(), CommandError> {
         self.host.revoke(&p.app).map_err(|e| failed(e.to_string()))

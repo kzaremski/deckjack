@@ -34,6 +34,14 @@ use deckjack_core::sandbox;
 const INSTALL: &str = "/install";
 const WORK: &str = "/work";
 
+/// Where the core listens, for the hosts most tests build: a node bound to
+/// its tailnet address, where a legacy whole-network grant does not reach the
+/// core on loopback. The D2 tests below build their own hosts on loopback.
+const CORE_LISTEN: std::net::SocketAddr = std::net::SocketAddr::new(
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 0, 1)),
+    7878,
+);
+
 /// A filesystem, a clock, a process table and a kernel, all in memory.
 ///
 /// Cloneable because [`Host`] takes its `Env` by value and gives it back
@@ -60,6 +68,8 @@ struct World {
     next_pid: Mutex<u32>,
     signaled: Mutex<Vec<u32>>,
     created: Mutex<Vec<PathBuf>>,
+    /// Pairs of spellings that are one file, as on a case-folding mount.
+    same: Mutex<Vec<(PathBuf, PathBuf)>>,
 }
 
 impl FakeEnv {
@@ -118,6 +128,18 @@ impl FakeEnv {
             .lock()
             .unwrap()
             .insert(PathBuf::from(at), PathBuf::from(target));
+    }
+
+    /// `a` and `b` are one file under two names, the way `BIN` is `bin` on a
+    /// filesystem that folds case (and `realpath` answers as written).
+    fn same_file_as(&self, a: &str, b: &str) {
+        self.mkdir(a);
+        self.mkdir(b);
+        self.inner
+            .same
+            .lock()
+            .unwrap()
+            .push((PathBuf::from(a), PathBuf::from(b)));
     }
 
     fn advance(&self, secs: u64) {
@@ -214,6 +236,18 @@ impl Env for FakeEnv {
             return Ok(path.to_path_buf());
         }
         Err(io::Error::new(io::ErrorKind::NotFound, "no such path"))
+    }
+
+    fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
+        let (a, b) = (self.canonicalize(a)?, self.canonicalize(b)?);
+        Ok(a == b
+            || self
+                .inner
+                .same
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(x, y)| (x == &a && y == &b) || (x == &b && y == &a)))
     }
 
     fn create_private_dir(&self, path: &Path) -> io::Result<()> {
@@ -349,6 +383,7 @@ fn host_with(env: &FakeEnv, policy: apps::Policy, grants: FakeGrants) -> Host<Fa
     Host::new(
         PathBuf::from(INSTALL),
         PathBuf::from(WORK),
+        apps::CoreDoor::new(CORE_LISTEN, vec![]),
         env.clone(),
         policy,
         Box::new(grants),
@@ -735,6 +770,82 @@ fn a_plan_grants_only_what_the_manifest_asked_for_inside_the_working_directory()
     }
 }
 
+#[test]
+fn a_gpu_app_is_granted_the_compute_device_and_others_are_not() {
+    // `/dev/kfd` is a character device, not a directory. It used to be
+    // carried as "unexpressible" and never granted, so `gpu = true` got the
+    // approval prompt and no device. Now it has to land in the policy's file
+    // list — and only for an app that asked.
+    let env = FakeEnv::new();
+    env.write("/dev/kfd", "");
+    env.write("/dev/null", "");
+    env.write("/dev/urandom", "");
+    install(
+        &env,
+        "photo",
+        &format!("{}\n[needs]\ngpu = true\n", manifest_text("photo", "")),
+    );
+    install(&env, "notes", &manifest_text("notes", ""));
+
+    let gpu = plan_for(&env, "photo").expect("a gpu manifest must produce a plan");
+    let plain = plan_for(&env, "notes").expect("a plain manifest must produce a plan");
+
+    let kfd = PathBuf::from("/dev/kfd");
+    assert!(
+        gpu.sandbox.policy.read_write_files.contains(&kfd),
+        "an app that asked for the GPU gets the compute device read-write: {:?}",
+        gpu.sandbox.policy
+    );
+    assert!(
+        !plain.sandbox.policy.read_write_files.contains(&kfd)
+            && !plain.sandbox.policy.read_files.contains(&kfd),
+        "an app that did not ask for the GPU never sees it: {:?}",
+        plain.sandbox.policy
+    );
+
+    // Every app gets the null device to write to and the entropy device to
+    // read, as files: in a directory list either one would fail the ruleset.
+    for plan in [&gpu, &plain] {
+        let policy = &plan.sandbox.policy;
+        assert!(
+            policy
+                .read_write_files
+                .contains(&PathBuf::from("/dev/null"))
+        );
+        assert!(policy.read_files.contains(&PathBuf::from("/dev/urandom")));
+        for file in policy.read_files.iter().chain(&policy.read_write_files) {
+            assert!(
+                !policy.read.contains(file) && !policy.read_write.contains(file),
+                "{} is a file and must not be in a directory list",
+                file.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_system_file_this_machine_lacks_is_not_granted() {
+    // Handing Landlock a path that is not there fails the whole ruleset, so a
+    // machine with no AMD GPU must plan no `/dev/kfd` rather than fail every
+    // GPU app's launch.
+    let env = FakeEnv::new();
+    install(
+        &env,
+        "photo",
+        &format!("{}\n[needs]\ngpu = true\n", manifest_text("photo", "")),
+    );
+    let plan = plan_for(&env, "photo").expect("plan");
+    assert!(
+        !plan
+            .sandbox
+            .policy
+            .read_write_files
+            .contains(&PathBuf::from("/dev/kfd")),
+        "{:?}",
+        plan.sandbox.policy
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A node that cannot confine does not run apps
 // ---------------------------------------------------------------------------
@@ -823,7 +934,7 @@ fn an_app_that_asked_for_no_network_is_refused_where_that_cannot_be_enforced() {
         ),
     );
     let plan = plan_for(&env, "notes").expect("an app that asked for network still runs");
-    assert!(plan.sandbox.policy.network);
+    assert!(plan.sandbox.policy.network.is_whole());
     assert!(
         plan.sandbox.network_is_coarse(),
         "a per-host allowlist that cannot be installed must be reported, not hidden"
@@ -1905,6 +2016,68 @@ fn a_ui_asset_that_is_not_base64_is_refused_instead_of_served() {
     assert!(asset.immutable, "a hashed asset stays cacheable");
 }
 
+/// An app's bytes are cached by the browser that fetched them and by nobody
+/// else. `public` would authorize a shared cache to hand a hashed asset to a
+/// client with no session (docs/APP-UI-ISOLATION.md §4.2).
+#[tokio::test]
+async fn an_apps_ui_assets_are_cached_privately_or_not_at_all() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    struct OneApp;
+    impl apps::UiHost for OneApp {
+        fn window_status(&self, _app: &str) -> WindowStatus {
+            WindowStatus::Live
+        }
+        fn ui_asset(&self, _app: &str, path: &str) -> Result<Option<apps::UiAsset>, apps::UiError> {
+            Ok(Some(apps::UiAsset {
+                content_type: "text/javascript".to_string(),
+                bytes: b"export {}".to_vec(),
+                // Only a content-hashed file is immutable.
+                immutable: path.starts_with("assets/"),
+            }))
+        }
+    }
+
+    let app = axum::Router::new().nest(apps::UI_MOUNT, apps::ui_router(Arc::new(OneApp)));
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port");
+    let addr = tcp.local_addr().expect("the bound address");
+    tokio::spawn(async move {
+        let _ = axum::serve(tcp, app).await;
+    });
+
+    for (path, want) in [
+        (
+            "/apps/pim/assets/index-abc123.js",
+            "private, max-age=31536000, immutable",
+        ),
+        ("/apps/pim/", "no-store"),
+    ] {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("send");
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).await.expect("read");
+        let cache = raw
+            .lines()
+            .find_map(|l| {
+                l.split_once(':')
+                    .filter(|(k, _)| k.eq_ignore_ascii_case("cache-control"))
+                    .map(|(_, v)| v.trim().to_string())
+            })
+            .unwrap_or_default();
+        assert!(raw.starts_with("HTTP/1.1 200"), "{path}: {raw}");
+        assert_eq!(cache, want, "{path}");
+        assert!(!cache.contains("public"), "{path}: {cache}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Smaller claims the rest of the module rests on
 // ---------------------------------------------------------------------------
@@ -1968,4 +2141,935 @@ fn an_app_socket_lives_in_the_install_directory_and_never_in_the_working_one() {
     assert!(path.starts_with(INSTALL));
     assert!(!path.starts_with(WORK));
     assert!(path.to_string_lossy().contains("pim"));
+}
+
+// ---------------------------------------------------------------------------
+// The dock fields: what the shell builds its app table from
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_manifest_carries_the_dock_fields_the_shell_needs() {
+    let manifest = load_manifest(&manifest_text(
+        "photo",
+        "title = \"Photos\"\ntag = \"Ph\"\nsummary = \"Edit and sort photographs\"\n\
+         min_width = 360\ndefault_width = 900\ndefault_height = 600\ncompact = false\n",
+    ))
+    .expect("a manifest with every dock field");
+    let app = &manifest.app;
+    assert_eq!(app.tag.as_deref(), Some("Ph"));
+    assert_eq!(app.summary.as_deref(), Some("Edit and sort photographs"));
+    assert_eq!(
+        (app.default_width, app.default_height),
+        (Some(900), Some(600))
+    );
+    assert!(!app.compact, "an app may say it has no compact layout");
+    assert!(app.wide);
+}
+
+#[test]
+fn an_app_that_says_nothing_about_layouts_supports_both() {
+    // The app contract says every app does both. Absent must mean that, or
+    // every manifest written before these fields existed would vanish from
+    // one of the two modes.
+    let manifest = load_manifest(&manifest_text("plain", "")).unwrap();
+    assert!(manifest.app.compact && manifest.app.wide);
+    assert_eq!(manifest.app.tag, None);
+    assert_eq!(manifest.app.summary, None);
+}
+
+#[test]
+fn dock_fields_the_shell_could_not_render_are_refused_at_discovery() {
+    for (extra, names) in [
+        ("tag = \"Pho\"\n", "app.tag"),
+        ("tag = \"\"\n", "app.tag"),
+        ("tag = \"P!\"\n", "app.tag"),
+        ("summary = \"\"\n", "app.summary"),
+        ("summary = \"two\\nlines\"\n", "app.summary"),
+        (
+            &*format!("summary = \"{}\"\n", "x".repeat(121)),
+            "app.summary",
+        ),
+        (
+            "min_width = 400\ndefault_width = 300\n",
+            "app.default_width",
+        ),
+        ("default_height = 0\n", "app.default_height"),
+        ("compact = false\nwide = false\n", "app.compact"),
+    ] {
+        let refused = load_manifest(&manifest_text("bad", extra));
+        match refused {
+            Err(ManifestError::Invalid { message, .. }) => assert!(
+                message.contains(names),
+                "{extra:?} was refused, but the message does not name {names}: {message}"
+            ),
+            other => panic!("{extra:?} must be refused as invalid, got {other:?}"),
+        }
+    }
+    // The edges that are fine, so the rules above are limits and not bans.
+    for extra in [
+        "tag = \"P\"\n",
+        "tag = \"9z\"\n",
+        &*format!("summary = \"{}\"\n", "x".repeat(120)),
+        "min_width = 400\ndefault_width = 400\n",
+        "wide = false\n",
+    ] {
+        load_manifest(&manifest_text("good", extra))
+            .unwrap_or_else(|e| panic!("{extra:?} should be accepted: {e}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Network granularity: TCP ports through Landlock
+// ---------------------------------------------------------------------------
+
+fn with_needs(name: &str, needs: &str) -> String {
+    format!("{}\n[needs]\n{needs}\n", manifest_text(name, ""))
+}
+
+#[test]
+fn naming_tcp_ports_narrows_the_network_to_exactly_those_ports() {
+    let env = FakeEnv::new();
+    env.mkdir("/run/systemd/resolve");
+    let resolver = Path::new("/run/systemd/resolve");
+
+    install(
+        &env,
+        "pim",
+        &with_needs(
+            "pim",
+            "network = [\"cloud.example.net\"]\nconnect_tcp = [443, 8443]",
+        ),
+    );
+    let plan = plan_for(&env, "pim").expect("a ported manifest plans");
+    assert_eq!(
+        plan.sandbox.policy.network,
+        sandbox::Network::Ports {
+            connect_tcp: vec![443, 8443],
+            bind_tcp: vec![],
+        },
+        "the ports the manifest named are the ones the kernel is told"
+    );
+    assert!(
+        !plan.sandbox.network_is_coarse(),
+        "a manifest narrowed to ports is not reported as the whole network"
+    );
+    assert!(
+        plan.sandbox.policy.read.iter().any(|p| p == resolver),
+        "an app that connects to hosts by name can read the resolver config"
+    );
+
+    // Listening only: no outbound port, so no hosts needed and no DNS.
+    install(&env, "dev", &with_needs("dev", "bind_tcp = [8080]"));
+    let plan = plan_for(&env, "dev").expect("a bind-only manifest plans");
+    assert_eq!(
+        plan.sandbox.policy.network,
+        sandbox::Network::Ports {
+            connect_tcp: vec![],
+            bind_tcp: vec![8080],
+        }
+    );
+    assert!(
+        !plan.sandbox.policy.read.iter().any(|p| p == resolver),
+        "an app that only listens has no use for the resolver config"
+    );
+}
+
+#[test]
+fn the_old_network_keys_mean_what_they_meant_when_they_were_approved() {
+    let env = FakeEnv::new();
+    env.mkdir("/run/systemd/resolve");
+    let resolver = Path::new("/run/systemd/resolve");
+
+    install(&env, "quiet", &manifest_text("quiet", ""));
+    let plan = plan_for(&env, "quiet").unwrap();
+    assert!(
+        plan.sandbox.policy.network.is_denied(),
+        "no hosts and no ports is no TCP at all: {:?}",
+        plan.sandbox.policy.network
+    );
+    assert!(!plan.sandbox.policy.read.iter().any(|p| p == resolver));
+
+    install(
+        &env,
+        "pim",
+        &with_needs("pim", "network = [\"cloud.example.net\"]"),
+    );
+    let plan = plan_for(&env, "pim").unwrap();
+    assert!(
+        plan.sandbox.policy.network.is_whole(),
+        "hosts with no ports keep the whole network, so an approved manifest does not break"
+    );
+    assert!(plan.sandbox.network_is_coarse());
+    assert!(plan.sandbox.policy.read.iter().any(|p| p == resolver));
+}
+
+#[test]
+fn ports_on_a_kernel_without_network_rules_are_refused_not_widened() {
+    let env = FakeEnv::new();
+    env.set_availability(sandbox::Availability::Enforcing {
+        landlock_abi: 3,
+        network_rules: false,
+    });
+    for (name, needs) in [
+        (
+            "pim",
+            "network = [\"cloud.example.net\"]\nconnect_tcp = [443]",
+        ),
+        ("dev", "bind_tcp = [8080]"),
+    ] {
+        install(&env, name, &with_needs(name, needs));
+        match plan_for(&env, name) {
+            Err(ConfinementError::NoNetworkRules { abi, .. }) => assert_eq!(abi, 3),
+            other => {
+                panic!("{name}: a port list that cannot be installed must refuse, got {other:?}")
+            }
+        }
+    }
+}
+
+#[test]
+fn a_port_list_that_cannot_mean_what_it_says_is_refused() {
+    for (needs, names) in [
+        ("network = [\"a.example\"]\nconnect_tcp = [0]", "port 0"),
+        ("bind_tcp = [0]", "port 0"),
+        (
+            "network = [\"a.example\"]\nconnect_tcp = [443, 443]",
+            "443 twice",
+        ),
+        ("bind_tcp = [8080, 8080]", "8080 twice"),
+        ("connect_tcp = [443]", "needs.network"),
+        // Hosts are where the app reaches out to; once ports are named, no
+        // connect port means no outbound TCP, so the host list would promise
+        // the operator a grant the sandbox does not install.
+        (
+            "network = [\"cloud.example.net\"]\nbind_tcp = [8080]",
+            "needs.connect_tcp",
+        ),
+    ] {
+        match load_manifest(&with_needs("bad", needs)) {
+            Err(ManifestError::Invalid { message, .. }) => assert!(
+                message.contains(names),
+                "{needs:?} was refused, but the message does not say {names:?}: {message}"
+            ),
+            other => panic!("{needs:?} must be refused as invalid, got {other:?}"),
+        }
+    }
+    // Not a TCP port at all: toml says so before validation does.
+    assert!(matches!(
+        load_manifest(&with_needs("bad", "bind_tcp = [70000]")),
+        Err(ManifestError::Parse { .. })
+    ));
+    // The edges that are fine.
+    for needs in [
+        "bind_tcp = [8080]",
+        "network = [\"a.example\"]\nconnect_tcp = [443, 65535]",
+        "network = [\"a.example\"]\nconnect_tcp = [443]\nbind_tcp = [443]",
+    ] {
+        load_manifest(&with_needs("good", needs))
+            .unwrap_or_else(|e| panic!("{needs:?} should be accepted: {e}"));
+    }
+}
+
+#[test]
+fn a_listening_port_alone_is_still_something_the_operator_approves() {
+    let env = FakeEnv::new();
+    install(&env, "dev", &with_needs("dev", "bind_tcp = [8080]"));
+    let mut host = host(&env);
+    host.refresh();
+    match host.open_window("dev") {
+        Err(HostError::NotApproved { summary, .. }) => assert!(
+            mentions(&summary, &["8080"]),
+            "the operator is told which port it listens on: {summary}"
+        ),
+        other => panic!("a bind grant must need approval, got {other:?}"),
+    }
+    assert_eq!(env.spawn_count(), 0);
+}
+
+#[test]
+fn the_approval_summary_names_the_ports() {
+    let manifest = load_manifest(&with_needs(
+        "pim",
+        "network = [\"cloud.example.net\"]\nconnect_tcp = [443, 993]\nbind_tcp = [8080]",
+    ))
+    .unwrap();
+    let summary = apps::summarize(&manifest.needs);
+    assert!(
+        mentions(&summary, &["cloud.example.net", "443", "993", "8080"]),
+        "{summary}"
+    );
+}
+
+#[test]
+fn a_fingerprint_covers_the_port_grants_and_not_their_order() {
+    let base = |needs: &str| {
+        load_manifest(&format!(
+            "{}\n[needs]\n{needs}\nworking_dir = [{{ path = \"Docs\", write = true }}]\n{}",
+            manifest_text("pim", ""),
+            command_block("pim.event.create", "write")
+        ))
+        .unwrap()
+        .fingerprint()
+    };
+    let legacy = base("network = [\"cloud.example.net\"]");
+    // A manifest naming no ports must hash as if the port fields did not
+    // exist (they are skipped when empty). If this moves, every app already
+    // approved with a host list is re-asked on upgrade for nothing. Pinned
+    // to the SHA-256 scheme that replaced FNV-1a; that switch re-asks once.
+    assert_eq!(
+        legacy, "sha256:a987f93aaa9164be992ff62c6deb7b0c86cf55fbbd944cc9cf29e05385ce49fd",
+        "a manifest naming no ports must hash as it did before ports existed"
+    );
+
+    let https = base("network = [\"cloud.example.net\"]\nconnect_tcp = [443, 993]");
+    for (changed, what) in [
+        (
+            base("network = [\"cloud.example.net\"]\nconnect_tcp = [443]"),
+            "a connect port added",
+        ),
+        (https.clone(), "connect ports named"),
+        (
+            base("network = [\"cloud.example.net\"]\nconnect_tcp = [443, 993]\nbind_tcp = [8080]"),
+            "a bind port added",
+        ),
+        (
+            base("network = [\"cloud.example.net\"]\nconnect_tcp = [993]\nbind_tcp = [443]"),
+            "a port moved from connect to bind",
+        ),
+    ] {
+        assert_ne!(legacy, changed, "{what} must need approving again");
+    }
+    assert_ne!(
+        https,
+        base("network = [\"cloud.example.net\"]\nconnect_tcp = [443, 994]"),
+        "a different port must need approving again"
+    );
+    assert_ne!(
+        https,
+        base("network = [\"cloud.example.net\"]\nconnect_tcp = [993]\nbind_tcp = [443]"),
+        "moving a port between connect and bind must need approving again"
+    );
+    assert_eq!(
+        https,
+        base("network = [\"cloud.example.net\"]\nconnect_tcp = [993, 443]"),
+        "the same ports in another order are the same grant"
+    );
+    assert_eq!(
+        base("network = [\"cloud.example.net\"]\nconnect_tcp = [443]\nbind_tcp = [8080, 9090]"),
+        base("network = [\"cloud.example.net\"]\nconnect_tcp = [443]\nbind_tcp = [9090, 8080]"),
+        "the same listening ports in another order are the same grant"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The install directory's own entries
+// ---------------------------------------------------------------------------
+//
+// The working directory defaults to the install directory, so a manifest's
+// `bin` is, by default, the directory holding the unconfined core binary, and
+// `apps` holds every other app's binary. Neither the manifest nor the
+// filesystem may lead a grant there.
+
+fn plan_in(env: &FakeEnv, name: &str, working_dir: &str) -> Result<LaunchPlan, ConfinementError> {
+    let installed = discovered(env, name);
+    LaunchPlan::build(
+        &installed,
+        Path::new(INSTALL),
+        Path::new(working_dir),
+        Confinement::Enforced,
+        env,
+    )
+}
+
+#[test]
+fn a_manifest_naming_an_install_directory_entry_is_refused() {
+    for path in [
+        "bin",
+        "apps",
+        "apps/notes",
+        "run",
+        "keys",
+        "cache",
+        "cache/apps/other/home",
+        "debug-session.cookie",
+        "server.log",
+        "./bin",
+    ] {
+        let toml = format!(
+            "{}\n[needs]\nworking_dir = [{{ path = \"{path}\", write = true }}]\n",
+            manifest_text("pim", "")
+        );
+        match load_manifest(&toml) {
+            Err(ManifestError::Invalid { message, .. }) => assert!(
+                message.contains("install directory"),
+                "{path}: the operator must be told why: {message}"
+            ),
+            other => panic!("path {path:?} must be refused, got {other:?}"),
+        }
+    }
+
+    // The controls: ordinary names, including ones that merely contain or
+    // sit below an entry's name somewhere else, and the operator's own
+    // `Cache` or `Apps`: on a case-sensitive filesystem those are not the
+    // entries, and only the launcher can tell a folding one (see
+    // `a_grant_spelling_an_entry_in_another_case_is_refused_where_it_is_that_entry`).
+    for path in [
+        "Notes",
+        "binaries",
+        "Docs/bin",
+        "Projects/apps",
+        "Cache",
+        "Apps",
+        "BIN",
+    ] {
+        let toml = format!(
+            "{}\n[needs]\nworking_dir = [{{ path = \"{path}\", write = true }}]\n",
+            manifest_text("pim", "")
+        );
+        load_manifest(&toml).unwrap_or_else(|e| panic!("{path:?} must be accepted: {e}"));
+    }
+}
+
+#[test]
+fn a_grant_whose_real_path_is_an_install_directory_entry_is_not_granted() {
+    // The working directory is the install directory, as by default, and the
+    // manifest is clean: the filesystem leads it into `bin/`.
+    let env = FakeEnv::new();
+    install(
+        &env,
+        "pim",
+        &format!(
+            "{}\n[needs]\nworking_dir = [{{ path = \"Tools\", write = true }}]\n",
+            manifest_text("pim", "")
+        ),
+    );
+    env.symlink_dir("/install/Tools", "/install/bin");
+
+    match plan_in(&env, "pim", INSTALL) {
+        Err(ConfinementError::InstallDenied { path, denied, .. }) => {
+            assert_eq!(path, PathBuf::from("/install/bin"));
+            assert_eq!(denied, PathBuf::from("/install/bin"));
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    // Into another app's directory, the same.
+    env.symlink_dir("/install/Tools", "/install/apps/other");
+    assert!(
+        matches!(
+            plan_in(&env, "pim", INSTALL),
+            Err(ConfinementError::InstallDenied { .. })
+        ),
+        "a grant on another app's directory must be refused"
+    );
+}
+
+#[test]
+fn a_grant_containing_the_install_directory_is_refused() {
+    // A working directory above the install directory: a grant on the tree
+    // holding it reaches every entry through that tree.
+    let env = FakeEnv::new();
+    install(
+        &env,
+        "pim",
+        &format!(
+            "{}\n[needs]\nworking_dir = [{{ path = \"install\" }}]\n",
+            manifest_text("pim", "")
+        ),
+    );
+
+    match plan_in(&env, "pim", "/") {
+        Err(ConfinementError::InstallDenied { path, .. }) => {
+            assert_eq!(path, PathBuf::from("/install"));
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_ordinary_grant_in_the_install_directory_is_still_granted() {
+    // The control for the two above: with the working directory being the
+    // install directory, the operator's own folders in it are grantable.
+    let env = FakeEnv::new();
+    install(
+        &env,
+        "pim",
+        &format!(
+            "{}\n[needs]\nworking_dir = [{{ path = \"Calendars\", write = true }}]\n",
+            manifest_text("pim", "")
+        ),
+    );
+
+    let plan = plan_in(&env, "pim", INSTALL).expect("an ordinary folder must be granted");
+    assert!(
+        plan.sandbox
+            .policy
+            .read_write
+            .contains(&PathBuf::from("/install/Calendars")),
+        "{:?}",
+        plan.sandbox.policy.read_write
+    );
+}
+
+#[test]
+fn a_grant_spelling_an_entry_in_another_case_is_refused_where_it_is_that_entry() {
+    // The manifest check lets `BIN` through: on a case-sensitive filesystem
+    // it is the operator's folder. On a folding mount it is `bin/` itself,
+    // and only the launcher, which can ask the filesystem, can tell.
+    let env = FakeEnv::new();
+    install(
+        &env,
+        "pim",
+        &format!(
+            "{}\n[needs]\nworking_dir = [{{ path = \"BIN\", write = true }}]\n",
+            manifest_text("pim", "")
+        ),
+    );
+    env.same_file_as("/install/BIN", "/install/bin");
+    match plan_in(&env, "pim", INSTALL) {
+        Err(ConfinementError::InstallDenied { path, denied, .. }) => {
+            assert_eq!(path, PathBuf::from("/install/BIN"));
+            assert_eq!(denied, PathBuf::from("/install/bin"));
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    // The control: where `Cache` is a folder of its own, it is granted.
+    install(
+        &env,
+        "pim",
+        &format!(
+            "{}\n[needs]\nworking_dir = [{{ path = \"Cache\", write = true }}]\n",
+            manifest_text("pim", "")
+        ),
+    );
+    env.mkdir("/install/cache");
+    let plan = plan_in(&env, "pim", INSTALL).expect("the operator's Cache is grantable");
+    assert!(
+        plan.sandbox
+            .policy
+            .read_write
+            .contains(&PathBuf::from("/install/Cache")),
+        "{:?}",
+        plan.sandbox.policy.read_write
+    );
+}
+
+#[test]
+fn an_approval_from_before_the_sha256_fingerprint_is_reported_stale_and_can_be_given_again() {
+    let env = FakeEnv::new();
+    install(
+        &env,
+        "pim",
+        &format!(
+            "{}\n[needs]\nnetwork = [\"cloud.example.net\"]\n",
+            manifest_text("pim", "")
+        ),
+    );
+    let grants = FakeGrants::default();
+    let mut host = host_with(&env, apps::Policy::default(), grants.clone());
+    host.refresh();
+    assert_eq!(host.approval("pim").unwrap(), apps::ApprovalState::Required);
+
+    host.approve("pim").unwrap();
+    assert_eq!(host.approval("pim").unwrap(), apps::ApprovalState::Approved);
+
+    // What a grant recorded by a build that hashed with fnv1a64 looks like.
+    grants.stored.lock().unwrap().as_mut().unwrap().fingerprint =
+        "fnv1a64:0123456789abcdef".to_string();
+    assert_eq!(host.approval("pim").unwrap(), apps::ApprovalState::Stale);
+    match host.open_window("pim") {
+        Err(e @ HostError::GrantStale { .. }) => {
+            assert!(e.to_string().contains("Approve pim"), "{e}");
+        }
+        other => panic!("expected a stale grant, got {other:?}"),
+    }
+
+    host.approve("pim").unwrap();
+    assert_eq!(host.approval("pim").unwrap(), apps::ApprovalState::Approved);
+}
+
+// ---------------------------------------------------------------------------
+// D2: no app grant may reach the core's own front door
+// ---------------------------------------------------------------------------
+
+fn host_listening_on(env: &FakeEnv, listen: &str, grants: FakeGrants) -> Host<FakeEnv> {
+    host_behind(env, listen, &[], grants)
+}
+
+/// A host whose core listens on `listen` and believes `trusted` over TCP.
+fn host_behind(
+    env: &FakeEnv,
+    listen: &str,
+    trusted: &[std::net::IpAddr],
+    grants: FakeGrants,
+) -> Host<FakeEnv> {
+    Host::new(
+        PathBuf::from(INSTALL),
+        PathBuf::from(WORK),
+        apps::CoreDoor::new(listen.parse().unwrap(), trusted.to_vec()),
+        env.clone(),
+        apps::Policy::default(),
+        Box::new(grants),
+    )
+}
+
+/// A grant stored before the rule existed: its fingerprint matches, so only
+/// the launch-time check stands between it and a process.
+fn grandfathered(env: &FakeEnv, name: &str) -> FakeGrants {
+    let installed = discovered(env, name);
+    let grants = FakeGrants::default();
+    grants
+        .record(&Grant {
+            app: name.to_string(),
+            fingerprint: installed.manifest.fingerprint(),
+            needs: installed.manifest.needs.clone(),
+            granted_at: 1,
+        })
+        .unwrap();
+    grants
+}
+
+#[test]
+fn a_grant_of_the_cores_port_is_refused_at_approval_and_at_launch() {
+    let env = FakeEnv::new();
+    install(
+        &env,
+        "probe",
+        &with_needs(
+            "probe",
+            "network = [\"a.example\"]\nconnect_tcp = [443, 7878]",
+        ),
+    );
+
+    // On every listen address: a Landlock port rule reaches every address
+    // that serves the port.
+    for listen in ["127.0.0.1:7878", "100.64.0.1:7878", "0.0.0.0:7878"] {
+        let mut host = host_listening_on(&env, listen, FakeGrants::default());
+        host.refresh();
+        match host.approve("probe") {
+            Err(HostError::ReachesCore {
+                app, port, reason, ..
+            }) => {
+                assert_eq!(app, "probe");
+                assert_eq!(port, 7878);
+                assert!(reason.contains("7878"), "{reason}");
+            }
+            other => panic!("{listen}: approving the core's port must be refused, got {other:?}"),
+        }
+
+        let mut host = host_listening_on(&env, listen, grandfathered(&env, "probe"));
+        host.refresh();
+        let opened = host.open_window("probe");
+        assert!(
+            matches!(opened, Err(HostError::ReachesCore { .. })),
+            "{listen}: {opened:?}"
+        );
+    }
+    assert_eq!(
+        env.spawn_count(),
+        0,
+        "nothing granted the core's port was spawned"
+    );
+
+    // Control: the same app on a core listening on another port launches.
+    let mut host = host_listening_on(&env, "127.0.0.1:9999", FakeGrants::default());
+    host.refresh();
+    host.approve("probe")
+        .expect("another port is not the core's");
+    host.open_window("probe").expect("and it launches");
+    assert_eq!(env.spawn_count(), 1);
+}
+
+#[test]
+fn a_whole_network_grant_is_refused_while_the_core_listens_on_loopback() {
+    let env = FakeEnv::new();
+    install(
+        &env,
+        "pim",
+        &with_needs("pim", "network = [\"cloud.example.net\"]"),
+    );
+
+    // Loopback, and the unspecified address, which accepts loopback too.
+    for listen in ["127.0.0.1:7878", "[::1]:7878", "0.0.0.0:7878", "[::]:7878"] {
+        let mut host = host_listening_on(&env, listen, FakeGrants::default());
+        host.refresh();
+        assert!(
+            matches!(host.approve("pim"), Err(HostError::ReachesCore { .. })),
+            "{listen}: a whole-network grant must not be approvable"
+        );
+        let mut host = host_listening_on(&env, listen, grandfathered(&env, "pim"));
+        host.refresh();
+        let opened = host.open_window("pim");
+        match &opened {
+            Err(e @ HostError::ReachesCore { .. }) => {
+                // The operator is told what to change.
+                assert!(e.to_string().contains("connect_tcp"), "{e}");
+            }
+            other => panic!("{listen}: expected a refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(env.spawn_count(), 0);
+
+    // Control: a core bound only to its tailnet address, believing nothing
+    // over TCP (the server.unix_socket setup), is not reachable from any
+    // trusted address.
+    let mut host = host_listening_on(&env, "100.64.0.1:7878", FakeGrants::default());
+    host.refresh();
+    host.approve("pim")
+        .expect("not reachable from a trusted address");
+    host.open_window("pim").expect("launches");
+    assert_eq!(env.spawn_count(), 1);
+}
+
+#[test]
+fn a_whole_network_grant_is_refused_while_any_address_is_trusted_over_tcp() {
+    // A TCP `tailscale serve` pointed at the node's own tailnet address
+    // arrives from that address, so the operator trusts it. An app under no
+    // TCP rule can connect to the core from that same address and be
+    // believed. Loopback and IPv4-mapped loopback are the same case.
+    let env = FakeEnv::new();
+    install(
+        &env,
+        "pim",
+        &with_needs("pim", "network = [\"cloud.example.net\"]"),
+    );
+    for trusted in ["100.64.0.1", "127.0.0.1", "::ffff:127.0.0.1"] {
+        let trusted: std::net::IpAddr = trusted.parse().unwrap();
+        let mut host = host_behind(&env, "100.64.0.1:7878", &[trusted], FakeGrants::default());
+        host.refresh();
+        assert!(
+            matches!(host.approve("pim"), Err(HostError::ReachesCore { .. })),
+            "trusting {trusted}: a whole-network grant must not be approvable"
+        );
+        let mut host = host_behind(
+            &env,
+            "100.64.0.1:7878",
+            &[trusted],
+            grandfathered(&env, "pim"),
+        );
+        host.refresh();
+        let opened = host.open_window("pim");
+        match &opened {
+            Err(e @ HostError::ReachesCore { .. }) => {
+                assert!(e.to_string().contains("trusted_proxies"), "{e}");
+            }
+            other => panic!("trusting {trusted}: expected a refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(env.spawn_count(), 0);
+
+    // Control: naming ports puts the app under Landlock's port rules, and a
+    // port that is not the core's cannot reach it from any address.
+    install(
+        &env,
+        "mail",
+        &with_needs(
+            "mail",
+            "network = [\"imap.example.net\"]\nconnect_tcp = [993]",
+        ),
+    );
+    let trusted: std::net::IpAddr = "100.64.0.1".parse().unwrap();
+    let mut host = host_behind(&env, "100.64.0.1:7878", &[trusted], FakeGrants::default());
+    host.refresh();
+    host.approve("mail")
+        .expect("ports other than the core's are fine");
+    host.open_window("mail").expect("launches");
+    assert_eq!(env.spawn_count(), 1);
+}
+
+#[test]
+fn an_ipv4_mapped_loopback_listen_address_is_loopback() {
+    let needs = apps::Needs {
+        network: vec!["cloud.example.net".to_string()],
+        ..apps::Needs::default()
+    };
+    assert!(
+        apps::reaches_core(
+            &needs,
+            &apps::CoreDoor::new("[::ffff:127.0.0.1]:7878".parse().unwrap(), vec![])
+        )
+        .is_some()
+    );
+}
+
+#[test]
+fn naming_ports_that_are_not_the_cores_is_allowed_on_loopback() {
+    let env = FakeEnv::new();
+    install(
+        &env,
+        "pim",
+        &with_needs(
+            "pim",
+            "network = [\"cloud.example.net\"]\nconnect_tcp = [443, 993]",
+        ),
+    );
+    let mut host = host_listening_on(&env, "127.0.0.1:7878", FakeGrants::default());
+    host.refresh();
+    host.approve("pim")
+        .expect("ports other than the core's are fine");
+    host.open_window("pim").expect("launches");
+    assert_eq!(env.spawn_count(), 1);
+
+    // And the pure rule agrees, for the manifest the validator cannot judge.
+    let needs = discovered(&env, "pim").manifest.needs;
+    assert_eq!(
+        apps::reaches_core(
+            &needs,
+            &apps::CoreDoor::new("127.0.0.1:7878".parse().unwrap(), vec![])
+        ),
+        None
+    );
+    assert!(
+        apps::reaches_core(
+            &needs,
+            &apps::CoreDoor::new("127.0.0.1:993".parse().unwrap(), vec![])
+        )
+        .is_some()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The window's scope: `[ui]` (docs/APP-UI-ISOLATION.md §4.6, §4.8)
+// ---------------------------------------------------------------------------
+
+fn with_ui(name: &str, invoke: &[&str]) -> String {
+    let list: Vec<String> = invoke.iter().map(|i| format!("{i:?}")).collect();
+    format!(
+        "{}\n[ui]\ninvoke = [{}]\n",
+        manifest_text(name, ""),
+        list.join(", ")
+    )
+}
+
+#[test]
+fn a_window_that_reaches_beyond_its_own_commands_is_not_launched_unapproved() {
+    let env = FakeEnv::new();
+    install(&env, "clock", &manifest_text("clock", ""));
+    install(&env, "filer", &with_ui("filer", &["files.list"]));
+    let mut host = host(&env);
+    host.refresh();
+
+    host.open_window("clock")
+        .expect("the control: an app that asks for nothing launches");
+    match host.open_window("filer") {
+        Err(HostError::NotApproved { summary, .. }) => {
+            assert!(summary.contains("files.list"), "{summary}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(env.spawn_count(), 1, "only the control was started");
+}
+
+#[test]
+fn changing_only_the_window_scope_blocks_launch_until_approved_again() {
+    let env = FakeEnv::new();
+    install(&env, "filer", &with_ui("filer", &["files.list"]));
+    let mut host = host(&env);
+    host.refresh();
+    host.approve("filer").unwrap();
+    host.open_window("filer")
+        .expect("the control: approved, it runs");
+    assert_eq!(env.spawn_count(), 1);
+    host.stop("filer", false);
+
+    // Nothing else changes: same needs, same commands, one more id in [ui].
+    install(
+        &env,
+        "filer",
+        &with_ui("filer", &["files.list", "files.trash"]),
+    );
+    host.refresh();
+    match host.open_window("filer") {
+        Err(HostError::GrantStale { summary, .. }) => {
+            assert!(summary.contains("files.trash"), "{summary}")
+        }
+        other => panic!("expected a stale grant, got {other:?}"),
+    }
+    assert_eq!(env.spawn_count(), 1, "nothing ran on the old approval");
+
+    host.approve("filer").unwrap();
+    host.open_window("filer").expect("approved again, it runs");
+    assert_eq!(env.spawn_count(), 2);
+}
+
+#[test]
+fn the_approved_window_scope_is_the_stored_one_and_only_while_it_matches() {
+    let env = FakeEnv::new();
+    install(&env, "filer", &with_ui("filer", &["files.list"]));
+    let mut host = host(&env);
+    host.refresh();
+    assert!(
+        host.approved_ui_invoke("filer").is_empty(),
+        "declared is not approved"
+    );
+
+    host.approve("filer").unwrap();
+    assert_eq!(host.approved_ui_invoke("filer"), ["files.list"]);
+
+    // The manifest on disk grows; the approval does not follow it.
+    install(
+        &env,
+        "filer",
+        &with_ui("filer", &["files.list", "files.read"]),
+    );
+    host.refresh();
+    assert!(
+        host.approved_ui_invoke("filer").is_empty(),
+        "a manifest changed after approval is a request, not a grant"
+    );
+    assert!(host.approved_ui_invoke("ghost").is_empty());
+}
+
+struct KnownRisks;
+
+impl apps::CommandRisks for KnownRisks {
+    fn risk(&self, command: &str) -> Option<deckjack_core::command::RiskLevel> {
+        use deckjack_core::command::RiskLevel;
+        match command {
+            "files.list" => Some(RiskLevel::ReadOnly),
+            "files.write" => Some(RiskLevel::Write),
+            "files.delete" => Some(RiskLevel::Destructive),
+            _ => None,
+        }
+    }
+}
+
+#[test]
+fn the_summary_leads_with_the_riskiest_thing_the_window_can_do() {
+    let manifest = load_manifest(&with_ui(
+        "probe",
+        &["files.list", "files.write", "files.delete"],
+    ))
+    .unwrap();
+    let summary = apps::summarize_with(&manifest.needs, &KnownRisks);
+    let at = |needle: &str| {
+        summary
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} missing from {summary:?}"))
+    };
+    assert!(summary.contains("on your behalf"), "{summary}");
+    assert!(at("files.delete") < at("files.write"), "{summary}");
+    assert!(at("files.write") < at("files.list"), "{summary}");
+    assert!(
+        summary.contains("remove or overwrite data (files.delete)"),
+        "{summary}"
+    );
+
+    // A command whose risk is unknown is not presented as harmless: it leads.
+    let manifest = load_manifest(&with_ui("probe", &["files.list", "files.mystery"])).unwrap();
+    let summary = apps::summarize_with(&manifest.needs, &KnownRisks);
+    assert!(
+        summary.find("files.mystery").unwrap() < summary.find("files.list").unwrap(),
+        "{summary}"
+    );
+
+    // Without a registry to ask (the `deckjack install` CLI), the ids are
+    // still all there, and still not presented as harmless.
+    let summary = apps::summarize(&manifest.needs);
+    assert!(
+        mentions(&summary, &["files.list", "files.mystery"]),
+        "{summary}"
+    );
+    assert!(summary.contains("does not know"), "{summary}");
 }

@@ -827,12 +827,7 @@ struct Caller {
 
 fn caller(ctx: &PasskeyCtx, peer: SocketAddr, headers: &HeaderMap) -> Caller {
     let ip = ctx.http.client_ip(peer, headers);
-    let presented = session::from_cookie_headers(
-        headers
-            .get_all(header::COOKIE)
-            .iter()
-            .filter_map(|v| v.to_str().ok()),
-    );
+    let presented = ctx.http.session_cookie(peer, headers);
     let now = ctx.now();
     let session =
         presented.filter(|id| matches!(ctx.state().verify(ip, Some(id), now), VerifyOutcome::Ok));

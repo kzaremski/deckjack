@@ -1,8 +1,7 @@
 import { inject, provide, ref, type InjectionKey, type Ref } from "vue";
 
-import { loadInstalled } from "../stores/apps.ts";
+import { createAppTable, type AppTable } from "../stores/apps.ts";
 import { createBus, browserBusEnv, type Bus } from "../stores/bus.ts";
-import type { Risk } from "../protocol.ts";
 import { createCommands, type CommandsStore } from "../stores/commands.ts";
 import { createUi, browserUiEnv, type UiStore } from "../stores/ui.ts";
 import {
@@ -23,9 +22,10 @@ import {
   DEFAULT_SHORTCUTS,
   type Keyboard,
 } from "./keyboard.ts";
-import { shellCommands } from "./shell-commands.ts";
+import { bindApps, bindConfirmations, shellCommands } from "./shell-commands.ts";
 import { browserViewportEnv, createViewport, type Viewport } from "./viewport.ts";
-import { createQuickLook, type QuickLookStore } from "./quicklook.ts";
+import { createQuickLook, openAppVia, type QuickLookStore } from "./quicklook.ts";
+import { createFrameBridge, type FrameBridge } from "./frame-bridge.ts";
 
 /**
  * The composition root.
@@ -52,6 +52,10 @@ export interface Shell {
   quicklook: QuickLookStore;
   /** Pending Inbox approvals, from the server's `inbox` event. */
   inboxPending: Ref<number>;
+  /** Built-in apps merged with what this node has installed. */
+  apps: AppTable;
+  /** Requests from app frames for shell-only things, such as Quick Look. */
+  frames: FrameBridge;
   dispose(): void;
 }
 
@@ -64,13 +68,20 @@ export function createShell(): Shell {
 
   const bus = createBus(browserBusEnv());
   const ui = createUi(browserUiEnv());
-  const windows = createWindows(bus, browserWindowsEnv());
+  const apps = createAppTable();
+  const windows = createWindows(bus, browserWindowsEnv(), apps);
   const commands = createCommands({ storage });
   const viewport = createViewport(browserViewportEnv());
   const keyboard = createKeyboard(browserKeyboardEnv(storage));
   // `navigator.onLine` is only trusted when it says false, the same rule the
   // bus follows: a captive portal reports true.
-  const quicklook = createQuickLook({ online: () => navigator.onLine !== false });
+  const quicklook = createQuickLook({
+    online: () => navigator.onLine !== false,
+    apps,
+    // "Open fully" is the shell opening an app, so it goes through the
+    // shell's own window store, on the file when the store can carry one.
+    openApp: openAppVia(windows),
+  });
   const inboxPending = ref(0);
 
   commands.register(
@@ -126,26 +137,20 @@ export function createShell(): Shell {
     }
   });
 
-  // The bus asks the operator through the shell's own dialog, using the
-  // prompt the backend wrote rather than wording invented here.
-  bus.onConfirm(async ({ command, prompt, risk }) =>
-    ui.confirm({
-      command,
-      title: "Confirm",
-      detail: prompt,
-      risk: risk as Risk,
-    }),
-  );
+  bindConfirmations({ bus, ui });
 
   bus.connect();
 
-  // What is actually installed on this node, so a window for an app binary
-  // renders that app's own UI instead of a placeholder. Fired once after
-  // connecting; a failure leaves the list empty, which is the right answer on
-  // a core with no app host.
-  void loadInstalled((command, params) => bus.call(command, params ?? {}).then((outcome) =>
-    outcome.status === "ok" ? outcome.value : Promise.reject(new Error("refused")),
-  ));
+  // What is installed on this node, loaded when the node says hello, and
+  // the palette's "Open" entries kept in step with it. See `bindApps`.
+  const unbindApps = bindApps({ bus, commands, windows, apps });
+
+  // App frames ask for Quick Look by posting to this window. See
+  // `frame-bridge.ts` for what is accepted and why it is a contract and not a
+  // boundary.
+  const frames = createFrameBridge({ commands, origin: window.location.origin, apps });
+  const onFrameMessage = (event: MessageEvent) => frames.handle(event);
+  window.addEventListener("message", onFrameMessage);
 
   return {
     bus,
@@ -157,7 +162,11 @@ export function createShell(): Shell {
     keyboard,
     quicklook,
     inboxPending,
+    apps,
+    frames,
     dispose() {
+      window.removeEventListener("message", onFrameMessage);
+      unbindApps();
       offBus();
       viewport.stop();
       bus.close();

@@ -1055,3 +1055,79 @@ fn a_grant_scoped_to_another_node_does_not_combine_with_one_scoped_to_this_one()
         "probe.wipe must not have run"
     );
 }
+
+// ---------------------------------------------------------------------------
+// What the grant confirmation names (APP-UI-ISOLATION §4.7)
+// ---------------------------------------------------------------------------
+
+/// The target the operator reads before confirming a grant, from the real
+/// dispatch path: the bus's own question to the operator.
+fn grant_target(h: &Harness, params: serde_json::Value) -> String {
+    match h.dispatch("system.grant.issue", params, Issuer::operator()) {
+        Admitted::NeedsConfirmation { target, prompt, .. } => {
+            let target = target.expect("a grant confirmation names its target");
+            assert!(prompt.contains(&target), "the prompt shows it: {prompt}");
+            target
+        }
+        _ => panic!("issuing a grant did not ask the operator first"),
+    }
+}
+
+/// A `*` buried in the middle of a long list of harmless patterns is the one
+/// that matters. It comes first, nothing is cut from the middle of the list,
+/// and the grant's reach (every node, never expiring) is said outright.
+#[test]
+fn a_grant_prompt_shows_the_broadest_pattern_and_its_reach_without_cutting_the_list() {
+    let h = Harness::new();
+    let mut namespaces: Vec<String> = (0..8).map(|i| format!("notes.list.part{i}")).collect();
+    namespaces.push("*".to_string());
+    namespaces.extend((0..8).map(|i| format!("tasks.read.part{i}")));
+    let total = namespaces.len();
+
+    let target = grant_target(
+        &h,
+        serde_json::json!({
+            "label": "coding",
+            "agent": "coding",
+            "namespaces": namespaces,
+            "nodes": ["*"],
+        }),
+    );
+    assert!(
+        target.chars().count() <= deckjack_core::command::TARGET_MAX_CHARS,
+        "the bus would cut it: {target}"
+    );
+    assert!(!target.contains('\u{2026}'), "the list was cut: {target}");
+    assert!(target.contains("may run *, "), "* is not first: {target}");
+    assert!(target.contains("every node"), "nodes left out: {target}");
+    assert!(
+        target.contains("until revoked"),
+        "lifetime left out: {target}"
+    );
+
+    // What was left out is counted, and the count adds up.
+    let after = target.split("may run ").nth(1).expect("the patterns");
+    let (listed, more) = after.split_once(" and ").expect("an 'and N more'");
+    let more: usize = more
+        .trim_end_matches(" more")
+        .parse()
+        .unwrap_or_else(|_| panic!("a count: {target}"));
+    assert_eq!(listed.split(", ").count() + more, total, "got {target}");
+}
+
+/// A narrow grant reads as narrow: one node, an hour.
+#[test]
+fn a_grant_prompt_names_one_node_and_a_lifetime() {
+    let h = Harness::new();
+    let target = grant_target(
+        &h,
+        serde_json::json!({
+            "label": "coding",
+            "agent": "coding",
+            "namespaces": ["git.status"],
+            "nodes": ["r620"],
+            "ttl_secs": 3600,
+        }),
+    );
+    assert_eq!(target, "coding on node r620 for 1 h, may run git.status");
+}

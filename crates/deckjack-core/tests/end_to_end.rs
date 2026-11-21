@@ -113,7 +113,8 @@ async fn start() -> Harness {
     // between the sets would be a startup failure in production and a silent
     // absence here.
     let files =
-        files::register_commands(&registry, dir.path(), &node_id).expect("the file commands");
+        files::register_commands(&registry, dir.path(), &node_id, &dir.path().join("install"))
+            .expect("the file commands");
     let windows =
         wiring::register_windows(&registry, node_id.clone()).expect("the window commands register");
     let host_token =
@@ -247,6 +248,7 @@ async fn start() -> Harness {
         apps::Host::new(
             install.clone(),
             dir.path().to_path_buf(),
+            apps::CoreDoor::new("127.0.0.1:7878".parse().unwrap(), vec![]),
             apps::OsEnv::new(),
             apps::Policy::default(),
             Box::new(deckjack_core::store::StoreGrants::new(Arc::clone(&store))),
@@ -267,7 +269,10 @@ async fn start() -> Harness {
 
     let ws_ctx = ws::WsCtx::new(
         Arc::clone(&ctx),
-        BusDispatch::new(Arc::clone(&bus)),
+        BusDispatch::new(
+            Arc::clone(&bus),
+            deckjack_core::ticket::Tickets::new(Arc::new(ws::SystemClock)),
+        ),
         ws::Hub::new(Arc::new(ws::SystemClock)),
         Arc::new(ws::SystemClock),
         node_id,
@@ -374,8 +379,19 @@ async fn request(
     // `Connection: close` makes the response end at EOF, so the reply can be
     // read to the end without implementing chunked framing.
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    // A browser's Fetch Metadata unless the caller says otherwise, because
+    // `fetchgate` refuses `/content`, `/passkey/*` and `/logout` without it.
+    // A caller that names `sec-fetch-site` decides; an empty value omits it.
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("sec-fetch-site"))
+    {
+        req.push_str("Sec-Fetch-Site: same-origin\r\n");
+    }
     for (name, value) in headers {
-        req.push_str(&format!("{name}: {value}\r\n"));
+        if !value.is_empty() {
+            req.push_str(&format!("{name}: {value}\r\n"));
+        }
     }
     match body {
         Some(b) => {
@@ -454,7 +470,8 @@ impl Ws {
     ) -> Result<Ws, u16> {
         let mut req = format!(
             "GET {} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-Fetch-Site: same-origin\r\n",
             ws::PATH
         );
         if let Some(c) = cookie {
@@ -1990,4 +2007,268 @@ async fn the_passkey_routes_are_mounted_on_the_real_front_door() {
         "the passkey routes are not mounted: {}",
         r.body
     );
+}
+
+// ---------------------------------------------------------------------------
+// An app's window over the socket (docs/APP-UI-ISOLATION.md §4.6, stage 3)
+// ---------------------------------------------------------------------------
+
+impl Ws {
+    /// An invoke made on behalf of an app's window, as the shell's broker
+    /// will send it from stage 4.
+    async fn invoke_as(&mut self, app: &str, id: &str, command: &str, params: Value) -> Value {
+        self.send_text(
+            &json!({
+                "type": "invoke", "id": id, "command": command, "params": params,
+                "as_app": app,
+            })
+            .to_string(),
+        )
+        .await;
+        self.response(id).await
+    }
+
+    /// Redeem a confirmation ticket, as `as_app` when it is given.
+    async fn confirm(
+        &mut self,
+        as_app: Option<&str>,
+        id: &str,
+        ticket: &str,
+        command: &str,
+        params: Value,
+    ) -> Value {
+        let mut frame = json!({
+            "type": "confirm", "id": id, "ticket": ticket, "command": command, "params": params,
+        });
+        if let Some(app) = as_app {
+            frame["as_app"] = json!(app);
+        }
+        self.send_text(&frame.to_string()).await;
+        self.response(id).await
+    }
+
+    /// The response for one correlation id, stepping over everything else.
+    async fn response(&mut self, id: &str) -> Value {
+        loop {
+            let frame = self.expect_json().await;
+            if frame["type"] == "response" && frame["id"] == id {
+                return frame;
+            }
+        }
+    }
+}
+
+fn error_code(response: &Value) -> &str {
+    assert_eq!(
+        response["outcome"]["status"], "error",
+        "expected a refusal: {response}"
+    );
+    response["outcome"]["error"]["code"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no error code in {response}"))
+}
+
+/// The refusal's reason, for telling apart which rule refused it.
+fn error_message(response: &Value) -> String {
+    response["outcome"]["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no error message in {response}"))
+        .to_string()
+}
+
+/// `filer` is not running in this harness, so every call made as it is
+/// refused. The hard-deny tests assert *which* rule refused: HARD_DENY,
+/// checked before anything about the app, not "no app called filer is
+/// running", which would refuse the same call without proving `terminal.*`
+/// or `system.*` is closed to a window whose app is up.
+fn refused_by_hard_deny(response: &Value) {
+    assert_eq!(error_code(response), wiring::NOT_PERMITTED, "{response}");
+    let message = error_message(response);
+    assert!(message.contains("never available"), "{message}");
+}
+
+#[tokio::test]
+async fn an_apps_window_cannot_open_a_terminal_over_the_socket() {
+    let h = start().await;
+    let cookie = h.sign_in().await;
+    let mut ws = Ws::connect(h.addr, Some(&cookie), None)
+        .await
+        .expect("upgrade");
+    ws.hello().await;
+
+    let refused = ws
+        .invoke_as(
+            "filer",
+            "t1",
+            "terminal.open",
+            json!({ "rows": 24, "cols": 80 }),
+        )
+        .await;
+    refused_by_hard_deny(&refused);
+    assert!(h.terminals.list().is_empty(), "a pty was spawned anyway");
+
+    // The control for which rule refused it: a command no hard rule covers,
+    // from the same window, is refused for the other reason.
+    let other = ws
+        .invoke_as("filer", "t0", "files.list", json!({ "path": "/" }))
+        .await;
+    assert_eq!(error_code(&other), wiring::NOT_PERMITTED, "{other}");
+    let message = error_message(&other);
+    assert!(message.contains("running"), "{message}");
+    assert!(!message.contains("never available"), "{message}");
+
+    // The control: the same socket, as the shell itself.
+    open_terminal(&mut ws).await;
+    assert_eq!(h.terminals.list().len(), 1);
+
+    // And the refusal is written down as the app's window, with the browser.
+    let rows = deckjack_core::audit::StoreSink::new(Arc::clone(&h.store))
+        .timeline(&deckjack_core::events::Query::default())
+        .expect("the timeline reads");
+    let row = rows
+        .iter()
+        .find(|row| {
+            row.entry.command == "terminal.open" && row.entry.issuer.label() == "app-ui:filer"
+        })
+        .unwrap_or_else(|| panic!("no app-ui:filer row for terminal.open in {rows:?}"));
+    assert!(
+        row.issuer_session.is_some(),
+        "which browser is not recorded"
+    );
+}
+
+#[tokio::test]
+async fn an_apps_window_cannot_reissue_the_recovery_codes_even_with_a_ticket() {
+    let h = start().await;
+    let cookie = h.sign_in().await;
+    let mut ws = Ws::connect(h.addr, Some(&cookie), None)
+        .await
+        .expect("upgrade");
+    ws.hello().await;
+    assert_eq!(h.lockdown.recovery_codes_left(), 2);
+
+    // Asked as the window, it is refused outright, not asked about.
+    let refused = ws
+        .invoke_as("filer", "r1", "system.recovery_codes", json!({}))
+        .await;
+    refused_by_hard_deny(&refused);
+
+    // A real ticket, issued to the shell's own call, is no way round it:
+    // redeemed as the window, it is refused, so the confirmation step is not
+    // what stops the window.
+    let asked = ws.invoke("r2", "system.recovery_codes", json!({})).await;
+    let ticket = ok_value(&asked)["ticket"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the shell's call should be asked about: {asked}"))
+        .to_string();
+    let refused = ws
+        .confirm(
+            Some("filer"),
+            "r2-yes",
+            &ticket,
+            "system.recovery_codes",
+            json!({}),
+        )
+        .await;
+    assert_eq!(error_code(&refused), ws::CONFIRMATION_REFUSED, "{refused}");
+    assert_eq!(
+        h.lockdown.recovery_codes_left(),
+        2,
+        "the codes were reissued"
+    );
+
+    // The control: the shell itself, confirmed with its own ticket, does
+    // reissue them.
+    let asked = ws.invoke("r3", "system.recovery_codes", json!({})).await;
+    let ticket = ok_value(&asked)["ticket"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the shell's call should be asked about: {asked}"))
+        .to_string();
+    let done = ws
+        .confirm(None, "r3-yes", &ticket, "system.recovery_codes", json!({}))
+        .await;
+    ok_value(&done);
+    assert_eq!(
+        h.lockdown.recovery_codes_left(),
+        lockdown::RECOVERY_CODES_ISSUED
+    );
+}
+
+#[tokio::test]
+async fn a_name_no_app_could_have_is_refused_before_the_bus() {
+    let h = start().await;
+    let cookie = h.sign_in().await;
+    let mut ws = Ws::connect(h.addr, Some(&cookie), None)
+        .await
+        .expect("upgrade");
+    ws.hello().await;
+
+    let status = ws.invoke("s1", "system.status", json!({})).await;
+    ok_value(&status);
+    for name in ["../filer", "Filer", "", "a b"] {
+        let refused = ws
+            .invoke_as(name, "s2", "files.list", json!({ "path": "/" }))
+            .await;
+        assert_eq!(
+            error_code(&refused),
+            wiring::NOT_PERMITTED,
+            "{name:?}: {refused}"
+        );
+    }
+    // Refused at the socket, not by the bus: no string a frame chose and no
+    // app could have is written into the audit log as an issuer.
+    let rows = deckjack_core::audit::StoreSink::new(Arc::clone(&h.store))
+        .timeline(&deckjack_core::events::Query::default())
+        .expect("the timeline reads");
+    assert!(
+        rows.iter()
+            .all(|row| !row.entry.issuer.label().starts_with("app-ui:")),
+        "a made-up app name reached the log: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.entry.command == "system.status"),
+        "the control: the log is being written"
+    );
+}
+
+#[tokio::test]
+async fn every_namespace_the_core_registers_is_reserved_from_apps() {
+    // Read off the product's own registry, assembled as main.rs assembles it,
+    // so a namespace the core starts registering is caught here until it is
+    // added to `RESERVED_NAMESPACES` and no app can take its name.
+    let h = start().await;
+    let mut namespaces: Vec<String> = h
+        .bus
+        .list(None)
+        .iter()
+        .map(|listing| listing.spec.id().namespace().to_string())
+        .collect();
+    namespaces.sort();
+    namespaces.dedup();
+    assert!(
+        namespaces.len() >= 4,
+        "the harness registered almost nothing: {namespaces:?}"
+    );
+    let parse = |name: &str| {
+        deckjack_core::apps::Manifest::parse(
+            std::path::Path::new("app.toml"),
+            &format!("[app]\nname = \"{name}\"\nversion = \"1\"\nprotocol = 1\n"),
+        )
+    };
+    // The control: the same template is a valid manifest under a name the
+    // core does not use, so a refusal below is the reserved-name rule and not
+    // a template that stopped parsing.
+    parse("zzapp").expect("the template parses for an unreserved name");
+    for namespace in &namespaces {
+        let error = match parse(namespace) {
+            Ok(_) => panic!(
+                "the core registers {namespace}.* and an app may still be called {namespace:?}"
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            error.contains("namespace the core itself uses"),
+            "{namespace}: refused for another reason: {error}"
+        );
+    }
 }

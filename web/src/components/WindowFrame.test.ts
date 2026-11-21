@@ -5,7 +5,6 @@ import { flushPromises, type DOMWrapper, type VueWrapper } from "@vue/test-utils
 import WindowFrame from "./WindowFrame.vue";
 import { harness, mountInShell, type Harness } from "../testing/shell-harness.ts";
 import type { AppId } from "../stores/apps.ts";
-import { apps } from "../stores/apps.ts";
 import type { Rect, SnapZone } from "../shell/geometry.ts";
 import type { ShellWindow } from "../stores/windows.ts";
 
@@ -1028,7 +1027,7 @@ describe("resizing", () => {
     // through the opposite one.
     const rig = liveShell();
     const window = await openWindow(rig, "files");
-    const min = apps.files.minSize;
+    const min = rig.shell.apps.contract("files").minSize;
     const wrapper = frameFor(rig, window);
     const before = rendered(wrapper);
 
@@ -1048,7 +1047,7 @@ describe("resizing", () => {
   it("pins a collapsed window at its minimum without moving the edge opposite", async () => {
     const rig = liveShell();
     const window = await openWindow(rig, "files");
-    const min = apps.files.minSize;
+    const min = rig.shell.apps.contract("files").minSize;
     const wrapper = frameFor(rig, window);
     const before = rendered(wrapper);
 

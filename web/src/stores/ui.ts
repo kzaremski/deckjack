@@ -26,6 +26,13 @@ export interface Confirmation {
   /** How many objects it will affect, when the backend reported a count:
    * "an agent deleting much of a researcher's inbox" is the lesson here. */
   count?: number;
+  /**
+   * What the command acts on, rendered by the node from the validated
+   * params: the paths, the app, "everything in the trash (12 items)". Plain
+   * text with bidi and control characters already stripped by the node, and
+   * shown as text here too, never as markup.
+   */
+  target?: string;
   resolve(ok: boolean): void;
 }
 

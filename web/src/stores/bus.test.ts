@@ -315,3 +315,249 @@ describe("the network coming back", () => {
       .toBeGreaterThan(before);
   });
 });
+
+describe("a call its caller stops waiting for", () => {
+  /**
+   * A terminal panel long-polls `terminal.read`, which parks on the node until
+   * the shell prints. Switching tabs or closing the panel has to stop that
+   * read on the node, not just stop listening: an abandoned read holds one of
+   * the socket's in-flight slots for as long as the shell stays quiet.
+   */
+  it("asks the node to cancel that call, and only that call", async () => {
+    const r = connected();
+    const stop = new AbortController();
+    const parked = r.bus.call("terminal.read", { id: "t1", cursor: 0 }, undefined, undefined, {
+      signal: stop.signal,
+    });
+    const other = r.bus.call("terminal.read", { id: "t2", cursor: 0 });
+    const invokes = r.socket().frames().filter((f) => f.type === "invoke");
+    const [parkedId, otherId] = invokes.map((f) => f.id);
+
+    stop.abort();
+
+    const cancels = r.socket().frames().filter((f) => f.type === "cancel");
+    expect(cancels.map((f) => f.id)).toEqual([parkedId]);
+    expect(cancels.map((f) => f.id)).not.toContain(otherId);
+
+    // The node answers the cancelled call, and the caller is answered.
+    r.socket().deliver({
+      type: "response",
+      id: parkedId,
+      outcome: { status: "error", error: { code: "cancelled", message: "terminal.read was cancelled" } },
+      elapsed_ms: 1,
+    });
+    expect((await parked).status).toBe("error");
+    r.socket().deliver({
+      type: "response",
+      id: otherId,
+      outcome: { status: "ok", value: { data: "", cursor: 0, exited: false, reset: false } },
+      elapsed_ms: 1,
+    });
+    expect((await other).status).toBe("ok");
+  });
+
+  it("is never sent at all when it was abandoned before it started", async () => {
+    const r = connected();
+    const stop = new AbortController();
+    stop.abort();
+
+    const outcome = await r.bus.call("terminal.read", { id: "t1", cursor: 0 }, undefined, undefined, {
+      signal: stop.signal,
+    });
+
+    expect(outcome.status).toBe("error");
+    expect(r.socket().frames().filter((f) => f.type === "invoke")).toEqual([]);
+  });
+
+  it("does not cancel a call that has already been answered", async () => {
+    const r = connected();
+    const stop = new AbortController();
+    const call = r.bus.call("terminal.read", { id: "t1", cursor: 0 }, undefined, undefined, {
+      signal: stop.signal,
+    });
+    const [invoke] = r.socket().frames().filter((f) => f.type === "invoke");
+    r.socket().deliver({
+      type: "response",
+      id: invoke!.id,
+      outcome: { status: "ok", value: { data: "x", cursor: 1, exited: false, reset: false } },
+      elapsed_ms: 1,
+    });
+    await call;
+
+    stop.abort();
+
+    expect(r.socket().frames().filter((f) => f.type === "cancel")).toEqual([]);
+  });
+});
+
+describe("a command the node asks the operator to confirm", () => {
+  /** Let the bus's awaits run: the dialog answering, the next frame going out. */
+  const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  const question = {
+    status: "needs_confirmation",
+    prompt:
+      "Empty the trash: /thesis/draft.txt. This removes or overwrites data and cannot be undone.",
+    target: "/thesis/draft.txt",
+    risk: "destructive",
+    ticket: "0123456789abcdef0123456789abcdef",
+  };
+
+  /** Answer the latest frame of `type` with `value`. */
+  function answer(r: Rig, type: string, value: unknown) {
+    const frame = r
+      .socket()
+      .frames()
+      .filter((f) => f.type === type)
+      .at(-1)!;
+    r.socket().deliver({
+      type: "response",
+      id: frame.id,
+      outcome: { status: "ok", value },
+      elapsed_ms: 1,
+    });
+  }
+
+  it("redeems the node's ticket with a confirm frame for the same call, never by claiming it", async () => {
+    const r = connected();
+    const asked: unknown[] = [];
+    r.bus.onConfirm(async (input) => {
+      asked.push(input);
+      return true;
+    });
+
+    const params = { ids: ["draft.txt"] };
+    const call = r.bus.call("files.trash.empty", params);
+    answer(r, "invoke", question);
+    await settle();
+
+    const [invoke] = r.socket().frames().filter((f) => f.type === "invoke");
+    expect(invoke, "the first frame asserted its own confirmation").not.toHaveProperty(
+      "confirmed",
+    );
+
+    const confirms = r.socket().frames().filter((f) => f.type === "confirm");
+    expect(confirms).toHaveLength(1);
+    expect(confirms[0]).toMatchObject({
+      ticket: question.ticket,
+      command: "files.trash.empty",
+      params,
+    });
+    expect(confirms[0]!.id, "a confirm is a fresh call, not a reuse of the asked one").not.toBe(
+      invoke!.id,
+    );
+    // The dialog showed the node's words and the node's target, not the ticket.
+    expect(asked).toEqual([
+      {
+        command: "files.trash.empty",
+        prompt: question.prompt,
+        risk: "destructive",
+        target: "/thesis/draft.txt",
+      },
+    ]);
+
+    answer(r, "confirm", { removed: 1 });
+    expect(await call).toMatchObject({ status: "ok", value: { removed: 1 } });
+  });
+
+  it("sends nothing more when the operator declines", async () => {
+    const r = connected();
+    r.bus.onConfirm(async () => false);
+
+    const call = r.bus.call("files.trash.empty", {});
+    answer(r, "invoke", question);
+
+    expect(await call).toMatchObject({ status: "refused" });
+    expect(r.socket().frames().filter((f) => f.type === "confirm")).toEqual([]);
+  });
+
+  it("asks nobody and runs nothing when the node's question carries no ticket", async () => {
+    const r = connected();
+    let asked = false;
+    r.bus.onConfirm(async () => {
+      asked = true;
+      return true;
+    });
+
+    const call = r.bus.call("files.trash.empty", {});
+    answer(r, "invoke", { ...question, ticket: undefined });
+    await settle();
+
+    expect(asked, "the operator was asked a question nothing could act on").toBe(false);
+    expect(r.socket().frames().filter((f) => f.type === "confirm")).toEqual([]);
+    expect((await call).status).toBe("error");
+  });
+
+  it("does not redeem a ticket on a different socket from the one that was asked", async () => {
+    // A ticket is bound to its socket. If the connection dropped and came back
+    // while the dialog was open, the "yes" answers a question the new socket
+    // was never asked: the node would refuse it, so the operator is told the
+    // truth instead.
+    const r = connected();
+    let say: (ok: boolean) => void = () => {};
+    r.bus.onConfirm(() => new Promise<boolean>((resolve) => (say = resolve)));
+
+    const call = r.bus.call("files.trash.empty", {});
+    answer(r, "invoke", question);
+    await settle();
+    const asked = r.socket();
+
+    asked.close();
+    r.advance(1_000);
+    r.socket().open();
+    expect(r.socket(), "the bus did not reconnect").not.toBe(asked);
+    expect(r.bus.status.value).toBe("open");
+
+    say(true);
+    await settle();
+    for (const s of r.sockets) {
+      expect(s.frames().filter((f) => f.type === "confirm")).toEqual([]);
+    }
+
+    const outcome = await call;
+    expect(outcome.status).toBe("error");
+    expect(outcome.status === "error" && outcome.message).toMatch(/nothing was run/);
+  });
+
+  it("stops rather than asking forever when a confirmed call is asked about again", async () => {
+    const r = connected();
+    let asked = 0;
+    r.bus.onConfirm(async () => {
+      asked += 1;
+      return true;
+    });
+
+    const call = r.bus.call("files.trash.empty", {});
+    answer(r, "invoke", question);
+    await settle();
+    answer(r, "confirm", { ...question, ticket: "ffffffffffffffffffffffffffffffff" });
+
+    expect((await call).status).toBe("refused");
+    expect(asked).toBe(1);
+  });
+
+  it("passes the node's refusal of a ticket through as an error the operator can read", async () => {
+    const r = connected();
+    r.bus.onConfirm(async () => true);
+
+    const call = r.bus.call("files.trash.empty", {});
+    answer(r, "invoke", question);
+    await settle();
+    const confirm = r
+      .socket()
+      .frames()
+      .filter((f) => f.type === "confirm")
+      .at(-1)!;
+    r.socket().deliver({
+      type: "response",
+      id: confirm.id,
+      outcome: {
+        status: "error",
+        error: { code: "confirmation_refused", message: "that confirmation expired" },
+      },
+      elapsed_ms: 1,
+    });
+
+    expect(await call).toMatchObject({ status: "error", message: "that confirmation expired" });
+  });
+});

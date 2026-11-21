@@ -2,7 +2,6 @@
 import { computed } from "vue";
 
 import { useShell } from "../shell/context.ts";
-import { apps, dockOrder } from "../stores/apps.ts";
 
 /**
  * The compact switcher: open windows ordered by recent focus, plus the apps
@@ -17,9 +16,9 @@ const shell = useShell();
 
 const open = computed(() => shell.windows.recent.value);
 const closed = computed(() =>
-  dockOrder
-    .filter((id) => !shell.windows.all.value.some((w) => w.app === id))
-    .map((id) => apps[id]),
+  shell.apps.dock.value.filter(
+    (app) => !shell.windows.all.value.some((w) => w.app === app.id),
+  ),
 );
 
 function close() {

@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Q2: frame-src against a frame that navigates itself</title>
+<body>
+  <script>
+    // Served with `Content-Security-Policy: frame-src {{A}}/frames/` (set by
+    // the test). Each child starts inside the allowed path, then navigates
+    // itself somewhere else.
+    window.violations = [];
+    document.addEventListener("securitypolicyviolation", (e) => {
+      violations.push({ directive: e.effectiveDirective || e.violatedDirective, blocked: e.blockedURI });
+    });
+    const A = "{{A}}";
+    const B = "{{B}}";
+    const cases = {
+      // Another site: the exfiltration case.
+      "q2-cross": `${B}/probe/nav.html?tag=q2-cross`,
+      // The parent's own origin, outside the allowed path.
+      "q2-path": `${A}/probe/nav.html?tag=q2-path`,
+      // Control: inside the allowed path, so it must land.
+      "q2-ok": `${A}/frames/probe/nav.html?tag=q2-ok`,
+    };
+    for (const [name, to] of Object.entries(cases)) {
+      const f = document.createElement("iframe");
+      f.sandbox = "allow-scripts allow-forms";
+      f.name = name;
+      f.src = `/frames/q2-child.html?tag=${name}-start&to=${encodeURIComponent(to)}`;
+      document.body.append(f);
+    }
+  </script>
+</body>

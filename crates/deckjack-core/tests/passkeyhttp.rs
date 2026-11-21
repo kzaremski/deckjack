@@ -177,7 +177,11 @@ impl Harness {
             // to catch invisible: a page that calls a route with a method the
             // router does not mount answers 405 on load, and no amount of
             // asserting on the routes alone would show it.
-            .merge(deckjack_core::passkeypage::page_router(true));
+            .merge(deckjack_core::passkeypage::page_router(true))
+            // The cookie-route gate, with the line `wiring::app` uses.
+            // tests/wiring.rs proves the assembly carries it; this file is
+            // where a credential exists to prove a refusal left it alone.
+            .layer(axum::middleware::from_fn(deckjack_core::fetchgate::gate));
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a loopback port");
@@ -274,8 +278,18 @@ async fn request(
 
     let mut text =
         format!("{method} {path} HTTP/1.1\r\nHost: deckjack.test\r\nConnection: close\r\n");
+    // A browser's Fetch Metadata unless the caller names the header, because
+    // the gate refuses `/passkey/*` without it. An empty value omits it.
+    if !headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("sec-fetch-site"))
+    {
+        text.push_str("Sec-Fetch-Site: same-origin\r\n");
+    }
     for (k, v) in headers {
-        text.push_str(&format!("{k}: {v}\r\n"));
+        if !v.is_empty() {
+            text.push_str(&format!("{k}: {v}\r\n"));
+        }
     }
     if let Some(body) = body {
         text.push_str("Content-Type: application/json\r\n");
@@ -604,6 +618,83 @@ async fn a_cross_origin_post_is_refused_on_every_mutating_route() {
         h.post("/passkey/sign-in/begin", &same, "").await.status,
         200
     );
+}
+
+#[tokio::test]
+async fn a_borrowed_session_cannot_remove_a_passkey_through_the_fetch_gate() {
+    // docs/APP-UI-ISOLATION.md §4.9. A same-origin document that is not the
+    // shell (an app UI in a sandboxed frame, a file opened through
+    // `/content`) or another site riding the cookie must not be able to
+    // remove the operator's passkey. The `Origin` check in the handler does
+    // not catch every one of these — a missing `Origin` passes it — which is
+    // why the gate is a second wall and not a duplicate.
+    let phone = row(b"phone", "Phone", 3);
+    let h = Harness::start(std::slice::from_ref(&phone)).await;
+    let id = h.tether_session("127.0.0.1".parse().unwrap());
+    let cookie = h.cookie(&id);
+    let body = format!(
+        "{{\"id\":\"{}\"}}",
+        CredentialId::from_bytes(b"phone".to_vec()).encode()
+    );
+
+    for (what, extra) in [
+        (
+            "Origin: null",
+            vec![("Origin", "null"), ("Sec-Fetch-Site", "same-origin")],
+        ),
+        (
+            "cross-site",
+            vec![
+                ("Sec-Fetch-Site", "cross-site"),
+                ("Sec-Fetch-Dest", "empty"),
+            ],
+        ),
+        (
+            "same-site",
+            vec![("Sec-Fetch-Site", "same-site"), ("Sec-Fetch-Dest", "empty")],
+        ),
+        // No Origin either, so the handler's own check would have let it in.
+        ("no Fetch Metadata", vec![("Sec-Fetch-Site", "")]),
+    ] {
+        let mut headers = vec![("Cookie", cookie.as_str())];
+        headers.extend(extra);
+        let reply = h.post("/passkey/credentials/remove", &headers, &body).await;
+        assert_eq!(reply.status, 403, "{what}: {}", reply.body);
+        assert!(
+            reply.body.contains(deckjack_core::fetchgate::REFUSED),
+            "{what} was refused by something other than the gate: {}",
+            reply.body
+        );
+        let rows = h
+            .store
+            .lock()
+            .unwrap()
+            .passkeys()
+            .expect("the credentials read back");
+        assert_eq!(rows, vec![phone.clone()], "{what} removed the passkey");
+    }
+
+    // The control: the shell's own request, same origin, removes it.
+    let reply = h
+        .post(
+            "/passkey/credentials/remove",
+            &[
+                ("Cookie", cookie.as_str()),
+                ("Origin", "https://deckjack.test"),
+                ("Sec-Fetch-Site", "same-origin"),
+                ("Sec-Fetch-Dest", "empty"),
+            ],
+            &body,
+        )
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let rows = h
+        .store
+        .lock()
+        .unwrap()
+        .passkeys()
+        .expect("the credentials read back");
+    assert!(rows.is_empty(), "the control did not remove the passkey");
 }
 
 // ---------------------------------------------------------------------------

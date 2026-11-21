@@ -1,12 +1,16 @@
-import { apps, dockOrder } from "../stores/apps.ts";
-import type { CommandEntry } from "../stores/commands.ts";
+import { watch } from "vue";
+
+import { awaitsApproval, type AppContract, type AppTable, type InstalledApp } from "../stores/apps.ts";
+import type { CommandEntry, CommandsStore } from "../stores/commands.ts";
 import type { UiStore } from "../stores/ui.ts";
 import type { WindowsStore } from "../stores/windows.ts";
 import type { Bus } from "../stores/bus.ts";
+import type { Risk } from "../protocol.ts";
 import { themeList, type DensityName, type ThemeController } from "../tokens/index.ts";
 import type { Keyboard } from "./keyboard.ts";
 import type { Viewport } from "./viewport.ts";
 import type { QuickLookStore } from "./quicklook.ts";
+import { APP_OPEN, parseAppOpen } from "./open-app.ts";
 
 /**
  * The shell's own commands.
@@ -91,7 +95,14 @@ export function shellCommands(deps: ShellCommandDeps): CommandEntry[] {
           ui.notify("error", "Quick Look needs a file path.", "shell.quicklook.open");
           return;
         }
-        quicklook.open(path);
+        // The folder to step through, from whoever knows it -- Files sends
+        // its listing. Only strings reach the store; a list that does not
+        // contain the file is the store's to refuse, and it does (no
+        // position, no stepping), so that rule lives in one place.
+        const siblings = Array.isArray(params?.siblings)
+          ? params.siblings.filter((s): s is string => typeof s === "string")
+          : undefined;
+        quicklook.open(path, siblings);
       },
     },
     {
@@ -351,18 +362,202 @@ export function shellCommands(deps: ShellCommandDeps): CommandEntry[] {
     });
   }
 
-  for (const id of dockOrder) {
-    const app = apps[id];
-    entries.push({
-      id: `app.open.${id}`,
-      title: `Open ${app.title}`,
-      summary: app.summary,
-      risk: "write",
-      group: "Apps",
-      keywords: [id, "app", "window", "open"],
-      run: () => windows.open(id).then(() => undefined),
-    });
-  }
-
   return entries;
+}
+
+/** One "Open <app>" palette entry per app the dock offers. */
+export function appOpenEntries(dock: AppContract[], windows: WindowsStore): CommandEntry[] {
+  return dock.map((app) => ({
+    id: `app.open.${app.id}`,
+    title: `Open ${app.title}`,
+    summary: app.summary,
+    risk: "write",
+    group: "Apps",
+    keywords: [app.id, "app", "window", "open"],
+    run: () => windows.open(app.id).then(() => undefined),
+  }));
+}
+
+/**
+ * One "Approve <title>" entry per installed app awaiting the operator's
+ * approval: never approved, or approved for a manifest that has since
+ * changed (every app approved before the fingerprint became SHA-256 is in
+ * this state once). This is the re-approval path the core's refusals and
+ * `deckjack install` point at.
+ *
+ * It runs `system.app.approve`, which is cross-project and so asks the
+ * operator to confirm through the bus's own dialog. The summary says what is
+ * being granted, so it is read before the entry is chosen. After a recorded
+ * approval the installed list is asked for again, which removes the entry.
+ */
+export function appApproveEntries(
+  installed: InstalledApp[],
+  bus: Bus,
+  reload: () => Promise<void>,
+): CommandEntry[] {
+  return installed.filter(awaitsApproval).map((app) => ({
+    id: `app.approve.${app.name}`,
+    title: `Approve ${app.title}`,
+    summary:
+      (app.approval === "stale"
+        ? "Its approval no longer covers what it asks for. "
+        : "Not approved yet. ") + `It asks for ${app.asks ?? "permissions"}.`,
+    risk: "cross_project",
+    group: "Apps",
+    keywords: [app.name, "approve", "permissions", "grant", "allow"],
+    run: async () => {
+      const outcome = await bus.call("system.app.approve", { app: app.name });
+      if (outcome.status === "ok") {
+        await reload();
+        return;
+      }
+      throw new Error(
+        outcome.status === "queued"
+          ? `approving ${app.title} is waiting in the Inbox`
+          : outcome.message,
+      );
+    },
+  }));
+}
+
+/**
+ * `shell.app.open`: open an app on a file, the shell's half of the open-app
+ * contract. Frames reach it through the frame bridge (`shell.openApp` in
+ * `/kit/shell.js`); the palette and an agent reach it as a command with the
+ * same parameters, checked by the same `parseAppOpen`.
+ */
+export function appOpenCommand(windows: WindowsStore, apps: AppTable): CommandEntry {
+  return {
+    id: APP_OPEN,
+    title: "Open in an app",
+    summary: "Open a file in an app, or bring that app's window forward",
+    risk: "write",
+    group: "Apps",
+    keywords: ["open with", "open in", "editor", "file", "app"],
+    run: async (params) => {
+      const parsed = parseAppOpen(params, apps);
+      if (!parsed.ok) throw new Error(parsed.reason);
+      const { app, path } = parsed.request;
+      await windows.openApp(app, path ? { path } : undefined);
+    },
+  };
+}
+
+export interface AppBindingDeps {
+  bus: Bus;
+  commands: CommandsStore;
+  windows: WindowsStore;
+  apps: AppTable;
+}
+
+/**
+ * Keeps the app table and the palette in step with the node.
+ *
+ * Two jobs, and both are here so `createShell` and the test harness run the
+ * same code rather than each assembling its own:
+ *
+ * - **Load `system.apps` when a node says hello.** Not when the shell is
+ *   built: the socket is still connecting then, and `bus.call` refuses
+ *   anything sent before it is open, so the list used to come back empty on
+ *   every page load and no installed app ever got its own UI. The welcome
+ *   frame is also what a reconnect, or a different node taking over, sends,
+ *   so the list follows the node instead of the first page load.
+ * - **Re-register the "Open" entries whenever the dock changes**, so an app
+ *   that was installed is in the palette as soon as it is in the dock.
+ *
+ * Returns the function that stops both.
+ */
+export function bindApps(deps: AppBindingDeps): () => void {
+  const { bus, commands, windows, apps } = deps;
+  let unregister: (() => void) | null = null;
+  let unregisterApprove: (() => void) | null = null;
+  const load = () =>
+    apps.load((command, params) =>
+      bus
+        .call(command, params ?? {})
+        .then((outcome) =>
+          outcome.status === "ok" ? outcome.value : Promise.reject(new Error("refused")),
+        ),
+    );
+  const stopApproveWatch = watch(
+    apps.installed,
+    (installed) => {
+      unregisterApprove?.();
+      unregisterApprove = commands.register(appApproveEntries(installed, bus, load));
+    },
+    { immediate: true },
+  );
+  const unregisterOpen = commands.register([appOpenCommand(windows, apps)]);
+  const stopWatch = watch(
+    apps.dock,
+    (dock) => {
+      unregister?.();
+      unregister = commands.register(appOpenEntries(dock, windows));
+    },
+    { immediate: true },
+  );
+  const offBus = bus.on((event) => {
+    if (event.kind !== "node") return;
+    void load();
+  });
+  return () => {
+    stopWatch();
+    stopApproveWatch();
+    unregisterApprove?.();
+    offBus();
+    unregister?.();
+    unregisterOpen();
+  };
+}
+
+/**
+ * Opens an app once the shell can: the node connected and the app known.
+ *
+ * For the PWA's `/?open=<app>` shortcuts. Dispatching at page load, as this
+ * used to, ran while the socket was still connecting, and opening a window is
+ * a record on the node, so the windows store refused with "not connected"
+ * and the shortcut did nothing at all. An installed app is also only known
+ * once `system.apps` has answered. A name that never becomes known is never
+ * opened, and it opens at most once.
+ *
+ * Returns a function that gives up waiting.
+ */
+export function openWhenReady(
+  deps: Pick<AppBindingDeps, "bus" | "apps" | "commands">,
+  app: string,
+): () => void {
+  let done = false;
+  const stop = watch(
+    () => deps.bus.status.value === "open" && deps.apps.isKnown(app),
+    (ready) => {
+      if (!ready || done) return;
+      done = true;
+      void deps.commands.dispatch(`app.open.${app}`);
+    },
+    { immediate: true },
+  );
+  return () => {
+    done = true;
+    stop();
+  };
+}
+
+/**
+ * The bus asks the operator through the shell's own dialog, using the prompt
+ * and target the node rendered rather than wording invented here.
+ *
+ * A function rather than inline in `createShell` so the test harness wires
+ * the dialog exactly as the product does: a target the node sends that never
+ * reaches the dialog is a confirmation the operator answers blind.
+ */
+export function bindConfirmations({ bus, ui }: { bus: Bus; ui: UiStore }): void {
+  bus.onConfirm(async ({ command, prompt, risk, target }) =>
+    ui.confirm({
+      command,
+      title: "Confirm",
+      detail: prompt,
+      risk: risk as Risk,
+      target,
+    }),
+  );
 }

@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Q4 child</title>
+<script>
+  const p = new URLSearchParams(location.search).get("p");
+  try {
+    new WebSocket("{{A}}".replace(/^http/, "ws") + `/ws?tag=${p}`);
+  } catch {
+    // A CSP refusal can throw synchronously; the server's log is the answer.
+  }
+</script>

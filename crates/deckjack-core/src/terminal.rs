@@ -61,6 +61,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -456,6 +457,13 @@ pub trait PtyProcess: Send + Sync {
     /// Block until the child exits and reap it. Called once, by the pump,
     /// after the output stream ends.
     fn wait(&self) -> Option<(u32, Option<String>)>;
+    /// Whether anything this terminal started may still be running once the
+    /// pump is done with it: a job the shell left behind in its session.
+    /// The registry keeps a closed terminal within the kill switch's reach
+    /// until this says no. A pty with no processes behind it says no.
+    fn lingers(&self) -> bool {
+        false
+    }
 }
 
 /// Opens pseudo-terminals.
@@ -523,6 +531,7 @@ impl PtyBackend for NativeBackend {
             child: Mutex::new(child),
             killer: Mutex::new(killer),
             pid,
+            reaped: AtomicBool::new(false),
         }))
     }
 }
@@ -532,6 +541,11 @@ struct NativePty {
     child: Mutex<Box<dyn Child + Send + Sync>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     pid: Option<u32>,
+    /// Set once `wait` has collected the child. From then on the pid is the
+    /// kernel's to hand to someone else, so signaling it — or the group or
+    /// session it names — could hit an unrelated process. Every hangup after
+    /// this is a no-op.
+    reaped: AtomicBool,
 }
 
 impl PtyProcess for NativePty {
@@ -560,12 +574,39 @@ impl PtyProcess for NativePty {
         let Some(pid) = self.pid else {
             return Ok(());
         };
+        if self.reaped.load(Ordering::Acquire) {
+            // The shell is gone, but a job it left behind — `nohup cmd &`
+            // and `exit` — is still in its session. The kernel does not hand
+            // out a pid while any process still carries it as a session id,
+            // so while such a job lives, the session id still means this
+            // terminal; `left_behind` also checks no new process has taken
+            // the pid. The polite hangup is the shell's to pass on, and the
+            // shell is gone, so only the kill switch reaches this far.
+            if how == Hangup::Now && left_behind(pid) {
+                kill_session(pid);
+            }
+            return Ok(());
+        }
         match how {
             // `clone_killer` exists so a kill can happen while another thread
             // is blocked in `wait`, which is exactly the pump's situation.
             // It signals the one process, so the group call below is what
             // actually takes the shell's children with it.
+            //
+            // The group is not the whole of it. An interactive shell puts
+            // every job in a process group of its own, so `killpg` on the
+            // shell's group leaves `make &` running as the host user — and
+            // holding the pty open, so the output stream never ends and the
+            // dead shell is never reaped. The shell is a session leader
+            // (`portable-pty` calls `setsid`), so its session is exactly the
+            // set of processes this terminal started, and that is what a
+            // kill switch kills.
+            //
+            // Members first, leader last: while the leader is alive and
+            // unreaped its pid cannot be reused, so the session id the scan
+            // matches on still means this terminal.
             Hangup::Now => {
+                kill_session(pid);
                 let _ = lock(&self.killer).kill();
                 killpg(Pid::from_raw(pid as i32), Signal::SIGKILL)
             }
@@ -583,8 +624,97 @@ impl PtyProcess for NativePty {
 
     fn wait(&self) -> Option<(u32, Option<String>)> {
         let status = lock(&self.child).wait().ok()?;
+        self.reaped.store(true, Ordering::Release);
         Some((status.exit_code(), status.signal().map(str::to_string)))
     }
+
+    fn lingers(&self) -> bool {
+        match self.pid {
+            Some(pid) => !self.reaped.load(Ordering::Acquire) || left_behind(pid),
+            None => false,
+        }
+    }
+}
+
+/// Whether processes remain in the session a reaped shell `sid` led.
+///
+/// Only while the pid itself is free: once a new process holds it, that
+/// process may have started a session of its own under the same id, and its
+/// members are not this terminal's to kill.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn left_behind(sid: u32) -> bool {
+    if std::path::Path::new(&format!("/proc/{sid}")).exists() {
+        return false;
+    }
+    !session_members(sid).is_empty()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn left_behind(_sid: u32) -> bool {
+    false
+}
+
+/// `SIGKILL` every process in the session `sid` leads, other than the leader
+/// itself (which the caller signals).
+///
+/// Read from `/proc`, the only interface Linux offers for "which processes
+/// are in this session". A process that exits between the listing and the
+/// kill is `ESRCH`, which is the outcome asked for. A process that forks
+/// between the two is the one race this cannot close; it is a kill switch for
+/// shells an operator was using, not a defense against a program written to
+/// outrun it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn kill_session(sid: u32) {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    for pid in session_members(sid) {
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+    }
+}
+
+/// Every process in session `sid` other than its leader, read from `/proc`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn session_members(sid: u32) -> Vec<u32> {
+    let mut members = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return members;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == sid {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if session_of_stat(&stat) == Some(sid) {
+            members.push(pid);
+        }
+    }
+    members
+}
+
+/// Elsewhere there is no portable way to list a session's members, so the
+/// kill stays with the shell's process group, as it always was.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn kill_session(_sid: u32) {}
+
+/// The session id field of a `/proc/<pid>/stat` line.
+///
+/// The command name in field 2 is parenthesized and may itself contain spaces
+/// and parentheses, so the fields are counted from the *last* `)`: state,
+/// ppid, pgrp, session.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+fn session_of_stat(stat: &str) -> Option<u32> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(3)?.parse().ok()
 }
 
 impl Drop for NativePty {
@@ -669,7 +799,9 @@ pub struct TerminalSession {
     opened_by: Opener,
     opened_at: u64,
     env: Arc<dyn Env>,
-    pty: Box<dyn PtyProcess>,
+    /// Shared with the output pump, which must be able to reap the child
+    /// after this session is gone: see [`pump`].
+    pty: Arc<dyn PtyProcess>,
     /// Input goes through a thread so that a shell which has stopped reading
     /// cannot block an async handler on a pty write. `SyncSender` is both
     /// bounded and `Sync`, so no lock is needed around it.
@@ -859,9 +991,9 @@ impl TerminalSession {
     }
 
     /// Record the exit and wake everyone following. Called by the pump once
-    /// the output stream ends.
-    fn reap(&self) {
-        let (code, signal) = self.pty.wait().unwrap_or((
+    /// the output stream ends and the child has been waited on.
+    fn record_exit(&self, status: Option<(u32, Option<String>)>) {
+        let (code, signal) = status.unwrap_or((
             // The child could not be reaped, which on Unix means something
             // else already did. Its output stream has ended either way, so
             // the honest report is an unknown non-zero status rather than
@@ -899,24 +1031,38 @@ fn spawn_input_thread(
     Ok(tx)
 }
 
-/// Read the pty until it ends, appending to the scrollback.
+/// Read the pty until it ends, appending to the scrollback, then reap the
+/// child.
 ///
-/// Holds a [`Weak`] rather than an [`Arc`]: a shell may sit idle for days,
-/// and a strong reference here would keep a closed session, its scrollback
-/// and its pty alive for as long as it did.
+/// Holds a [`Weak`] to the session rather than an [`Arc`]: a shell may sit
+/// idle for days, and a strong reference here would keep a closed session
+/// and its scrollback alive for as long as it did.
+///
+/// It holds the *pty* strongly, though, and that is the half that matters.
+/// The pump is the one thing that waits on the child, and it must do so
+/// whether or not anyone still holds the session: `close` and `kill_all`
+/// forget the session first and the shell dies afterwards, so a pump that
+/// reaped through the session found it gone and skipped the `wait`, leaving a
+/// zombie for every terminal a lockdown or a close ever took.
 fn spawn_output_pump(
     session: &Arc<TerminalSession>,
     mut reader: Box<dyn Read + Send>,
 ) -> io::Result<()> {
     let weak = Arc::downgrade(session);
+    let pty = Arc::clone(&session.pty);
     let id = session.id.clone();
     std::thread::Builder::new()
         .name(format!("dj-pty-out-{id}"))
-        .spawn(move || pump(&weak, &id, reader.as_mut()))?;
+        .spawn(move || pump(&weak, pty, &id, reader.as_mut()))?;
     Ok(())
 }
 
-fn pump(weak: &Weak<TerminalSession>, id: &TerminalId, reader: &mut (dyn Read + Send)) {
+fn pump(
+    weak: &Weak<TerminalSession>,
+    pty: Arc<dyn PtyProcess>,
+    id: &TerminalId,
+    reader: &mut (dyn Read + Send),
+) {
     let mut buf = [0u8; READ_CHUNK];
     loop {
         let n = match reader.read(&mut buf) {
@@ -932,17 +1078,24 @@ fn pump(weak: &Weak<TerminalSession>, id: &TerminalId, reader: &mut (dyn Read + 
                 break;
             }
         };
-        // The session was closed while this read was in flight; its pty and
-        // scrollback are already gone.
-        let Some(session) = weak.upgrade() else {
-            return;
-        };
-        lock(&session.out).push(&buf[..n]);
-        session.wake.notify_waiters();
+        // A session closed while the shell is still printing has nowhere to
+        // put the output, but the stream is still drained to its end: a
+        // shell blocked writing to a full pty never gets as far as exiting,
+        // and the end of the stream is what says it is safe to wait.
+        if let Some(session) = weak.upgrade() {
+            lock(&session.out).push(&buf[..n]);
+            session.wake.notify_waiters();
+        }
     }
 
+    // Reaped unconditionally, before the session is even looked for.
+    let status = pty.wait();
+    // Let go of the pty before the exit is announced, so that once a session
+    // reads as exited the pump holds nothing of it: pruning the session is
+    // then what closes the master, not a race with this thread's last line.
+    drop(pty);
     if let Some(session) = weak.upgrade() {
-        session.reap();
+        session.record_exit(status);
     }
 }
 
@@ -959,6 +1112,18 @@ pub struct Limits {
     /// than take it down.
     pub max_sessions: usize,
     pub scrollback_bytes: usize,
+    /// How long an exited terminal is kept, in seconds, so a browser that
+    /// reconnects can still read its last output and how it ended.
+    ///
+    /// An exited terminal is not free: until it is forgotten it holds its pty
+    /// master, the thread that feeds its input and its scrollback. So it is
+    /// kept for this long and no longer.
+    pub exited_grace_secs: u64,
+    /// The most exited terminals kept at once, whatever their age. Exited
+    /// terminals do not count against [`Limits::max_sessions`], so without
+    /// this a loop of open-and-exit would hold a pty per pass for the whole
+    /// grace period. The oldest exit goes first.
+    pub max_exited: usize,
 }
 
 impl Default for Limits {
@@ -966,6 +1131,8 @@ impl Default for Limits {
         Limits {
             max_sessions: 16,
             scrollback_bytes: SCROLLBACK_BYTES,
+            exited_grace_secs: 15 * 60,
+            max_exited: 8,
         }
     }
 }
@@ -980,6 +1147,11 @@ pub struct Registry {
     backend: Arc<dyn PtyBackend>,
     limits: Limits,
     live: Mutex<HashMap<TerminalId, Arc<TerminalSession>>>,
+    /// Terminals closed but possibly not ended: a job that ignored the
+    /// hangup, or one the shell left behind, runs on after `close` has
+    /// forgotten the session. Kept so the kill switch still reaches them;
+    /// dropped once the pump is done and nothing lingers.
+    closed: Mutex<Vec<Arc<dyn PtyProcess>>>,
 }
 
 impl Registry {
@@ -989,7 +1161,92 @@ impl Registry {
             backend,
             limits,
             live: Mutex::new(HashMap::new()),
+            closed: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Keep a closed terminal's pty within the kill switch's reach, and let
+    /// go of the ones that are over: only this list still holds them (the
+    /// pump has reaped and returned) and nothing they started is running.
+    ///
+    /// The new ones are judged with the rest: one that nothing else holds and
+    /// that left nothing running is let go now, so its master closes now. A
+    /// caller that still holds the session holds the pty too, so a terminal
+    /// just closed is always kept until a later call.
+    fn keep_closed(&self, ptys: impl IntoIterator<Item = Arc<dyn PtyProcess>>) {
+        let mut closed = lock(&self.closed);
+        closed.extend(ptys);
+        closed.retain(|p| Arc::strong_count(p) > 1 || p.lingers());
+    }
+
+    /// Exited terminals past their grace, and those beyond
+    /// [`Limits::max_exited`], taken out of `live`.
+    ///
+    /// The cap is node-wide, so it has to choose whose terminals go. Each
+    /// eviction takes the oldest exit of whichever opener holds the most
+    /// exited terminals: a session that opens and exits shells in a loop
+    /// pays for its own loop, and another session's recently exited
+    /// terminal stays reattachable for its grace.
+    fn take_expired(
+        &self,
+        live: &mut HashMap<TerminalId, Arc<TerminalSession>>,
+    ) -> Vec<Arc<TerminalSession>> {
+        let cutoff = self.env.now().saturating_sub(self.limits.exited_grace_secs);
+        let mut exited: Vec<(u64, u64, TerminalId, Opener)> = live
+            .values()
+            .filter_map(|s| {
+                s.exit()
+                    .map(|e| (e.at, s.opened_at, s.id.clone(), s.opened_by))
+            })
+            .collect();
+        // Oldest exit first, so within one opener the cap takes the ones
+        // least likely to be looked at again.
+        exited.sort_by(|a, b| (a.0, a.1, a.2.as_str()).cmp(&(b.0, b.1, b.2.as_str())));
+        let (mut doomed, mut kept): (Vec<_>, Vec<_>) =
+            exited.into_iter().partition(|(at, ..)| *at < cutoff);
+        while kept.len() > self.limits.max_exited {
+            let held = |o: &Opener| kept.iter().filter(|k| &k.3 == o).count();
+            // The first opener (in exit order) with the largest share; its
+            // first entry in `kept` is its oldest exit.
+            let most = kept.iter().map(|k| held(&k.3)).max().unwrap_or(0);
+            let Some(i) = kept.iter().position(|k| held(&k.3) == most) else {
+                break;
+            };
+            doomed.push(kept.remove(i));
+        }
+        doomed
+            .into_iter()
+            .filter_map(|(_, _, id, _)| live.remove(&id))
+            .collect()
+    }
+
+    /// Drop sessions already out of `live`, keeping their ptys within the
+    /// kill switch's reach for as long as something they started lingers.
+    fn let_go(&self, sessions: Vec<Arc<TerminalSession>>) -> usize {
+        let n = sessions.len();
+        let ptys: Vec<Arc<dyn PtyProcess>> = sessions.iter().map(|s| Arc::clone(&s.pty)).collect();
+        // The sessions first: each one holds its pty and its input thread's
+        // sender, and the pty can only be let go once nothing else holds it.
+        drop(sessions);
+        self.keep_closed(ptys);
+        n
+    }
+
+    /// Forget exited terminals past [`Limits::exited_grace_secs`], and the
+    /// oldest beyond [`Limits::max_exited`]. Returns how many went.
+    ///
+    /// Run on every open and list, and on a timer by the wiring, so the bound
+    /// holds whether or not anyone is using the terminal app.
+    pub fn reap_exited(&self) -> usize {
+        let expired = {
+            let mut live = lock(&self.live);
+            self.take_expired(&mut live)
+        };
+        let n = self.let_go(expired);
+        if n > 0 {
+            tracing::debug!(count = n, "exited terminals forgotten");
+        }
+        n
     }
 
     pub fn limits(&self) -> Limits {
@@ -1006,10 +1263,14 @@ impl Registry {
         // a size with nothing to resync them. Clamping twice is harmless.
         let mut spec = spec;
         spec.size = spec.size.clamped();
+        self.reap_exited();
         let mut live = lock(&self.live);
 
-        // Exited sessions are kept so their last output can still be read,
-        // but they hold no pty and no threads, so they do not count here.
+        // Exited sessions are kept so their last output can still be read.
+        // They are not counted here — a few crashed shells must not wedge the
+        // terminal app — because they are bounded on their own, by
+        // `exited_grace_secs` and `max_exited`, and `reap_exited` above has
+        // just applied both.
         let running = live.values().filter(|s| s.exit().is_none()).count();
         if running >= self.limits.max_sessions {
             return Err(TerminalError::TooMany {
@@ -1029,7 +1290,7 @@ impl Registry {
         }
 
         let size = spec.size;
-        let pty = self.backend.open(&spec, &id)?;
+        let pty: Arc<dyn PtyProcess> = Arc::from(self.backend.open(&spec, &id)?);
 
         let reader = pty.reader().map_err(|source| TerminalError::Pty {
             id: id.clone(),
@@ -1088,6 +1349,7 @@ impl Registry {
 
     /// Everything held, oldest first, so a client can rebuild its tab strip.
     pub fn list(&self) -> Vec<Info> {
+        self.reap_exited();
         let mut out: Vec<Info> = lock(&self.live).values().map(|s| s.info()).collect();
         out.sort_by_key(|i| (i.opened_at, i.id.0.clone()));
         out
@@ -1102,6 +1364,7 @@ impl Registry {
     /// the unfiltered list handed any signed-in session the handle to every
     /// other session's shell. Callers serving a session use this.
     pub fn list_for(&self, owner: &Opener) -> Vec<Info> {
+        self.reap_exited();
         let mut out: Vec<Info> = lock(&self.live)
             .values()
             .filter(|s| &s.opened_by == owner)
@@ -1121,7 +1384,9 @@ impl Registry {
             .remove(id)
             .ok_or_else(|| TerminalError::NoSuchTerminal { id: id.clone() })?;
         tracing::info!(terminal = %id, "terminal closed");
-        session.hangup(Hangup::Polite)
+        let hung = session.hangup(Hangup::Polite);
+        self.keep_closed([Arc::clone(&session.pty)]);
+        hung
     }
 
     /// Lockdown: kill every shell, now, and forget them all.
@@ -1133,14 +1398,22 @@ impl Registry {
             lock(&self.live).drain().map(|(_, s)| s).collect();
         let mut killed = 0;
         for session in &sessions {
-            if session.exit().is_some() {
-                continue;
-            }
+            // An exited shell is signaled too, for the jobs it left behind
+            // (see `NativePty::hangup`); it is just not counted as killed.
+            let running = session.exit().is_none();
             match session.hangup(Hangup::Now) {
-                Ok(()) => killed += 1,
+                Ok(()) if running => killed += 1,
+                Ok(()) => {}
                 Err(e) => {
                     tracing::warn!(terminal = %session.id, error = %e, "could not kill shell")
                 }
+            }
+        }
+        // Terminals already closed, whose jobs may have ignored the hangup.
+        let closed: Vec<Arc<dyn PtyProcess>> = lock(&self.closed).drain(..).collect();
+        for pty in &closed {
+            if let Err(e) = pty.hangup(Hangup::Now) {
+                tracing::warn!(error = %e, "could not kill a closed terminal's processes");
             }
         }
         if killed > 0 {
@@ -1167,6 +1440,7 @@ impl Registry {
                 tracing::warn!(terminal = %session.id, error = %e, "could not hang up shell");
             }
         }
+        self.keep_closed(doomed.iter().map(|s| Arc::clone(&s.pty)));
         doomed.len()
     }
 
@@ -1175,14 +1449,20 @@ impl Registry {
     /// Exited sessions are kept on purpose so the browser can read the last
     /// output and the exit status after a reconnect. They are not kept
     /// forever, or a long-running server accumulates every shell it ever ran.
+    ///
+    /// [`Self::reap_exited`] is the policy the server runs; this is the same
+    /// release with a cutoff the caller picks.
     pub fn prune_exited(&self, cutoff: u64) -> usize {
-        let mut live = lock(&self.live);
-        let before = live.len();
-        live.retain(|_, s| match s.exit() {
-            Some(exit) => exit.at >= cutoff,
-            None => true,
-        });
-        before - live.len()
+        let gone: Vec<Arc<TerminalSession>> = {
+            let mut live = lock(&self.live);
+            let ids: Vec<TerminalId> = live
+                .values()
+                .filter(|s| s.exit().is_some_and(|exit| exit.at < cutoff))
+                .map(|s| s.id.clone())
+                .collect();
+            ids.iter().filter_map(|id| live.remove(id)).collect()
+        };
+        self.let_go(gone)
     }
 }
 
@@ -1205,4 +1485,24 @@ impl Drop for Registry {
 /// better than taking the whole server down with it.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_of_stat;
+
+    /// A program can name itself anything, including text that looks like
+    /// the fields after it. Counting from the first `)` would read this
+    /// one's session as `5`, and the kill switch would sweep session 5.
+    #[test]
+    fn the_session_is_read_past_a_command_name_that_contains_parentheses() {
+        let stat = "4242 (evil) S 1 5 5) S 1 777 4242 34816 4242 4194560 0 0";
+        assert_eq!(session_of_stat(stat), Some(4242));
+    }
+
+    #[test]
+    fn a_truncated_stat_line_has_no_session() {
+        assert_eq!(session_of_stat("4242 (sh) S 1"), None);
+        assert_eq!(session_of_stat(""), None);
+    }
 }

@@ -352,6 +352,7 @@ fn issuer_columns(issuer: &Issuer) -> (&'static str, Option<&str>, Option<&str>)
         Issuer::Cli => ("cli", None, None),
         Issuer::System => ("system", None, None),
         Issuer::Agent { session, window } => ("agent", Some(session.as_str()), window.as_deref()),
+        Issuer::AppUi { app } => ("app_ui", Some(app.as_str()), None),
     }
 }
 
@@ -456,6 +457,7 @@ impl<'q> Bounds<'q> {
             Some(IssuerFilter::System) => (Some("system"), None),
             // `session: None` is every agent, not an agent with no name.
             Some(IssuerFilter::Agent { session }) => (Some("agent"), session.as_deref()),
+            Some(IssuerFilter::AppUi { app }) => (Some("app_ui"), app.as_deref()),
             None => (None, None),
         };
 
@@ -559,6 +561,12 @@ impl RawRow {
                     .clone()
                     .ok_or_else(|| bad("issuer_name", "NULL".to_string()))?,
                 window: self.issuer_window.clone(),
+            },
+            "app_ui" => Issuer::AppUi {
+                app: self
+                    .issuer_name
+                    .clone()
+                    .ok_or_else(|| bad("issuer_name", "NULL".to_string()))?,
             },
             other => return Err(bad("issuer_kind", other.to_string())),
         };
@@ -741,6 +749,9 @@ fn issuer(issuer: &BusIssuer) -> Issuer {
         // for window invitations to reach the bus's issuer.
         BusIssuer::Agent { session } => Issuer::agent(session.as_str()),
         BusIssuer::Cli => Issuer::Cli,
+        // The app by name; the browser it ran in goes into `issuer_session`
+        // with the operator's tag, through `browser_session()`.
+        BusIssuer::AppUi { app, .. } => Issuer::AppUi { app: app.clone() },
     }
 }
 
@@ -790,10 +801,10 @@ pub struct TimelineParams {
     /// was given.
     pub since_ms: Option<i64>,
     pub until_ms: Option<i64>,
-    /// `operator`, `agent`, `cli` or `system`.
+    /// `operator`, `agent`, `cli`, `system` or `app_ui`.
     pub issuer: Option<String>,
-    /// One agent session by name. Ignored unless `issuer` is `agent`, because
-    /// only an agent has a session name in this table.
+    /// One agent session by name, or with `issuer` `app_ui` one app by name.
+    /// Ignored for the other issuers, which have no name in this table.
     pub session: Option<String>,
     /// A command id, or a namespace when `namespace` is set.
     pub command: Option<String>,
@@ -871,8 +882,11 @@ fn issuer_filter(kind: &str, session: Option<String>) -> Result<IssuerFilter, Co
         "cli" => Ok(IssuerFilter::Cli),
         "system" => Ok(IssuerFilter::System),
         "agent" => Ok(IssuerFilter::Agent { session }),
+        // An app window's row carries the app's name where an agent's carries
+        // its session name, so `session` names the app here.
+        "app_ui" => Ok(IssuerFilter::AppUi { app: session }),
         other => Err(CommandError::Failed(anyhow::anyhow!(
-            "{other:?} is not an issuer: expected operator, agent, cli or system"
+            "{other:?} is not an issuer: expected operator, agent, cli, system or app_ui"
         ))),
     }
 }

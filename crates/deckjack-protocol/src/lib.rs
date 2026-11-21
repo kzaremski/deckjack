@@ -61,6 +61,7 @@ use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 /// The app protocol this build speaks.
@@ -120,6 +121,36 @@ pub const UI_INDEX: &str = "index.html";
 /// the earlier of the two checks, not a substitute for it.
 pub const HIDDEN_DIR: &str = ".deckjack";
 
+/// What the install directory (`~/.deckjack`, or `$DECKJACK_HOME`) holds, by
+/// top-level name: the core binary, the installed apps, their sockets, this
+/// node's identity, the caches, debug mode's session cookie, the server's
+/// log and the proxy socket's folder.
+///
+/// The working directory defaults to the install directory, so every one of
+/// these is, by default, a top-level name in the tree apps and the file layer
+/// see. None of them is ever exposed: the core's file layer refuses any path
+/// whose canonical form is inside `<install>/<entry>`, and the launcher
+/// refuses a grant that reaches one. A manifest naming one as the first
+/// component of a `working_dir` path is refused here as well, because under
+/// the default layout that path *is* the install directory's.
+///
+/// The core re-exports this as `node::INSTALL_LAYOUT`, and its tests check
+/// that every path the core writes into the install directory starts with
+/// one of these names, so a new entry cannot be added without listing it.
+pub const INSTALL_LAYOUT: &[&str] = &[
+    "bin",
+    "apps",
+    "run",
+    "keys",
+    "cache",
+    "debug-session.cookie",
+    "server.log",
+    // The proxy socket for `tailscale serve` and its lock file, when
+    // `[server] unix_socket` is set (it must be under here if it is inside
+    // the install directory at all).
+    "proxy",
+];
+
 // ---------------------------------------------------------------------------
 // The manifest
 // ---------------------------------------------------------------------------
@@ -127,14 +158,69 @@ pub const HIDDEN_DIR: &str = ".deckjack";
 // ---------------------------------------------------------------------------
 
 /// `app.toml`: what an app is, what it provides and what it needs.
+///
+/// The `[ui]` table is written at the top level of `app.toml` and held in
+/// [`Needs::ui`]. Top level, because it describes the app's *window* and not
+/// its process; inside `Needs`, because it is something the operator approves
+/// exactly like the rest of `[needs]`: [`Needs::is_empty`] counts it, the
+/// stored approval carries it, and the fingerprint covers it, without a
+/// second struct that each of those three places would have to remember.
+/// `ManifestToml` is the file's shape and does the moving.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "ManifestToml", into = "ManifestToml")]
 pub struct Manifest {
     pub app: AppInfo,
-    #[serde(default)]
     pub needs: Needs,
-    #[serde(default)]
     pub commands: Vec<CommandDecl>,
+}
+
+/// `app.toml` exactly as written: `[ui]` beside `[needs]`, not inside it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestToml {
+    app: AppInfo,
+    #[serde(default)]
+    needs: Needs,
+    #[serde(default, skip_serializing_if = "UiNeeds::is_empty")]
+    ui: UiNeeds,
+    #[serde(default)]
+    commands: Vec<CommandDecl>,
+}
+
+impl TryFrom<ManifestToml> for Manifest {
+    type Error = String;
+
+    fn try_from(raw: ManifestToml) -> Result<Manifest, String> {
+        // `[needs.ui]` would deserialize, because `Needs` holds the field.
+        // Refused rather than merged, so there is one place to read an app's
+        // window scope and a reviewer never has to look in two.
+        if !raw.needs.ui.is_empty() {
+            return Err(
+                "the window's scope is declared in a top-level [ui] table, not in [needs.ui]"
+                    .to_string(),
+            );
+        }
+        let mut needs = raw.needs;
+        needs.ui = raw.ui;
+        Ok(Manifest {
+            app: raw.app,
+            needs,
+            commands: raw.commands,
+        })
+    }
+}
+
+impl From<Manifest> for ManifestToml {
+    fn from(manifest: Manifest) -> ManifestToml {
+        let mut needs = manifest.needs;
+        let ui = std::mem::take(&mut needs.ui);
+        ManifestToml {
+            app: manifest.app,
+            needs,
+            ui,
+            commands: manifest.commands,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,7 +244,38 @@ pub struct AppInfo {
     /// manager's app contract.
     #[serde(default)]
     pub min_width: Option<u32>,
+    /// One or two letters or digits for the dock and the window tag. Short
+    /// enough to read at 22px, which an icon would not be at compact
+    /// density. The shell derives one from the title when this is absent.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// One line for the palette and the switcher: what the app is for.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// The size a new window opens at on the desktop, before the operator
+    /// moves it. Each falls back to the shell's default independently.
+    #[serde(default)]
+    pub default_width: Option<u32>,
+    #[serde(default)]
+    pub default_height: Option<u32>,
+    /// Whether the app renders in compact mode (one window fills a phone)
+    /// and in wide mode (a desktop window). Both default to true, because the
+    /// app contract says every app does both; an app that cannot says so
+    /// here rather than shipping a panel that breaks.
+    #[serde(default = "yes")]
+    pub compact: bool,
+    #[serde(default = "yes")]
+    pub wide: bool,
 }
+
+fn yes() -> bool {
+    true
+}
+
+/// Most characters an [`AppInfo::summary`] may have. It is one line in a
+/// palette row; a paragraph there is a manifest written for a different
+/// place.
+pub const SUMMARY_MAX: usize = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -181,9 +298,32 @@ pub struct Needs {
     ///
     /// The host *names* are a different matter. Landlock's network rules are
     /// per-port, so an allowlist of names cannot be installed as written and
-    /// a non-empty list opens the network as a whole — reported at warn on
-    /// every launch, see [`Sandbox::network_is_coarse`].
+    /// a non-empty list on its own opens the network as a whole — reported at
+    /// warn on every launch, see [`Sandbox::network_is_coarse`]. Naming
+    /// ports in [`Needs::connect_tcp`] or [`Needs::bind_tcp`] is what narrows
+    /// it.
     pub network: Vec<String>,
+    /// TCP ports the app may connect to, on any host: `[443]` for an app
+    /// that speaks HTTPS to the hosts in [`Needs::network`].
+    ///
+    /// Naming any port here or in [`Needs::bind_tcp`] switches the app from
+    /// "the whole network" to "TCP on exactly these ports": Landlock refuses
+    /// every other TCP connect and bind. What Landlock cannot do is said
+    /// plainly so nobody plans against it: it filters **ports, not hosts**
+    /// (an app granted 443 reaches every host's 443, and the host list stays
+    /// a statement for the operator, not a rule), and it does **not filter
+    /// UDP** at all, so DNS and QUIC are outside it either way.
+    ///
+    /// Skipped when empty, for the same reason as
+    /// [`Needs::invoke_commands`]: an installed app that names no ports keeps
+    /// the fingerprint it was approved under.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub connect_tcp: Vec<u16>,
+    /// TCP ports the app may listen on. See [`Needs::connect_tcp`]; a port
+    /// here does not by itself let anything outside this machine reach it,
+    /// it only stops Landlock refusing the bind.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bind_tcp: Vec<u16>,
     /// Parts of the working directory the app may see.
     pub working_dir: Vec<DirNeed>,
     /// Whether the app may **call** commands on the bus, not merely serve
@@ -210,6 +350,106 @@ pub struct Needs {
     /// which is the case the fingerprint exists for.
     #[serde(skip_serializing_if = "is_false")]
     pub invoke_commands: bool,
+    /// What the app's **window** may reach beyond the app's own commands:
+    /// `[ui]` in `app.toml`. See [`UiNeeds`].
+    ///
+    /// Skipped when empty for the reason [`Needs::invoke_commands`] is: an
+    /// app with no `[ui]` keeps the fingerprint it was approved under.
+    #[serde(skip_serializing_if = "UiNeeds::is_empty")]
+    pub ui: UiNeeds,
+}
+
+/// `[ui]`: the scope of an app's window, as opposed to its process.
+///
+/// An app's UI may always call the commands its own process registered at
+/// handshake — exactly those ids, never "anything named `<app>.*`". Anything
+/// else it calls or listens to is listed here, approved by the operator with
+/// the rest of `[needs]`, and checked by the core on every call that arrives
+/// on the app's behalf (docs/APP-UI-ISOLATION.md §4.6).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UiNeeds {
+    /// Command ids the window may call. Each is exact; a trailing `.*` is
+    /// allowed only inside the app's own namespace, because a wildcard over
+    /// a core namespace would silently grow when the core adds a command.
+    /// Nothing under [`HARD_DENY`] may appear.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub invoke: Vec<String>,
+    /// Event topics the window may subscribe to, under the same rules.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<String>,
+}
+
+impl UiNeeds {
+    pub fn is_empty(&self) -> bool {
+        self.invoke.is_empty() && self.events.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What an app's window may never reach, and names no app may take
+// ---------------------------------------------------------------------------
+
+/// Namespaces no app's window may ever call or listen to, whatever its
+/// manifest says and whatever the operator approved.
+///
+/// - `terminal`: a shell is the whole machine.
+/// - `system`: approvals, grants, lockdown and recovery codes (D5: all of it).
+/// - `shell`: shell operations go only through the broker's own `shell` op.
+/// - `auth`: sign-in, sessions and passkeys.
+///
+/// One constant, applied to commands **and** event topics: in manifest
+/// validation here, and again by the core at dispatch.
+pub const HARD_DENY: &[&str] = &["terminal", "system", "shell", "auth"];
+
+/// Whether a command id or an event topic falls under [`HARD_DENY`].
+///
+/// By namespace: the id itself, or anything under `<namespace>.`. A pattern
+/// such as `system.*` is caught by the same test, so a wildcard is not a
+/// way around it.
+pub fn is_hard_denied(id: &str) -> bool {
+    let namespace = id.split('.').next().unwrap_or(id);
+    HARD_DENY.contains(&namespace)
+}
+
+/// Namespaces the core itself registers or reserves. None may be an app's
+/// name, and so none may prefix an app's command: a command must be named
+/// `<app>.<something>`, so refusing the name refuses the prefix.
+///
+/// The difference this makes is the one docs/APP-UI-ISOLATION.md §4.6 is
+/// about: an app named `files` must not look as if it owned the core's
+/// `files.*`. Every namespace the core registers must be in this list;
+/// `deckjack-core`'s tests check that against the core's real registry.
+pub const RESERVED_NAMESPACES: &[&str] = &[
+    "auth", "editor", "files", "git", "shell", "system", "terminal",
+];
+
+/// Whether `name` is a core namespace no app may take.
+pub fn is_reserved_namespace(name: &str) -> bool {
+    RESERVED_NAMESPACES.contains(&name)
+}
+
+/// One dotted id or topic as `[ui]` may name it: dot-separated parts of
+/// `a-z`, `0-9` and `_`, each starting with a letter (the core's command id
+/// rule), optionally ending in `.*`. Returns the namespace and whether the
+/// entry was a wildcard, or `None` when it is not well formed.
+fn ui_entry(entry: &str) -> Option<(&str, bool)> {
+    let mut parts: Vec<&str> = entry.split('.').collect();
+    let wildcard = parts.last() == Some(&"*");
+    if wildcard {
+        parts.pop();
+    }
+    // An exact entry needs a namespace and a name; a wildcard needs only the
+    // namespace.
+    if parts.is_empty() || (!wildcard && parts.len() < 2) || entry.contains("__") {
+        return None;
+    }
+    let well_formed = parts.iter().all(|part| {
+        let mut chars = part.chars();
+        chars.next().is_some_and(|c| c.is_ascii_lowercase())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    });
+    well_formed.then_some((parts[0], wildcard))
 }
 
 /// `[needs]` key for [`Needs::invoke_commands`], named once so a refusal can
@@ -238,8 +478,21 @@ impl Needs {
     /// it in this struct: an app with an otherwise empty `[needs]` launches
     /// with no approval at all, so a capability that did not make this
     /// `false` would be a capability nobody was ever asked about.
+    ///
+    /// [`Needs::ui`] counts for the same reason, and it is what makes D1 of
+    /// docs/APP-UI-ISOLATION.md true: an app whose window calls anything
+    /// beyond its own commands — Files calling the core's `files.*` — needs
+    /// approving, where an app that only calls its own still launches
+    /// unasked. Topics count as well as commands: a window that listens to
+    /// `files.*` events learns every file name in the working directory.
     pub fn is_empty(&self) -> bool {
-        !self.gpu && !self.invoke_commands && self.network.is_empty() && self.working_dir.is_empty()
+        !self.gpu
+            && !self.invoke_commands
+            && self.ui.is_empty()
+            && self.network.is_empty()
+            && self.connect_tcp.is_empty()
+            && self.bind_tcp.is_empty()
+            && self.working_dir.is_empty()
     }
 }
 
@@ -337,9 +590,68 @@ impl Manifest {
                 self.app.name
             )));
         }
+        // The command loop below holds every command to `<name>.`, so this
+        // one check also keeps an app from declaring a command under a core
+        // namespace.
+        if is_reserved_namespace(&self.app.name) {
+            return Err(bad(format!(
+                "app.name {:?} is a namespace the core itself uses, so no app may take it: \
+                 an app called that would look as if it owned the core's {:?}.* commands. \
+                 Reserved: {}",
+                self.app.name,
+                self.app.name,
+                RESERVED_NAMESPACES.join(", ")
+            )));
+        }
         if self.app.version.trim().is_empty() {
             return Err(bad(
                 "app.version is empty; set it to the build's version".into()
+            ));
+        }
+
+        // The dock fields. Each is checked here so the shell can render what
+        // `system.apps` hands it without second-guessing a manifest.
+        if let Some(tag) = &self.app.tag {
+            let count = tag.chars().count();
+            if !(1..=2).contains(&count) || !tag.chars().all(char::is_alphanumeric) {
+                return Err(bad(format!(
+                    "app.tag {tag:?} is not usable: a tag is one or two letters or digits, \
+                     because it is drawn at 22px in the dock and on every window"
+                )));
+            }
+        }
+        if let Some(summary) = &self.app.summary {
+            if summary.trim().is_empty() || summary.contains(['\n', '\r']) {
+                return Err(bad(
+                    "app.summary must be one non-empty line; leave it out rather than empty".into(),
+                ));
+            }
+            if summary.chars().count() > SUMMARY_MAX {
+                return Err(bad(format!(
+                    "app.summary is {} characters and the limit is {SUMMARY_MAX}: it is one \
+                     row in the palette",
+                    summary.chars().count()
+                )));
+            }
+        }
+        if let (Some(default), Some(min)) = (self.app.default_width, self.app.min_width)
+            && default < min
+        {
+            return Err(bad(format!(
+                "app.default_width {default} is below app.min_width {min}: every new \
+                 window would open narrower than the app says it can work at"
+            )));
+        }
+        if self.app.default_width == Some(0) || self.app.default_height == Some(0) {
+            return Err(bad(
+                "app.default_width and app.default_height must be above zero".into(),
+            ));
+        }
+        if !self.app.compact && !self.app.wide {
+            return Err(bad(
+                "app.compact and app.wide are both false: an app that renders in neither \
+                 layout can never be shown. Set the one it supports"
+                    .into(),
             ));
         }
 
@@ -416,6 +728,31 @@ impl Manifest {
                     need.path
                 )));
             }
+            // The first real component, because the working directory
+            // defaults to the install directory: under that layout `bin` is
+            // the core binary's directory and `apps` every app's. A working
+            // directory elsewhere loses only those few names at its top
+            // level, and the launcher checks the real paths again whatever
+            // the layout. Exactly, not ignoring case: on a case-sensitive
+            // filesystem `Cache` or `Apps` is the operator's own folder, and
+            // whether a folding mount makes `BIN` the same file as `bin` is
+            // something only the launcher can ask the filesystem.
+            let first = as_path.components().find_map(|c| match c {
+                std::path::Component::Normal(name) => Some(name.to_string_lossy()),
+                _ => None,
+            });
+            if let Some(first) = first
+                && let Some(entry) = INSTALL_LAYOUT.iter().find(|entry| first == **entry)
+            {
+                return Err(bad(format!(
+                    "needs.working_dir path {:?} names {entry:?}, which is part of \
+                     Deckjack's install directory (the core and app binaries, app sockets, \
+                     the proxy socket, node keys, caches and session files). The working directory is the \
+                     install directory by default, so no app may ask for it; choose a \
+                     different folder name",
+                    need.path
+                )));
+            }
             // `.` and `./.` have no parent component and no hidden component,
             // so every check above passes while the grant is the whole
             // working directory — including the hidden directory inside it,
@@ -444,11 +781,100 @@ impl Manifest {
             }
         }
 
+        for (key, ports) in [
+            ("connect_tcp", &self.needs.connect_tcp),
+            ("bind_tcp", &self.needs.bind_tcp),
+        ] {
+            let mut seen: Vec<u16> = Vec::new();
+            for &port in ports {
+                // Port 0 to Landlock means "a port the kernel picks", which is
+                // a different grant from any port a manifest author would
+                // write down, and no app here needs it.
+                if port == 0 {
+                    return Err(bad(format!(
+                        "needs.{key} lists port 0, which is not a port an app connects to or \
+                         listens on; name the real port numbers"
+                    )));
+                }
+                if seen.contains(&port) {
+                    return Err(bad(format!("needs.{key} lists port {port} twice")));
+                }
+                seen.push(port);
+            }
+        }
+        // Ports filter where TCP may go, never to whom: the host list is
+        // what the operator reads when approving, so an app that reaches out
+        // has to say where to, even though Landlock cannot hold it to that.
+        if !self.needs.connect_tcp.is_empty() && self.needs.network.is_empty() {
+            return Err(bad(
+                "needs.connect_tcp names ports but needs.network names no host: list the \
+                 hosts the app reaches on those ports, so the operator approves where it \
+                 goes and not only which ports"
+                    .into(),
+            ));
+        }
+        // The other direction: once any port is named, TCP is limited to
+        // exactly those ports, so hosts with no connect port would be hosts
+        // the app cannot reach. Refused rather than approved under a summary
+        // that promises network access the sandbox does not install.
+        if !self.needs.network.is_empty()
+            && !self.needs.bind_tcp.is_empty()
+            && self.needs.connect_tcp.is_empty()
+        {
+            return Err(bad(
+                "needs.network names hosts and needs.bind_tcp names ports, but \
+                 needs.connect_tcp names none: with ports named, the app may only connect \
+                 on the ports listed there, so list the ports it uses to reach those hosts"
+                    .into(),
+            ));
+        }
+
+        for (key, entries, what) in [
+            ("ui.invoke", &self.needs.ui.invoke, "command"),
+            ("ui.events", &self.needs.ui.events, "event topic"),
+        ] {
+            let mut seen: Vec<&str> = Vec::new();
+            for entry in entries {
+                let Some((namespace, wildcard)) = ui_entry(entry) else {
+                    return Err(bad(format!(
+                        "{key} entry {entry:?} is not a {what}: write an exact id such as \
+                         `files.read`, or `{}.*` for the app's own",
+                        self.app.name
+                    )));
+                };
+                if is_hard_denied(entry) {
+                    return Err(bad(format!(
+                        "{key} names {entry:?}, and no app's window may ever reach {namespace}.*: \
+                         {} are the operator's alone, whatever is approved",
+                        HARD_DENY
+                            .iter()
+                            .map(|ns| format!("{ns}.*"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+                // A wildcard over someone else's namespace would pick up every
+                // command added there later, approved or not.
+                if wildcard && namespace != self.app.name {
+                    return Err(bad(format!(
+                        "{key} entry {entry:?} is a wildcard outside the app's own namespace; \
+                         list the exact {what}s, so a {what} added there later is not \
+                         granted without anyone seeing it"
+                    )));
+                }
+                if seen.contains(&entry.as_str()) {
+                    return Err(bad(format!("{key} lists {entry:?} twice")));
+                }
+                seen.push(entry);
+            }
+        }
+
         Ok(())
     }
 
     /// A stable digest of everything the operator approved: the `[needs]`
-    /// table and the command surface with its risk levels.
+    /// table (with the window's `[ui]` scope, which it holds) and the command
+    /// surface with its risk levels.
     ///
     /// An app that gains a network host, turns a read command into a
     /// destructive one, or starts asking for [`Needs::invoke_commands`] gets
@@ -458,10 +884,16 @@ impl Manifest {
     /// deliberately excluded: a patch release that asks for nothing new
     /// should not nag.
     ///
-    /// Hashed with FNV-1a rather than [`std::hash::DefaultHasher`], whose
-    /// output is explicitly not stable between Rust releases — a fingerprint
-    /// that changed when the compiler did would revoke every grant on an
-    /// upgrade.
+    /// Hashed with SHA-256. Not [`std::hash::DefaultHasher`], whose output
+    /// is explicitly not stable between Rust releases (a fingerprint that
+    /// changed when the compiler did would revoke every grant on an
+    /// upgrade), and not a fast 64-bit hash either: the app author writes
+    /// both the approved manifest and its update, so equal fingerprints have
+    /// to mean an equal request even against someone searching for a
+    /// collision. The `sha256:` prefix replaced an earlier `fnv1a64:`, so
+    /// every grant recorded under that is stale once: the core reports such
+    /// an app as `stale` in `system.apps`, the shell offers "Approve <app>"
+    /// for it, and `deckjack install` says it must be approved again.
     pub fn fingerprint(&self) -> String {
         let mut commands: Vec<(&str, Risk)> = self
             .commands
@@ -470,25 +902,33 @@ impl Manifest {
             .collect();
         commands.sort();
 
+        // A port list is a set: `[80, 443]` and `[443, 80]` grant the same
+        // thing and must not re-ask the operator. Sorted on a copy, so the
+        // manifest keeps the order its author wrote. Empty lists are skipped
+        // in serialization, so an app that names no ports hashes exactly as
+        // it did before these fields existed.
+        let mut needs = self.needs.clone();
+        needs.connect_tcp.sort_unstable();
+        needs.bind_tcp.sort_unstable();
+        // `[ui]` is inside `needs`, so the window's scope is in the digest:
+        // an app that starts calling `files.write` is asked about again.
+        // Its lists are sets for the same reason the port lists are, and an
+        // app with no `[ui]` serializes exactly as before the table existed.
+        needs.ui.invoke.sort_unstable();
+        needs.ui.events.sort_unstable();
+
         // These types contain no maps, floats or non-string keys, so
         // serialization cannot fail and the field order is the declaration
         // order. That is what makes the digest reproducible.
         let canonical = serde_json::json!({
-            "needs": &self.needs,
+            "needs": &needs,
             "commands": commands,
         });
         let text = serde_json::to_string(&canonical).unwrap_or_default();
-        format!("fnv1a64:{:016x}", fnv1a64(text.as_bytes()))
+        let digest = Sha256::digest(text.as_bytes());
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        format!("sha256:{hex}")
     }
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 /// The one place the character set for an app name is decided.

@@ -5,6 +5,13 @@
 //! previews, downloads or agent tools. The terminal is the one documented
 //! escape hatch, and it does not come through here.
 //!
+//! The install directory's own entries ([`crate::node::INSTALL_LAYOUT`]: the
+//! core and app binaries, sockets, keys, caches and the debug session cookie)
+//! are refused the same way, by canonical host path, wherever the working
+//! directory is relative to them. By default the working directory *is* the
+//! install directory, so without this `files.write` could replace the core.
+//! See [`Root::protecting_install`].
+//!
 //! **Why the API is shaped this way.** The predecessor project took an
 //! absolute path from the client, canonicalized it, and used it: the
 //! configured root was decorative. So in this module there is no function
@@ -546,6 +553,13 @@ pub enum FileError {
     )]
     HiddenState { requested: VirtualPath },
 
+    #[error(
+        "{requested} is part of Deckjack's install directory (the core and app binaries, \
+         app sockets, node keys, caches and session files), which Deckjack never exposes; \
+         use the terminal if you need to inspect it"
+    )]
+    InstallState { requested: VirtualPath },
+
     #[error("{path} does not exist")]
     NotFound { path: VirtualPath },
 
@@ -598,6 +612,27 @@ pub enum FileError {
     )]
     NotLocal { address: NodePath },
 
+    #[error("{path} cannot go inside itself")]
+    IntoItself { path: VirtualPath },
+
+    #[error(
+        "{path} is on a different filesystem from where it was going, so it cannot be moved \
+         in one step; copy it and then move the original to the trash"
+    )]
+    CrossesFilesystems { path: VirtualPath },
+
+    #[error("{path} is a socket, device or pipe, which Files does not copy")]
+    NotCopyable { path: VirtualPath },
+
+    #[error("{path} was named twice; each item can only be moved or copied once")]
+    Duplicate { path: VirtualPath },
+
+    #[error("the operation was cancelled and everything it had made was removed")]
+    Cancelled,
+
+    #[error("{path} is already in the trash; empty the trash to delete it for good, or restore it")]
+    AlreadyInTrash { path: VirtualPath },
+
     #[error("{path}: {source}")]
     Io {
         path: VirtualPath,
@@ -615,6 +650,7 @@ impl FileError {
             self,
             FileError::OutsideRoot { .. }
                 | FileError::HiddenState { .. }
+                | FileError::InstallState { .. }
                 | FileError::WriteThroughSymlink { .. }
                 | FileError::Path(_)
         )
@@ -663,6 +699,35 @@ pub trait Fs: Send + Sync {
     fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+
+    /// Copy one regular file's bytes to a path that must not exist yet,
+    /// carrying the permission bits (never set-user-id and friends).
+    ///
+    /// `chunk` is told how many bytes each step moved and answers whether to
+    /// go on; `false` stops the copy with [`io::ErrorKind::Interrupted`] and
+    /// leaves the partial file for the caller to remove. That is how a long
+    /// copy reports progress and how cancelling it actually stops the disk.
+    fn copy_file(
+        &self,
+        from: &Path,
+        to: &Path,
+        chunk: &mut dyn FnMut(u64) -> bool,
+    ) -> io::Result<u64>;
+
+    /// Where a symlink points, as written: never resolved.
+    fn read_link(&self, path: &Path) -> io::Result<PathBuf>;
+
+    /// Create a symlink at `at` whose text is `target`, as written.
+    fn symlink(&self, target: &Path, at: &Path) -> io::Result<()>;
+
+    /// Whether two paths, following symlinks, are one file. The default
+    /// compares canonical paths, which is right wherever names are
+    /// case-sensitive; [`OsFs`] asks the filesystem for the file's identity,
+    /// so it also holds on a mount that folds case, where `realpath` hands
+    /// `BIN` back as written although it is `bin`.
+    fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
+        Ok(self.canonicalize(a)? == self.canonicalize(b)?)
+    }
 }
 
 /// What this layer reports about a file. A deliberately small subset of
@@ -741,6 +806,12 @@ impl Fs for OsFs {
         std::fs::canonicalize(path)
     }
 
+    fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt as _;
+        let (a, b) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
+        Ok(a.dev() == b.dev() && a.ino() == b.ino())
+    }
+
     fn meta(&self, path: &Path) -> io::Result<Meta> {
         Ok(OsFs::convert(&std::fs::metadata(path)?))
     }
@@ -771,7 +842,16 @@ impl Fs for OsFs {
 
     fn read_range(&self, path: &Path, offset: u64, max: u64) -> io::Result<Vec<u8>> {
         use std::io::{Read as _, Seek as _, SeekFrom};
-        let mut file = std::fs::File::open(path)?;
+        // The callers have stat'ed the path, but by name: what is opened now
+        // may be a FIFO swapped in since, whose plain open would wait for a
+        // writer forever. This open never waits, and judges the descriptor.
+        let (mut file, meta) = crate::content::open_examined(path)?;
+        if !meta.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file, so it is not read",
+            ));
+        }
         if offset > 0 {
             file.seek(SeekFrom::Start(offset))?;
         }
@@ -829,6 +909,65 @@ impl Fs for OsFs {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
     }
+
+    fn copy_file(
+        &self,
+        from: &Path,
+        to: &Path,
+        chunk: &mut dyn FnMut(u64) -> bool,
+    ) -> io::Result<u64> {
+        use std::io::{Read as _, Write as _};
+        let mut src = std::fs::File::open(from)?;
+        // `create_new`: the caller proved the name free, and a file that
+        // appeared since is someone else's, not something to truncate.
+        let mut dst = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(to)?;
+        // One MiB: large enough that a 2 GB video is two thousand progress
+        // steps rather than a million, small enough that cancelling is
+        // noticed within a blink.
+        let mut buf = vec![0u8; 1 << 20];
+        let mut total = 0u64;
+        loop {
+            let n = src.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            dst.write_all(&buf[..n])?;
+            total += n as u64;
+            if !chunk(n as u64) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "copy cancelled"));
+            }
+        }
+        dst.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = src.metadata()?.permissions().mode() & 0o777;
+            dst.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        Ok(total)
+    }
+
+    fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
+        std::fs::read_link(path)
+    }
+
+    fn symlink(&self, target: &Path, at: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, at)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (target, at);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "symlinks are not copied on this platform",
+            ))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -879,11 +1018,99 @@ pub struct Root {
     /// otherwise fail the test on every single path.
     real: PathBuf,
     fs: Arc<dyn Fs>,
+    /// The install directory's own entries, which are never exposed wherever
+    /// the working directory is. See [`InstallGuard`].
+    install: Option<Arc<InstallGuard>>,
 }
 
 impl fmt::Debug for Root {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Root").field("real", &self.real).finish()
+        f.debug_struct("Root")
+            .field("real", &self.real)
+            .field("install", &self.install.as_ref().map(|g| &g.real))
+            .finish()
+    }
+}
+
+/// The install directory, as the file layer refuses it.
+///
+/// The working directory defaults to the install directory, which holds the
+/// unconfined core binary, every app's binary, the app sockets, the node's
+/// keys, the caches and, in debug mode, a live session cookie. Hiding only
+/// `.deckjack/` left all of that readable and writable through `files.*`.
+/// So every canonical path the boundary produces is also tested against
+/// `<install>/<entry>` for each entry of [`crate::node::INSTALL_LAYOUT`],
+/// compared as canonical host paths, so the rule holds whether the working
+/// directory is the install directory, contains it, or reaches it through a
+/// symlink.
+#[derive(Debug)]
+struct InstallGuard {
+    /// The install directory, canonical (or, for parts that do not exist
+    /// yet, canonical up to the deepest part that does).
+    real: PathBuf,
+    /// Where entries that exist and are symlinks really lead, so a
+    /// `bin -> /opt/deckjack/bin` is protected at its target too.
+    linked: Vec<PathBuf>,
+}
+
+impl InstallGuard {
+    fn new(install_dir: &Path, fs: &dyn Fs) -> InstallGuard {
+        let real = canonical_as_far_as_exists(install_dir, fs);
+        let linked = crate::node::INSTALL_LAYOUT
+            .iter()
+            .filter_map(|entry| fs.canonicalize(&install_dir.join(entry)).ok())
+            .filter(|target| !target.starts_with(&real))
+            .collect();
+        InstallGuard { real, linked }
+    }
+
+    /// Whether a canonical host path is one of the install directory's
+    /// entries or anything beneath one.
+    fn covers(&self, real: &Path, fs: &dyn Fs) -> bool {
+        if let Ok(rel) = real.strip_prefix(&self.real)
+            && let Some(Component::Normal(first)) = rel.components().next()
+            && crate::node::install_entry_named(first, &self.real, |a, b| {
+                fs.same_file(a, b).unwrap_or(false)
+            })
+            .is_some()
+        {
+            return true;
+        }
+        self.linked.iter().any(|target| real.starts_with(target))
+    }
+
+    /// Whether a canonical host path holds one of the entries beneath it:
+    /// the install directory itself or anything above it. Moving, copying or
+    /// deleting that tree would carry the entries along.
+    fn contained_by(&self, real: &Path) -> bool {
+        self.real.starts_with(real) || self.linked.iter().any(|t| t.starts_with(real))
+    }
+}
+
+/// `path` with every symlink resolved in the deepest ancestor that exists,
+/// and the rest appended as written. An install directory that does not
+/// exist yet still gets a canonical prefix to compare against.
+fn canonical_as_far_as_exists(path: &Path, fs: &dyn Fs) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        if let Ok(real) = fs.canonicalize(&cursor) {
+            let mut out = real;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (
+            cursor.file_name().map(|n| n.to_os_string()),
+            cursor.parent(),
+        ) {
+            (Some(name), Some(parent)) => {
+                rest.push(name);
+                cursor = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
@@ -916,7 +1143,28 @@ impl Root {
                 });
             }
         }
-        Ok(Root { real, fs })
+        Ok(Root {
+            real,
+            fs,
+            install: None,
+        })
+    }
+
+    /// Never expose `install_dir`'s own entries ([`crate::node::INSTALL_LAYOUT`])
+    /// through this root, wherever the two directories are relative to each
+    /// other. What the server's file layer is always built with; a root
+    /// without it is for tests and tools that have no install directory.
+    pub fn protecting_install(mut self, install_dir: &Path) -> Root {
+        self.install = Some(Arc::new(InstallGuard::new(install_dir, self.fs.as_ref())));
+        self
+    }
+
+    /// Whether a canonical host path is inside one of the install
+    /// directory's entries.
+    fn is_install_state(&self, real: &Path) -> bool {
+        self.install
+            .as_ref()
+            .is_some_and(|g| g.covers(real, self.fs.as_ref()))
     }
 
     /// The canonical host path of the root. For logs and for the operator;
@@ -990,6 +1238,17 @@ impl Root {
         if path.is_hidden_state() {
             return Err(FileError::HiddenState { requested: path });
         }
+        // The parent was contained above, but the last name was not: a write
+        // to `/debug-session.cookie` in the install directory names a file
+        // that may not exist yet. And this is the resolution create, delete,
+        // rename, move, copy and trash use, so a tree that *holds* the
+        // install directory is refused here as well — moving or deleting it
+        // would carry the binaries and the cookie along.
+        if self.is_install_state(&real)
+            || self.install.as_ref().is_some_and(|g| g.contained_by(&real))
+        {
+            return Err(FileError::InstallState { requested: path });
+        }
         Ok(Resolved {
             real,
             path,
@@ -1033,6 +1292,14 @@ impl Root {
                 requested: requested.clone(),
             });
         }
+        // The install directory's entries, by canonical host path, so a
+        // symlink leading there and a working directory above the install
+        // directory are refused the same as a direct request.
+        if self.is_install_state(&real) {
+            return Err(FileError::InstallState {
+                requested: requested.clone(),
+            });
+        }
         Ok(Resolved {
             real,
             path,
@@ -1048,7 +1315,13 @@ impl Root {
         out
     }
 
-    fn map_io(&self, path: &VirtualPath, source: io::Error) -> FileError {
+    /// The filesystem this root acts through, for the bulk operations in
+    /// `transfer` and `trash`, which resolve every path here first.
+    pub(crate) fn fs(&self) -> &dyn Fs {
+        self.fs.as_ref()
+    }
+
+    pub(crate) fn map_io(&self, path: &VirtualPath, source: io::Error) -> FileError {
         match source.kind() {
             io::ErrorKind::NotFound => FileError::NotFound { path: path.clone() },
             io::ErrorKind::PermissionDenied => FileError::Denied { path: path.clone() },
@@ -1119,6 +1392,12 @@ impl Root {
             if path.is_hidden_state() {
                 continue;
             }
+            // Left out like `.deckjack/`, not shown and refused: the install
+            // directory's entries are not the operator's files.
+            let real = resolved.real.join(&name);
+            if self.is_install_state(&real) {
+                continue;
+            }
             if !options.show_dotfiles && name.starts_with('.') {
                 continue;
             }
@@ -1127,7 +1406,6 @@ impl Root {
                 break;
             }
 
-            let real = resolved.real.join(&name);
             let Ok(link) = self.fs.link_meta(&real) else {
                 // Vanished between the read_dir and the stat, or unreadable.
                 // A listing that drops one racing entry is right; failing the
@@ -1834,7 +2112,7 @@ pub struct DeleteParams {
 /// thread inside a syscall, and the terminal's long poll shares those
 /// threads: one slow `stat` on a stalled mount would hold up output the
 /// operator is watching come out of a shell.
-async fn off_thread<T, F>(command: CommandId, work: F) -> Result<T, CommandError>
+pub(crate) async fn off_thread<T, F>(command: CommandId, work: F) -> Result<T, CommandError>
 where
     F: FnOnce() -> Result<T, FileError> + Send + 'static,
     T: Send + 'static,
@@ -1856,7 +2134,7 @@ where
 /// [`FileError`]'s messages are written for the operator, so they are passed
 /// through as they are; what this chooses is the *kind* of failure, because
 /// the shell and the Inbox render the kinds differently.
-fn to_command_error(command: CommandId, error: FileError) -> CommandError {
+pub(crate) fn to_command_error(command: CommandId, error: FileError) -> CommandError {
     let message = error.to_string();
     match error {
         // A path the namespace cannot even hold is a malformed request, and
@@ -1870,6 +2148,7 @@ fn to_command_error(command: CommandId, error: FileError) -> CommandError {
             command,
             reason: message,
         },
+        FileError::Cancelled => CommandError::Cancelled { command },
         other => CommandError::Failed(anyhow::Error::new(other)),
     }
 }
@@ -2153,6 +2432,12 @@ pub enum SetupError {
     Registry(#[from] RegistryError),
 }
 
+use crate::archive::ListArchive;
+use crate::space::FreeSpace;
+use crate::thumbnail::{MakeThumbnail, ThumbnailCache, Thumbnailer};
+use crate::transfer::{CopyEntries, MoveEntries};
+use crate::trash::{EmptyTrash, ListTrash, RestoreTrash, TrashEntries};
+
 /// Put the file commands on the bus.
 ///
 /// Returns the [`Namespace`] it built so the caller keeps a handle. The HTTP
@@ -2160,16 +2445,33 @@ pub enum SetupError {
 /// boundary, and building a second [`Root`] for them would be a second place
 /// for the containment rules to drift — which is exactly how the predecessor
 /// project ended up with a decorative root.
+///
+/// `install_dir` is this node's install directory ([`crate::node::install_dir`]
+/// in `main`). Two things follow from it, and taking the directory rather
+/// than each derived path is what keeps them from drifting apart:
+///
+/// - its entries ([`crate::node::INSTALL_LAYOUT`]) are never exposed through
+///   the namespace, wherever the working directory is relative to it — by
+///   default the working directory *is* the install directory;
+/// - Files keeps its thumbnails in [`crate::thumbnail::cache_dir`] of it.
+///
+/// It is a required argument, not a default, so no caller can register the
+/// file commands without saying which install directory to keep out.
 pub fn register_commands(
     registry: &Registry,
     working_dir: &Path,
     node_id: &str,
+    install_dir: &Path,
 ) -> Result<Arc<Namespace>, SetupError> {
     let local = NodeName::parse(node_id).map_err(|source| SetupError::Node {
         node: node_id.to_string(),
         source,
     })?;
-    let files = Arc::new(Namespace::new(local, Root::open(working_dir)?));
+    let root = Root::open(working_dir)?.protecting_install(install_dir);
+    let files = Arc::new(Namespace::new(local, root));
+    // The editor's commands are this namespace's too; see `editor.rs` for
+    // why they cannot live in the editor app.
+    crate::editor::register_commands(registry, &files)?;
 
     macro_rules! reg {
         ($command:ident) => {
@@ -2185,6 +2487,24 @@ pub fn register_commands(
     reg!(MakeDir);
     reg!(RenameEntry);
     reg!(DeleteEntry);
+    // Bulk work for Files, in their own modules so this one stays the
+    // boundary and the single-item commands.
+    reg!(MoveEntries);
+    reg!(CopyEntries);
+    reg!(TrashEntries);
+    reg!(ListTrash);
+    reg!(RestoreTrash);
+    reg!(EmptyTrash);
+    reg!(FreeSpace);
+    registry.register(MakeThumbnail::new(Arc::new(Thumbnailer::new(
+        Arc::clone(&files),
+        ThumbnailCache::new(
+            crate::thumbnail::cache_dir(install_dir),
+            crate::thumbnail::DEFAULT_CACHE_CAP,
+        ),
+    ))))?;
+    // Reads inside an archive without extracting it, for Quick Look.
+    reg!(ListArchive);
 
     Ok(files)
 }

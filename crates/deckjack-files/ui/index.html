@@ -6,198 +6,287 @@
     <title>Files</title>
     <link rel="stylesheet" href="/kit/kit.css" />
     <style>
-      /* A path bar made of buttons, so every ancestor is one click away. */
+      /* A path bar made of buttons, so every ancestor is one tap away. It
+         scrolls rather than truncating, and never shrinks to nothing. */
       .crumbs {
         display: flex;
+        flex: 1;
         overflow-x: auto;
         gap: 0.125rem;
         align-items: center;
-        min-width: 0;
+        min-width: 4rem;
+        scrollbar-width: none;
       }
-      .crumb {
+      .crumb,
+      .sep {
         padding: 0 0.25rem;
         border: 0;
         background: none;
         color: var(--dj-color-text-muted, #9aa0ad);
         font: inherit;
         white-space: nowrap;
+      }
+      .crumb {
+        min-height: var(--dj-touch, 2rem);
         cursor: pointer;
       }
-      .crumb:last-child {
+      .crumb:last-of-type {
         color: var(--dj-color-text, #e7e9ee);
       }
       .crumb:hover {
         color: var(--dj-color-accent, #7aa2f7);
       }
+
+      #list {
+        flex: 1;
+        overflow: auto;
+        outline: none;
+      }
+      #list .dj-row {
+        min-height: var(--dj-touch, 2rem);
+        user-select: none;
+        -webkit-user-select: none;
+        /* The long-press is ours: no callout menu, no text magnifier. */
+        -webkit-touch-callout: none;
+        align-items: center;
+        cursor: default;
+      }
+      #list .dj-row[aria-selected="true"] {
+        background: var(--dj-color-selection, #2d3344);
+      }
+      #list:focus-visible .dj-row[data-cursor] {
+        outline: 1px solid var(--dj-color-accent, #7aa2f7);
+        outline-offset: -1px;
+      }
+      .check,
       .kind {
         flex: none;
         width: 1rem;
         color: var(--dj-color-text-muted, #9aa0ad);
         text-align: center;
       }
-      .preview {
-        overflow: auto;
+      /* The check column only exists in selection mode, where a tap toggles
+         and the operator needs to see what a tap will do. */
+      #list:not([data-mode="select"]) .check {
+        display: none;
+      }
+      .rename {
         flex: 1;
-        margin: 0;
-        padding: var(--dj-space-3, 0.75rem);
-        font-family: var(--dj-font-mono, ui-monospace, monospace);
-        white-space: pre-wrap;
-        word-break: break-word;
+        min-width: 0;
+        font: inherit;
+        color: inherit;
+        background: var(--dj-color-surface, #16181d);
+        border: 1px solid var(--dj-color-accent, #7aa2f7);
+        border-radius: var(--dj-radius-sm, 4px);
+        padding: 0 0.25rem;
+      }
+      #selbar[hidden],
+      .dj-button[hidden] {
+        display: none;
+      }
+      #selbar {
+        flex-wrap: wrap;
+        border-top: 1px solid var(--dj-color-border, #2a2e38);
+        border-bottom: 0;
+      }
+      .foot {
+        display: flex;
+        flex: none;
+        align-items: center;
+        gap: var(--dj-space-2, 0.5rem);
+      }
+      .foot .dj-status {
+        flex: 1;
+        min-width: 0;
+      }
+      #undo {
+        margin-right: var(--dj-space-3, 0.75rem);
+      }
+      #select[aria-pressed="true"] {
+        color: var(--dj-color-accent, #7aa2f7);
+      }
+
+      /* Thumbnails sit where the kind glyph does, so a row is the same
+         height with or without one. */
+      .kind {
+        width: 1.75rem;
+      }
+      .thumb {
+        display: block;
+        width: 1.75rem;
+        height: 1.75rem;
+        object-fit: cover;
+        border-radius: var(--dj-radius-sm, 4px);
+      }
+      .thumb:not([src]) {
+        visibility: hidden;
+      }
+
+      #tools[hidden] {
+        display: none;
+      }
+      #tools {
+        gap: var(--dj-space-2, 0.5rem);
+      }
+      #filter {
+        flex: 1;
+        min-width: 4rem;
+        min-height: var(--dj-touch, 2rem);
+        padding: 0 0.5rem;
+        font: inherit;
+        color: inherit;
+        background: var(--dj-color-surface, #16181d);
+        border: 1px solid var(--dj-color-border, #2a2e38);
+        border-radius: var(--dj-radius-sm, 4px);
+      }
+      #filter:focus {
+        outline: none;
+        border-color: var(--dj-color-accent, #7aa2f7);
+      }
+      #sort {
+        min-height: var(--dj-touch, 2rem);
+        font: inherit;
+        color: inherit;
+        background: var(--dj-color-surface-raised, #1b1e25);
+        border: 1px solid var(--dj-color-border, #2a2e38);
+        border-radius: var(--dj-radius-sm, 4px);
+      }
+      #sortdir {
+        min-width: var(--dj-touch, 2rem);
+      }
+
+      /* A folder a drag would drop into. */
+      #list .dj-row[data-drop],
+      .crumb[data-drop] {
+        outline: 2px solid var(--dj-color-accent, #7aa2f7);
+        outline-offset: -2px;
+        background: var(--dj-color-selection, #2d3344);
+      }
+      #list[data-dragging] {
+        cursor: grabbing;
+      }
+      #ghost {
+        position: fixed;
+        left: 0;
+        top: 0;
+        z-index: 20;
+        pointer-events: none;
+        padding: var(--dj-space-1, 0.25rem) var(--dj-space-2, 0.5rem);
+        border-radius: var(--dj-radius-sm, 4px);
+        background: var(--dj-color-accent, #7aa2f7);
+        color: var(--dj-color-surface, #16181d);
+        font-size: var(--dj-text-xs, 0.75rem);
+        white-space: nowrap;
+      }
+      #ghost[hidden],
+      #menu[hidden] {
+        display: none;
+      }
+
+      #menu {
+        position: fixed;
+        z-index: 10;
+        display: flex;
+        flex-direction: column;
+        min-width: 11rem;
+        max-width: calc(100vw - 8px);
+        padding: var(--dj-space-1, 0.25rem) 0;
+        border: 1px solid var(--dj-color-border, #2a2e38);
+        border-radius: var(--dj-radius-sm, 4px);
+        background: var(--dj-color-surface-raised, #1b1e25);
+        box-shadow: 0 6px 24px rgb(0 0 0 / 0.35);
+      }
+      .menu-item {
+        min-height: var(--dj-touch, 2rem);
+        padding: 0 var(--dj-space-3, 0.75rem);
+        border: 0;
+        background: none;
+        color: inherit;
+        font: inherit;
+        text-align: left;
+        cursor: pointer;
+      }
+      .menu-item:hover,
+      .menu-item:focus-visible {
+        outline: none;
+        background: var(--dj-color-surface-hover, #21242c);
+      }
+
+      #space {
+        flex: none;
+        padding: 0 var(--dj-space-3, 0.75rem);
+        color: var(--dj-color-text-muted, #9aa0ad);
+        font-size: var(--dj-text-xs, 0.75rem);
+        white-space: nowrap;
+      }
+      #space[data-low] {
+        color: var(--dj-color-danger, #f7768e);
       }
     </style>
   </head>
   <body>
     <div class="dj-bar">
-      <button class="dj-button" id="up" title="Up one level">↑</button>
+      <button class="dj-button" id="up" title="Up one folder (Backspace)" aria-label="Up one folder">↑</button>
       <nav class="crumbs" id="crumbs" aria-label="Path"></nav>
-      <span class="dj-spacer"></span>
+      <button class="dj-button" id="paste" hidden title="Paste (Ctrl+V)"></button>
+      <button class="dj-button" id="select" aria-pressed="false" title="Select several">Select</button>
       <button class="dj-button" id="mkdir">New folder</button>
+      <button class="dj-button" id="trashview" title="What is in the trash">Trash</button>
     </div>
 
-    <div class="dj-body" id="body" data-pane="list">
-      <div class="dj-list" id="list"></div>
-      <div class="dj-main">
-        <pre class="preview" id="preview">Pick a file.</pre>
-      </div>
+    <div class="dj-bar" id="tools">
+      <input id="filter" type="search" placeholder="Filter" aria-label="Filter by name (/)" autocomplete="off" />
+      <select id="sort" aria-label="Sort by">
+        <option value="name">Name</option>
+        <option value="size">Size</option>
+        <option value="modified">Modified</option>
+        <option value="kind">Kind</option>
+      </select>
+      <button class="dj-button" id="sortdir" aria-label="Ascending">↑</button>
     </div>
 
-    <p class="dj-status" id="status">Loading…</p>
+    <div
+      id="list"
+      role="listbox"
+      aria-multiselectable="true"
+      aria-label="Files"
+      tabindex="0"
+    ></div>
+
+    <!-- Below the list, not above it: a bar that appears above the rows on
+         the first click moves them, and the second click of a double-click
+         then lands on a different row. At the bottom it is also where a
+         thumb is. -->
+    <div class="dj-bar" id="selbar" hidden>
+      <span id="selcount">0 selected</span>
+      <span class="dj-spacer"></span>
+      <button class="dj-button" id="peek" title="Quick Look (Space)">Quick Look</button>
+      <button class="dj-button" id="openwith" hidden title="Open in an app" aria-haspopup="menu">Open with…</button>
+      <button class="dj-button" id="rename" title="Rename (F2)">Rename</button>
+      <button class="dj-button" id="cut" title="Cut, to move (Ctrl+X)">Cut</button>
+      <button class="dj-button" id="copy" title="Copy (Ctrl+C)">Copy</button>
+      <button class="dj-button" id="trash" title="Move to the trash (Delete)">Trash</button>
+      <button class="dj-button" id="restore" hidden title="Put back where it was">Restore</button>
+      <button class="dj-button" id="done">Done</button>
+    </div>
+
+    <div class="foot">
+      <p class="dj-status" id="status">Loading…</p>
+      <button class="dj-button" id="keepboth" hidden title="Copy under a new name instead">Keep both</button>
+      <button class="dj-button" id="undo" hidden>Undo</button>
+      <span id="space" aria-live="polite"></span>
+    </div>
+
+    <div id="menu" role="menu" hidden></div>
+    <div id="ghost" hidden aria-hidden="true"></div>
 
     <script type="module">
       import { bus, failure, text } from "/kit/bus.js";
+      import { createSelection } from "/kit/selection.js";
+      import { shell } from "/kit/shell.js";
+      import { mountFiles } from "./files.js";
 
-      const list = document.getElementById("list");
-      const preview = document.getElementById("preview");
-      const status = document.getElementById("status");
-      const crumbs = document.getElementById("crumbs");
-      const body = document.getElementById("body");
-
-      /**
-       * Addresses are `node:/path` or `/path` in the core's one namespace, and
-       * this UI never builds a host path. `/` is the working directory on
-       * whichever node is answering.
-       */
-      let here = "/";
-
-      /** A preview is capped: a panel asks for little and fails fast rather
-       * than pulling a gigabyte across to show the first screen of it. */
-      const PREVIEW_BYTES = 128 * 1024;
-
-      function say(message) {
-        status.textContent = message;
-      }
-
-      function size(bytes) {
-        if (bytes < 1024) return `${bytes} B`;
-        const units = ["KB", "MB", "GB", "TB"];
-        let value = bytes / 1024;
-        let i = 0;
-        while (value >= 1024 && i < units.length - 1) {
-          value /= 1024;
-          i++;
-        }
-        return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[i]}`;
-      }
-
-      function drawCrumbs() {
-        const parts = here.split("/").filter(Boolean);
-        const items = [{ label: "Working directory", path: "/" }];
-        let path = "";
-        for (const part of parts) {
-          path += `/${part}`;
-          items.push({ label: part, path });
-        }
-        crumbs.innerHTML = items
-          .map(
-            (c, i) =>
-              `${i ? '<span class="crumb" aria-hidden="true">/</span>' : ""}` +
-              `<button class="crumb" data-path="${text(c.path)}">${text(c.label)}</button>`,
-          )
-          .join("");
-        for (const button of crumbs.querySelectorAll(".crumb[data-path]")) {
-          button.addEventListener("click", () => open(button.dataset.path));
-        }
-      }
-
-      async function open(path) {
-        const result = await bus.invoke("files.list", { path });
-        here = String(result.path ?? path);
-        drawCrumbs();
-
-        const entries = result.entries ?? [];
-        // Folders first, then by name: the order a file manager is expected
-        // to have, decided here because the command returns what the
-        // filesystem gave it.
-        entries.sort(
-          (a, b) =>
-            Number(b.kind === "dir") - Number(a.kind === "dir") ||
-            a.name.localeCompare(b.name),
-        );
-
-        if (entries.length === 0) {
-          list.innerHTML = '<p class="dj-empty">Nothing here.</p>';
-        } else {
-          list.innerHTML = entries
-            .map(
-              (e) => `
-              <button class="dj-row" data-path="${text(e.path)}" data-kind="${text(e.kind)}"
-                      ${e.escapes ? 'title="This link points outside the working directory and cannot be opened."' : ""}>
-                <span class="kind">${e.kind === "dir" ? "/" : e.escapes ? "!" : ""}</span>
-                <span class="dj-row-name">${text(e.name)}</span>
-                <span class="dj-row-meta">${e.kind === "dir" ? "" : size(e.len ?? 0)}</span>
-              </button>`,
-            )
-            .join("");
-          for (const row of list.querySelectorAll(".dj-row")) {
-            row.addEventListener("click", () =>
-              (row.dataset.kind === "dir" ? open(row.dataset.path) : show(row.dataset.path)).catch(
-                (e) => failure(status, e),
-              ),
-            );
-          }
-        }
-
-        let note = `${entries.length} item${entries.length === 1 ? "" : "s"}`;
-        if (result.truncated) note += " (listing was cut short)";
-        say(note);
-        preview.textContent = "Pick a file.";
-        body.dataset.pane = "list";
-      }
-
-      async function show(path) {
-        body.dataset.pane = "main";
-        preview.textContent = "Reading…";
-        try {
-          const result = await bus.invoke("files.read", { path, max_bytes: PREVIEW_BYTES });
-          // The core answers with text, or says it could not: a binary file
-          // is not something to render as mojibake.
-          preview.textContent = String(result.content ?? "");
-          say(path);
-        } catch (e) {
-          preview.textContent = "";
-          failure(status, e);
-        }
-      }
-
-      document.getElementById("up").addEventListener("click", () => {
-        const parts = here.split("/").filter(Boolean);
-        parts.pop();
-        open(`/${parts.join("/")}`.replace(/\/+$/, "") || "/").catch((e) => failure(status, e));
-      });
-
-      document.getElementById("mkdir").addEventListener("click", async () => {
-        const name = prompt("New folder name");
-        if (!name) return;
-        const path = here === "/" ? `/${name}` : `${here}/${name}`;
-        try {
-          await bus.invoke("files.mkdir", { path });
-          await open(here);
-        } catch (e) {
-          failure(status, e);
-        }
-      });
-
-      open("/").catch((e) => failure(document.body, e));
+      mountFiles(document, { bus, shell, createSelection, text, failure });
     </script>
   </body>
 </html>

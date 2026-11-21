@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>demo app</title>
+<!-- Served with the headers of APP-UI-ISOLATION §4.2 (set by the test), so
+     there is no inline script here: the CSP has none to allow. Each script
+     records itself in `self.ran`; report.js posts the list to the parent. -->
+<script src="{{A}}/kit/k.js?tag=q3f-kit-classic"></script>
+<script type="module" src="{{A}}/apps/demo/~cap/main.js?tag=q3f-main"></script>
+<script type="module" src="{{A}}/apps/demo/~other/evil.js?tag=q3f-other"></script>
+<script type="module" src="{{A}}/kit/m.js?tag=q3f-kit-module-noacao"></script>
+<script type="module" src="{{A}}/apps/demo/~cap/report.js?tag=q3f-report"></script>

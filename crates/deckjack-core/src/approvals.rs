@@ -689,6 +689,15 @@ fn translate_issuer(issuer: &command::Issuer) -> grants::Issuer {
             label: session.as_str().to_string(),
             session: None,
         },
+        // Not reachable through routing (a window's call is confirmed like
+        // the operator's, never queued). If it ever were, the item records
+        // the window under a label no grant is held by, so releasing it
+        // comes back as an agent with no grant and is refused, rather than
+        // as the operator.
+        command::Issuer::AppUi { app, .. } => grants::Issuer::Session {
+            label: format!("app-ui:{app}"),
+            session: None,
+        },
     }
 }
 
@@ -1329,10 +1338,22 @@ impl GrantListing {
 /// by hoping nobody ever writes `system.*` into a grant. Without it, an agent
 /// holding `system.inbox.approve` could queue a destructive command and then
 /// approve it, which is the whole design defeated in two dispatches.
+///
+/// An app's window is refused for the same reason. It runs in the operator's
+/// browser and dispatches on the operator's session, so "not an agent" is
+/// not "the operator": a window that could approve its own queued command,
+/// or issue itself a grant, would be the same two-dispatch defeat.
+/// `system.*` is hard-denied to app windows before dispatch as well; this is
+/// the rule holding even if that check were ever lost.
 fn operator_only(cx: &Context, what: &str) -> Result<(), CommandError> {
     if cx.issuer.is_agent() {
         return Err(failed(format!(
             "{what} is the operator's decision; an agent may not make it, whatever its grant says"
+        )));
+    }
+    if cx.issuer.is_app_ui() {
+        return Err(failed(format!(
+            "{what} is the operator's decision; an app's window may not make it"
         )));
     }
     Ok(())
@@ -1526,6 +1547,97 @@ impl Command for ListGrants {
     }
 }
 
+/// The target of a `system.grant.issue` confirmation:
+/// `coding on every node until revoked, may run *, git.* and 6 more`.
+///
+/// Built to fit inside [`crate::command::TARGET_MAX_CHARS`] whole, so the
+/// bus never cuts it, because a cut in the middle of a list of patterns is
+/// exactly where a `*` could hide:
+///
+/// - the **nodes** and the **lifetime** come first, since a grant on every
+///   node that never expires and a one-node grant for an hour are different
+///   decisions with the same namespaces;
+/// - the **namespaces** follow broadest first (`*`, then wildcards with the
+///   fewest segments, then exact ids), and the ones that do not fit are
+///   counted ("and 6 more"), never elided from the middle.
+pub fn grant_subject(p: &IssueParams) -> String {
+    use crate::command::{TARGET_MAX_CHARS, plain_text};
+    const PART: usize = 24;
+
+    let nodes = match p.nodes.as_slice() {
+        [] => "no node".to_string(),
+        [one] if one == "*" => "every node".to_string(),
+        [one] => format!("node {}", plain_text(one, PART)),
+        many => format!("{} nodes", many.len()),
+    };
+    let lifetime = match p.ttl_secs {
+        None => "until revoked".to_string(),
+        Some(secs) => format!("for {}", spoken_duration(secs)),
+    };
+    let project = match &p.project {
+        Some(project) => format!(" in project {}", plain_text(project, PART)),
+        None => String::new(),
+    };
+    let head = format!(
+        "{} on {nodes} {lifetime}{project}, may run ",
+        plain_text(&p.agent, PART)
+    );
+
+    let mut patterns: Vec<String> = p
+        .namespaces
+        .iter()
+        .map(|n| plain_text(n, 40))
+        .filter(|n| !n.is_empty())
+        .collect();
+    if patterns.is_empty() {
+        return format!("{head}nothing");
+    }
+    // Broadest first: anything with a wildcard before any exact id, and
+    // among wildcards the one with the fewest segments (`*` before `git.*`).
+    patterns.sort_by_key(|n| (!n.contains('*'), n.split('.').count()));
+
+    let room = TARGET_MAX_CHARS.saturating_sub(head.chars().count());
+    let total = patterns.len();
+    let mut shown = String::new();
+    let mut listed = 0;
+    for (i, pattern) in patterns.iter().enumerate() {
+        let candidate = if i == 0 {
+            pattern.clone()
+        } else {
+            format!("{shown}, {pattern}")
+        };
+        let rest = total - i - 1;
+        let suffix = if rest > 0 {
+            format!(" and {rest} more").chars().count()
+        } else {
+            0
+        };
+        if i > 0 && candidate.chars().count() + suffix > room {
+            break;
+        }
+        shown = candidate;
+        listed += 1;
+    }
+    if listed < total {
+        shown.push_str(&format!(" and {} more", total - listed));
+    }
+    format!("{head}{shown}")
+}
+
+/// `90` as "90 s", `7200` as "2 h", `172800` as "2 days".
+fn spoken_duration(secs: u64) -> String {
+    const DAY: u64 = 86_400;
+    match secs {
+        s if s >= DAY && s % DAY == 0 => match s / DAY {
+            1 => "1 day".to_string(),
+            n => format!("{n} days"),
+        },
+        s if s >= 3_600 && s % 3_600 == 0 => format!("{} h", s / 3_600),
+        s if s >= 60 && s % 60 == 0 => format!("{} min", s / 60),
+        s => format!("{s} s"),
+    }
+}
+
 /// `system.grant.issue`: hand an agent session a scope.
 ///
 /// [`RiskLevel::CrossProject`], so the operator confirms, matching
@@ -1544,6 +1656,13 @@ impl Command for IssueGrant {
 
     type Params = IssueParams;
     type Output = GrantListing;
+
+    /// Who gets what, where, and for how long. The scope is the decision; a
+    /// prompt naming only the holder would let a grant of `*` read like a
+    /// grant of `notes.list`. See [`grant_subject`].
+    fn subject(&self, p: &IssueParams) -> Option<String> {
+        Some(grant_subject(p))
+    }
 
     async fn run(&self, p: IssueParams, cx: Context) -> Result<GrantListing, CommandError> {
         operator_only(&cx, "issuing a grant")?;

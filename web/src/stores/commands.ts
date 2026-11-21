@@ -7,8 +7,8 @@ import type { CommandSpec, Risk } from "../protocol.ts";
  * the CLI and an agent can dispatch, in one list.
  *
  * "Everything is a command" is only real if the UI has no second path. So a
- * dock button calls `dispatch("app.open.files")` rather than
- * `windows.open("files")`, and the palette is a view over this registry
+ * dock button calls `dispatch("app.open.filer")` rather than
+ * `windows.open("filer")`, and the palette is a view over this registry
  * rather than a hand-written menu.
  *
  * Shell commands are registered locally because the shell *is* their backend.

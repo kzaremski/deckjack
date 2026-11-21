@@ -1,5 +1,5 @@
 [package]
-name = "deckjack-files"
+name = "deckjack-filer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,10 +8,13 @@ repository.workspace = true
 description = "Deckjack app: the working directory, over the core's file commands"
 
 [[bin]]
-name = "deckjack-files"
+name = "deckjack-filer"
 path = "src/main.rs"
 
 [dependencies]
 deckjack-app.workspace = true
 anyhow.workspace = true
 rust-embed.workspace = true
+
+[dev-dependencies]
+deckjack-protocol.workspace = true

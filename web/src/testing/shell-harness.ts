@@ -28,9 +28,14 @@ import { createWindows } from "../stores/windows.ts";
 import { createThemeController } from "../tokens/index.ts";
 import { createKeyboard, DEFAULT_SHORTCUTS } from "../shell/keyboard.ts";
 import { createViewport } from "../shell/viewport.ts";
-import { createQuickLook } from "../shell/quicklook.ts";
-import { shellCommands } from "../shell/shell-commands.ts";
+import { createQuickLook, openAppVia } from "../shell/quicklook.ts";
+import { bindApps, bindConfirmations, shellCommands } from "../shell/shell-commands.ts";
+import { createAppTable } from "../stores/apps.ts";
+import { createFrameBridge } from "../shell/frame-bridge.ts";
 import { ref } from "vue";
+
+/** The origin the harness's frame bridge accepts, standing in for the page's. */
+export const HARNESS_ORIGIN = "https://pocket.example.ts.net";
 
 /** A socket the test drives: nothing happens until the test says so. */
 export class FakeSocket implements SocketLike {
@@ -181,7 +186,8 @@ export function harness(options: HarnessOptions = {}): Harness {
       };
     },
   });
-  const windows = createWindows(bus, { id: idFactory(), storage });
+  const apps = createAppTable();
+  const windows = createWindows(bus, { id: idFactory(), storage }, apps);
   const commands = createCommands({ storage });
   const theme = createThemeController({
     root: document.documentElement,
@@ -198,7 +204,12 @@ export function harness(options: HarnessOptions = {}): Harness {
     hingeFraction: () => null,
   });
   const keyboard = createKeyboard({ apple: false, storage });
-  const quicklook = createQuickLook({ online: () => online });
+  const quicklook = createQuickLook({
+    online: () => online,
+    apps,
+    // The same wiring as `context.ts`: the shell's own window store.
+    openApp: openAppVia(windows),
+  });
   const inboxPending = ref(0);
 
   commands.register(
@@ -215,6 +226,9 @@ export function harness(options: HarnessOptions = {}): Harness {
     }),
   );
   keyboard.bind(DEFAULT_SHORTCUTS);
+  const unbindApps = bindApps({ bus, commands, windows, apps });
+  bindConfirmations({ bus, ui });
+  const frames = createFrameBridge({ commands, origin: HARNESS_ORIGIN, apps });
 
   const shell: Shell = {
     bus,
@@ -226,7 +240,10 @@ export function harness(options: HarnessOptions = {}): Harness {
     keyboard,
     quicklook,
     inboxPending,
+    apps,
+    frames,
     dispose() {
+      unbindApps();
       viewport.stop();
       bus.close();
     },

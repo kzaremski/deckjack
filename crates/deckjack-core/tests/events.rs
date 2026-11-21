@@ -250,6 +250,13 @@ fn an_issuer_query_returns_only_that_issuer() {
     log.append(rec(Issuer::agent("claude"), "claude")).unwrap();
     log.append(rec(Issuer::agent_via_window("scribe", "3"), "scribe"))
         .unwrap();
+    log.append(rec(
+        Issuer::AppUi {
+            app: "filer".into(),
+        },
+        "filer",
+    ))
+    .unwrap();
 
     let only = |f: IssuerFilter| {
         let entries = log.timeline(&oldest_first().issuer(f)).unwrap();
@@ -270,6 +277,20 @@ fn an_issuer_query_returns_only_that_issuer() {
     // wrong agent.
     assert!(only(IssuerFilter::agent("clau")).is_empty());
     assert!(only(IssuerFilter::agent("CLAUDE")).is_empty());
+    // An app's window is its own issuer, by app or all of them.
+    assert_eq!(only(IssuerFilter::AppUi { app: None }), ["filer"]);
+    assert_eq!(
+        only(IssuerFilter::AppUi {
+            app: Some("filer".into())
+        }),
+        ["filer"]
+    );
+    assert!(
+        only(IssuerFilter::AppUi {
+            app: Some("scribe".into())
+        })
+        .is_empty()
+    );
 }
 
 #[test]

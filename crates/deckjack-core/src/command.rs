@@ -655,6 +655,24 @@ pub trait Command: Send + Sync + 'static {
         Enablement::Enabled
     }
 
+    /// What this call acts on, for the operator's confirmation: the paths a
+    /// delete names, the app an approval is for, "everything in the trash
+    /// (12 items)".
+    ///
+    /// Rendered from the **validated** parameters, never from anything the
+    /// client wrote for display, because a prompt made from the command's
+    /// title alone is what lets a bait-and-switch through: "Empty the trash"
+    /// reads the same whatever it is about to remove. The bus strips bidi and
+    /// control characters and truncates the result ([`plain_text`]), so an
+    /// implementation returns plain text and does not defend against either.
+    ///
+    /// Asked only when a call is about to be confirmed, and synchronously, so
+    /// anything it reads from disk has to be cheap: a directory count, a few
+    /// small files. `None` where there is nothing to say beyond the title.
+    fn subject(&self, _params: &Self::Params) -> Option<String> {
+        None
+    }
+
     fn run(
         &self,
         params: Self::Params,
@@ -687,6 +705,9 @@ pub trait DynCommand: Send + Sync + 'static {
 trait Erased: Send + Sync + 'static {
     fn spec(&self) -> &CommandSpec;
     fn enablement(&self) -> Enablement;
+    /// [`Command::subject`], from raw parameters. Parameters that do not
+    /// validate have no subject; the call fails on them when it runs.
+    fn subject(&self, params: &Value) -> Option<String>;
     fn call(
         self: Arc<Self>,
         params: Value,
@@ -706,6 +727,11 @@ impl<C: Command> Erased for Typed<C> {
 
     fn enablement(&self) -> Enablement {
         self.command.enablement()
+    }
+
+    fn subject(&self, params: &Value) -> Option<String> {
+        let parsed: C::Params = serde_json::from_value(params.clone()).ok()?;
+        self.command.subject(&parsed)
     }
 
     fn call(
@@ -741,6 +767,13 @@ impl<D: DynCommand> Erased for Dynamic<D> {
 
     fn enablement(&self) -> Enablement {
         self.command.enablement()
+    }
+
+    /// An app's command has only a schema, and nothing on this side knows
+    /// which of its parameters names the thing acted on. Until a manifest can
+    /// say so, its prompt is its title.
+    fn subject(&self, _params: &Value) -> Option<String> {
+        None
     }
 
     fn call(
@@ -801,6 +834,26 @@ pub struct ToolDefinition {
 /// backend is gone.
 pub struct Registry {
     commands: RwLock<HashMap<CommandId, Arc<dyn Erased>>>,
+    /// Which running app put each app-provided command here, and what that
+    /// app's window was approved to call beyond it. Written only by
+    /// [`Registry::register_app`] and [`Registry::register_provided`], which
+    /// the app host calls at handshake, and cleared by
+    /// [`Registry::unregister_app`] when the connection ends.
+    ///
+    /// Kept beside the commands, not in the app host, because it has exactly
+    /// the commands' lifetime: an app's window may call what its process
+    /// registered for as long as it stays registered, and nothing after.
+    apps: RwLock<AppScopes>,
+}
+
+/// See [`Registry::apps`].
+#[derive(Default)]
+struct AppScopes {
+    /// Command id to the app whose process registered it.
+    provided: HashMap<CommandId, String>,
+    /// App to the `[ui] invoke` entries of its approved, stored manifest,
+    /// for every app currently registered.
+    ui_invoke: HashMap<String, Vec<String>>,
 }
 
 impl Default for Registry {
@@ -813,7 +866,64 @@ impl Registry {
     pub fn new() -> Registry {
         Registry {
             commands: RwLock::new(HashMap::new()),
+            apps: RwLock::new(AppScopes::default()),
         }
+    }
+
+    /// An app finished its handshake: record what its window was approved
+    /// to call beyond its own commands. Called before its commands are
+    /// registered with [`Registry::register_provided`].
+    ///
+    /// `ui_invoke` must come from the operator's stored approval, never from
+    /// the manifest on disk alone: a manifest that changed after approval is
+    /// a request, not a grant.
+    pub fn register_app(&self, app: &str, ui_invoke: Vec<String>) {
+        self.apps_mut().ui_invoke.insert(app.to_string(), ui_invoke);
+    }
+
+    /// The app's connection ended: its window may call nothing any more,
+    /// not even its own commands, which go away with it.
+    pub fn unregister_app(&self, app: &str) {
+        let mut apps = self.apps_mut();
+        apps.ui_invoke.remove(app);
+        apps.provided.retain(|_, owner| owner != app);
+    }
+
+    /// Register a command an app's process declared at handshake, and record
+    /// that it is that app's. This is what an app's own scope is made of:
+    /// the ids its process registered, never "anything named `<app>.*`".
+    pub fn register_provided<D: DynCommand>(
+        &self,
+        app: &str,
+        declaration: Declaration,
+        command: D,
+    ) -> Result<CommandId, RegistryError> {
+        let id = self.register_declared(declaration, command)?;
+        self.apps_mut().provided.insert(id.clone(), app.to_string());
+        Ok(id)
+    }
+
+    /// The app whose process registered this command, if an app did.
+    pub fn provider(&self, id: &CommandId) -> Option<String> {
+        self.apps_read().provided.get(id).cloned()
+    }
+
+    /// The approved `[ui] invoke` entries of a registered app, or `None`
+    /// when no app of that name is registered right now.
+    pub fn app_ui_invoke(&self, app: &str) -> Option<Vec<String>> {
+        self.apps_read().ui_invoke.get(app).cloned()
+    }
+
+    fn apps_read(&self) -> std::sync::RwLockReadGuard<'_, AppScopes> {
+        self.apps
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn apps_mut(&self) -> std::sync::RwLockWriteGuard<'_, AppScopes> {
+        self.apps
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Register a typed command. Its id and risk come from its own type.
@@ -852,6 +962,9 @@ impl Registry {
         let mut map = self.write();
         let before = map.len();
         map.retain(|id, _| id.namespace() != namespace);
+        self.apps_mut()
+            .provided
+            .retain(|id, _| id.namespace() != namespace);
         before - map.len()
     }
 
@@ -866,8 +979,10 @@ impl Registry {
     pub fn remove_all(&self, ids: &[CommandId]) -> usize {
         let mut map = self.write();
         let before = map.len();
+        let mut apps = self.apps_mut();
         for id in ids {
             map.remove(id);
+            apps.provided.remove(id);
         }
         before - map.len()
     }
@@ -1312,6 +1427,20 @@ pub enum Issuer {
     /// `deckjack <command>` on the host. Treated as the operator for routing,
     /// recorded separately so a timeline can tell them apart.
     Cli,
+    /// An installed app's window, calling through the shell on the
+    /// operator's browser session (docs/APP-UI-ISOLATION.md §4.6).
+    ///
+    /// Never the operator. The bus holds it to the app's own scope (the
+    /// command ids its process registered at handshake) plus the `[ui]
+    /// invoke` entries the operator approved, minus
+    /// [`deckjack_protocol::HARD_DENY`], and refuses anything else with
+    /// [`Refused::NotPermitted`]. It is reached only from an invoke frame's
+    /// `as_app` on a signed-in browser socket (`wiring::BusDispatch`), so the
+    /// browser session is always known.
+    AppUi {
+        app: String,
+        session: BrowserSession,
+    },
 }
 
 impl Issuer {
@@ -1336,18 +1465,29 @@ impl Issuer {
         }
     }
 
+    /// An app's window on a signed-in browser. See [`Issuer::AppUi`].
+    pub fn app_ui(app: impl Into<String>, session: SessionId) -> Issuer {
+        Issuer::AppUi {
+            app: app.into(),
+            session: BrowserSession::new(session),
+        }
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             Issuer::Operator { .. } => "operator",
             Issuer::Agent { .. } => "agent",
             Issuer::Cli => "cli",
+            Issuer::AppUi { .. } => "app_ui",
         }
     }
 
-    /// The agent session's name, when there is one.
+    /// The agent session's name, or the app whose window asked, when there
+    /// is one.
     pub fn name(&self) -> Option<&str> {
         match self {
             Issuer::Agent { session } => Some(session.as_str()),
+            Issuer::AppUi { app, .. } => Some(app),
             Issuer::Operator { .. } | Issuer::Cli => None,
         }
     }
@@ -1360,12 +1500,19 @@ impl Issuer {
     pub fn browser_session(&self) -> Option<&BrowserSession> {
         match self {
             Issuer::Operator { session } => session.as_ref(),
+            Issuer::AppUi { session, .. } => Some(session),
             Issuer::Agent { .. } | Issuer::Cli => None,
         }
     }
 
     pub fn is_agent(&self) -> bool {
         matches!(self, Issuer::Agent { .. })
+    }
+
+    /// Whether this is an app's window, rather than the operator, an agent
+    /// or the CLI.
+    pub fn is_app_ui(&self) -> bool {
+        matches!(self, Issuer::AppUi { .. })
     }
 }
 
@@ -1380,6 +1527,7 @@ impl fmt::Display for Issuer {
             } => write!(f, "operator {}", browser.tag()),
             Issuer::Agent { session } => write!(f, "agent {session}"),
             Issuer::Cli => f.write_str("cli"),
+            Issuer::AppUi { app, session } => write!(f, "app-ui:{app} {}", session.tag()),
         }
     }
 }
@@ -1660,6 +1808,21 @@ impl Running {
     /// produce the progress. Poll the completion concurrently — spawn it, or
     /// `select!` on both — as `wiring::BusDispatch` does.
     pub fn split(self) -> (mpsc::Receiver<Progress>, BoxFuture<'static, Completion>) {
+        self.split_until(std::future::pending())
+    }
+
+    /// [`split`](Self::split), with a way for the caller to stop the work.
+    ///
+    /// When `cancel` resolves first, the command's future is **dropped** —
+    /// which is how a backend learns it was cancelled (see
+    /// `transfer::CancelOnDrop`) — and the completion reports
+    /// [`CommandError::Cancelled`]. The completion is still journaled, so a
+    /// cancelled dispatch ends with a row saying so rather than with a `Ran`
+    /// that nothing ever closed.
+    pub fn split_until(
+        self,
+        cancel: impl Future<Output = ()> + Send + 'static,
+    ) -> (mpsc::Receiver<Progress>, BoxFuture<'static, Completion>) {
         let Running {
             dispatch,
             command,
@@ -1674,7 +1837,15 @@ impl Running {
         } = self;
 
         let finish: BoxFuture<'static, Completion> = Box::pin(async move {
-            let outcome = future.await;
+            // `biased`: work that finished in the same poll as the cancel
+            // arrived is reported as the result it produced, not discarded.
+            let outcome = tokio::select! {
+                biased;
+                outcome = future => outcome,
+                () = cancel => Err(CommandError::Cancelled {
+                    command: command.clone(),
+                }),
+            };
             let finished = env.now();
             let (decision, detail) = match &outcome {
                 Ok(_) => (Decision::Completed, None),
@@ -1737,8 +1908,13 @@ pub enum Admitted {
     NeedsConfirmation {
         dispatch: DispatchId,
         risk: RiskLevel,
-        /// What to put in the dialog, phrased for a person.
+        /// What to put in the dialog, phrased for a person. Names `target`
+        /// when there is one.
         prompt: String,
+        /// What the call acts on, from [`Command::subject`], made safe by
+        /// [`plain_text`]. Also inside `prompt`; carried apart so a dialog
+        /// can set it off from the sentence around it.
+        target: Option<String>,
     },
 }
 
@@ -1814,6 +1990,16 @@ pub enum Refused {
     NodeNotAllowed {
         session: AgentSessionId,
         node: NodeId,
+    },
+
+    /// An app's window asked for something outside its scope. Stable code
+    /// `not_permitted` on the socket, so a refusal by scope can never be
+    /// mistaken for a malformed call.
+    #[error("the {app} app's window may not run {command}: {reason}")]
+    NotPermitted {
+        app: String,
+        command: CommandId,
+        reason: String,
     },
 
     // Names no affordance that does not exist. The previous wording sent the
@@ -2247,6 +2433,17 @@ impl Bus {
         out
     }
 
+    /// The target a confirmation of this call shows, rendered now: the same
+    /// text [`Admitted::NeedsConfirmation`] carries. `None` for an unknown
+    /// command or one that names no target.
+    ///
+    /// A confirmation is bound to the target it showed, and this is how the
+    /// redeeming side reads what the call would act on *now*.
+    pub fn target(&self, command: &CommandId, params: &Value) -> Option<String> {
+        let entry = self.registry.lookup(command)?;
+        shown_target(entry.as_ref(), params)
+    }
+
     /// Authorize a request and hand back the work.
     ///
     /// Nothing has run when this returns; see [`Admitted`].
@@ -2280,10 +2477,12 @@ impl Bus {
                     },
                     &spec,
                 )?;
+                let target = shown_target(entry.as_ref(), &request.params);
                 Ok(Admitted::NeedsConfirmation {
                     dispatch,
                     risk: spec.risk(),
-                    prompt: confirmation_prompt(&spec),
+                    prompt: confirmation_prompt(&spec, target.as_deref()),
+                    target,
                 })
             }
             Route::Queue => {
@@ -2363,6 +2562,12 @@ impl Bus {
             if request.issuer.is_agent() && self.agents_paused() {
                 return Err(Refused::AgentsPaused);
             }
+            // An app's window never reaches the Inbox (it is routed like the
+            // operator), but this is a public door into the bus, and a
+            // scope that held at one door and not the other would not hold.
+            if let Issuer::AppUi { app, .. } = &request.issuer {
+                self.check_app_ui(app, &request.command)?;
+            }
             let entry = self.entry(&request)?;
             let spec = entry.spec().clone();
             let node = self.resolve_node(&spec, request.target.as_ref())?;
@@ -2404,6 +2609,9 @@ impl Bus {
         if request.issuer.is_agent() && self.agents_paused() {
             return Err(Refused::AgentsPaused);
         }
+        if let Issuer::AppUi { app, .. } = &request.issuer {
+            self.check_app_ui(app, &request.command)?;
+        }
 
         let entry = self.entry(request)?;
         let spec = entry.spec();
@@ -2431,9 +2639,66 @@ impl Bus {
                     Route::Run
                 }
             }
+            // Inside its scope, an app's window is routed like the operator
+            // whose browser it is running in: a destructive call is asked
+            // about, not queued for an agent's Inbox.
+            Issuer::AppUi { .. } => {
+                if risk.needs_confirmation_from_operator() && !request.confirmed {
+                    Route::Confirm
+                } else {
+                    Route::Run
+                }
+            }
         };
 
         Ok((entry, node, route))
+    }
+
+    /// Whether an app's window may run this command at all.
+    ///
+    /// Three rules, in this order, and the first is not negotiable:
+    ///
+    /// 1. Nothing under [`deckjack_protocol::HARD_DENY`], whatever was
+    ///    approved.
+    /// 2. Its own scope: a command this app's process registered at
+    ///    handshake ([`Registry::provider`]). Not the prefix `<app>.*`, so a
+    ///    core command that happens to share the app's namespace, or one the
+    ///    core registers there later, is not the app's.
+    /// 3. An exact `[ui] invoke` entry of the app's approved manifest. A
+    ///    wildcard entry is only ever allowed in the app's own namespace, and
+    ///    it widens nothing here: rule 2 already covers what the app
+    ///    registered, and nothing else matches.
+    ///
+    /// Checked before the registry lookup, so a window probing for commands
+    /// learns nothing from "unknown" versus "refused".
+    fn check_app_ui(&self, app: &str, command: &CommandId) -> Result<(), Refused> {
+        let refuse = |reason: String| Refused::NotPermitted {
+            app: app.to_string(),
+            command: command.clone(),
+            reason,
+        };
+        if deckjack_protocol::is_hard_denied(command.as_str()) {
+            return Err(refuse(format!(
+                "{}.* is never available to an app's window",
+                command.namespace()
+            )));
+        }
+        let Some(ui_invoke) = self.registry.app_ui_invoke(app) else {
+            return Err(refuse(format!(
+                "no app called {app} is running on this node"
+            )));
+        };
+        if self.registry.provider(command).as_deref() == Some(app) {
+            return Ok(());
+        }
+        if ui_invoke.iter().any(|entry| entry == command.as_str()) {
+            return Ok(());
+        }
+        Err(refuse(
+            "it is neither one of the app's own commands nor in the [ui] invoke list the \
+             operator approved; add it to the app's manifest and approve the app again"
+                .to_string(),
+        ))
     }
 
     fn entry(&self, request: &Request) -> Result<Arc<dyn Erased>, Refused> {
@@ -2686,7 +2951,7 @@ fn logged_params(spec: &CommandSpec, params: &Value) -> Option<Value> {
 /// What the confirmation dialog asks. Phrased from the risk level because the
 /// backend declared that and the UI did not, so the dialog cannot
 /// under-describe what it is about to do.
-fn confirmation_prompt(spec: &CommandSpec) -> String {
+fn confirmation_prompt(spec: &CommandSpec, target: Option<&str>) -> String {
     let what = match spec.risk() {
         RiskLevel::Destructive => "This removes or overwrites data and cannot be undone.",
         RiskLevel::Outbound => "This leaves this machine and cannot be taken back.",
@@ -2695,5 +2960,149 @@ fn confirmation_prompt(spec: &CommandSpec) -> String {
         // above `Write`. Spelled out anyway rather than left to a `_` arm.
         RiskLevel::Write | RiskLevel::ReadOnly => "",
     };
-    format!("{} {}", spec.title(), what).trim().to_string()
+    let asked = match target {
+        Some(target) => format!("{}: {target}.", spec.title()),
+        None => format!("{}.", spec.title()),
+    };
+    format!("{asked} {what}").trim().to_string()
+}
+
+/// A command's subject as a confirmation shows it: plain, bounded, and
+/// absent rather than empty.
+fn shown_target(entry: &dyn Erased, params: &Value) -> Option<String> {
+    entry
+        .subject(params)
+        .map(|s| plain_text(&s, TARGET_MAX_CHARS))
+        .filter(|s| !s.is_empty())
+}
+
+/// The longest target a confirmation shows, in characters.
+///
+/// Long enough for a real path several folders deep, short enough that the
+/// dialog on a phone does not scroll: a target the operator has to scroll to
+/// read is a target they do not read.
+pub const TARGET_MAX_CHARS: usize = 160;
+
+/// Text made safe to show as a confirmation's target.
+///
+/// - **Bidi controls are removed** (marks, embeddings, overrides and
+///   isolates), so `photo\u{202E}gpj.exe` cannot render as `photoexe.jpg`.
+/// - **Control and invisible format characters are removed**, and runs of
+///   whitespace become one space, so a newline cannot push the real target
+///   out of view and a zero-width space cannot make two names look alike.
+/// - **Long text loses its middle**, not its end: the end of a path is the
+///   thing acted on and the start is where it lives, and both matter more
+///   than the folders between them.
+///
+/// The result is plain text. The shell renders it as text, never as markup.
+pub fn plain_text(text: &str, max_chars: usize) -> String {
+    let mut kept: Vec<char> = Vec::with_capacity(text.len());
+    for c in text.chars() {
+        let c = if c.is_whitespace() { ' ' } else { c };
+        if invisible(c) || (c == ' ' && matches!(kept.last(), None | Some(' '))) {
+            continue;
+        }
+        kept.push(c);
+    }
+    if kept.last() == Some(&' ') {
+        kept.pop();
+    }
+    if kept.len() <= max_chars {
+        return kept.into_iter().collect();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    // One character for the ellipsis. The end, which names the thing acted
+    // on, gets the odd one out.
+    let room = max_chars - 1;
+    let head = room / 2;
+    let tail = room - head;
+    let mut out: String = kept[..head].iter().collect();
+    out.push('\u{2026}');
+    out.extend(&kept[kept.len() - tail..]);
+    out
+}
+
+/// Characters a confirmation never shows: bidi controls, every other
+/// control character, and the invisible format characters that make two
+/// different strings look the same.
+fn invisible(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            // Bidi: the Arabic letter mark, LRM and RLM, embeddings and
+            // overrides, isolates.
+            '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                // Soft hyphen, Mongolian vowel separator, zero-width space
+                // and joiners, word joiner and invisible operators, byte
+                // order mark, interlinear annotations, tag characters.
+                | '\u{00AD}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200D}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{E0000}'..='\u{E007F}'
+        )
+}
+
+/// Paths for a confirmation's target: up to three, then how many more.
+///
+/// The three share one budget that fits inside [`TARGET_MAX_CHARS`] with the
+/// separators and the "and N more", so the bus never has to cut the joined
+/// text again (which would land in the middle and take the second path's
+/// name with it). A short path leaves its unused share to the longer ones;
+/// each path that still does not fit loses its own middle, never its name.
+pub fn name_paths<I, S>(paths: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    const SHOWN: usize = 3;
+    let mut named: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for path in paths {
+        total += 1;
+        if named.len() < SHOWN {
+            named.push(plain_text(path.as_ref(), usize::MAX));
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+    let more = if total > SHOWN {
+        format!(" and {} more", total - SHOWN)
+    } else {
+        String::new()
+    };
+    let separators = 2 * (named.len() - 1);
+    let budget = TARGET_MAX_CHARS.saturating_sub(separators + more.chars().count());
+    let shares = fair_shares(&named, budget);
+    for (path, room) in named.iter_mut().zip(shares) {
+        *path = plain_text(path, room);
+    }
+    let mut out = named.join(", ");
+    out.push_str(&more);
+    Some(out)
+}
+
+/// Split `budget` characters between `texts`: each gets an equal share, and
+/// what a shorter one does not use goes to the rest.
+fn fair_shares(texts: &[String], budget: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..texts.len()).collect();
+    order.sort_by_key(|&i| texts[i].chars().count());
+    let mut shares = vec![0; texts.len()];
+    let mut left = budget;
+    for (done, &i) in order.iter().enumerate() {
+        let share = left / (texts.len() - done);
+        let take = texts[i].chars().count().min(share);
+        shares[i] = take;
+        left -= take;
+    }
+    shares
 }

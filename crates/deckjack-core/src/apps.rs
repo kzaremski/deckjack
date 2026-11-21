@@ -55,6 +55,7 @@
 //! [needs]
 //! gpu = false
 //! network = ["cloud.zaremski.net"]
+//! connect_tcp = [443]           # without ports, hosts open the whole network
 //! working_dir = [{ path = "Calendars", write = true }]
 //!
 //! [[commands]]
@@ -127,7 +128,7 @@ pub use deckjack_protocol::{
     AppFrame, AppInfo, BINARY_PREFIX, CommandDecl, CoreFrame, DirNeed, Hello, Lifecycle,
     MANIFEST_FILE, MAX_FRAME_BYTES, MIN_PROTOCOL_VERSION, Manifest, ManifestError, Needs,
     PROTOCOL_VERSION, ProtocolError, RegisteredCommand, Registration, Risk, UI_INDEX, UiAsset,
-    WireAsset, check_protocol, decode_frame, encode_frame, valid_name,
+    UiNeeds, WireAsset, check_protocol, decode_frame, encode_frame, valid_name,
 };
 
 /// Read and validate one `app.toml`.
@@ -414,7 +415,7 @@ pub trait Env: Send + Sync {
     /// Separate from [`Env::exists`] because Landlock refuses a
     /// directory-only right such as `ReadDir` on anything that is not a
     /// directory, and one such rule fails the whole ruleset. See
-    /// [`PENDING_FILE_GRANTS`].
+    /// [`SYSTEM_READ_WRITE_FILES`].
     fn is_dir(&self, path: &Path) -> bool;
 
     /// Resolve a path through symlinks.
@@ -433,6 +434,14 @@ pub trait Env: Send + Sync {
     /// them, so a world-readable scratch directory stays world-readable to
     /// everything Landlock is not confining.
     fn create_private_dir(&self, path: &Path) -> io::Result<()>;
+
+    /// Whether two paths, following symlinks, are one file. The default
+    /// compares canonical paths; [`OsEnv`] asks for the file's identity, so a
+    /// mount that folds case (where `realpath` answers `BIN` as written
+    /// although it is `bin`) is judged by what the file is.
+    fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
+        Ok(self.canonicalize(a)? == self.canonicalize(b)?)
+    }
 
     /// Whether this node can confine a process at all.
     ///
@@ -523,6 +532,12 @@ impl Env for OsEnv {
 
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
         std::fs::canonicalize(path)
+    }
+
+    fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt as _;
+        let (a, b) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
+        Ok(a.dev() == b.dev() && a.ino() == b.ino())
     }
 
     fn create_private_dir(&self, path: &Path) -> io::Result<()> {
@@ -705,7 +720,7 @@ const DEV_READ_WRITE_DIRS: &[&str] = &["/dev/shm"];
 /// Granted read and write only when the manifest asks for the GPU.
 ///
 /// `/dev/dri` covers Mesa, Vulkan and VA-API. ROCm also wants `/dev/kfd`,
-/// which is a character device and so is in [`PENDING_FILE_GRANTS`].
+/// which is a character device and so is in [`GPU_READ_WRITE_FILES`].
 const GPU_READ_WRITE_DIRS: &[&str] = &["/dev/dri"];
 
 /// Granted read only when the manifest allows the network.
@@ -721,26 +736,26 @@ const RESOLVER_READ_DIRS: &[&str] = &[
     "/run/resolvconf",
 ];
 
-/// Paths an app needs that [`sandbox::Policy`] cannot express yet, kept here
-/// so the gap is in the code rather than only in a release note.
+/// Single files every app may read and write.
 ///
-/// Landlock refuses a directory-only access right — `ReadDir` is one — on a
-/// path that is not a directory, and it fails the whole ruleset rather than
-/// that one rule. [`sandbox::apply`] hands `AccessFs::from_read` to every
-/// entry of [`sandbox::Policy::read`], so a file in that list makes every
-/// launch fail. Verified on this machine: Landlock ABI 4 answers
-/// `incompatible directory-only access-rights: ReadDir`.
+/// Files, not directories, and that difference is load-bearing: Landlock
+/// refuses a directory-only right such as `ReadDir` on a non-directory and
+/// fails the *whole* ruleset rather than that one rule (Landlock ABI 4 answers
+/// `incompatible directory-only access-rights: ReadDir`). So these go into
+/// [`sandbox::Policy::read_write_files`], which grants only the rights a file
+/// can carry. Before that list existed these were skipped, and an app that
+/// opened `/dev/null` got `EACCES`.
 ///
-/// So these are *not* granted, [`Sandbox::unexpressible`] carries them, and
-/// [`Host::launch`] names them at warn on every launch. An app that opens
-/// `/dev/null` gets `EACCES`, and the operator should learn that from the
-/// launcher rather than from an app that looks broken. Closing it is one
-/// field on `sandbox::Policy` for non-directory paths, granted with
-/// `AccessFs::from_read(WANTED) & !AccessFs::ReadDir`.
-const PENDING_FILE_GRANTS: &[&str] = &[
-    "/dev/null",
-    "/dev/zero",
-    "/dev/full",
+/// Writable because writing is what they are for: `/dev/null` is where a
+/// helper's unwanted output goes. None of them stores anything.
+const SYSTEM_READ_WRITE_FILES: &[&str] = &["/dev/null", "/dev/zero", "/dev/full"];
+
+/// Single files every app may read. See [`SYSTEM_READ_WRITE_FILES`].
+///
+/// The entropy devices, because almost every TLS, hashing or UUID library
+/// opens one; and the handful of `/proc` files runtimes read to size thread
+/// pools and allocators. None of them describes another process.
+const SYSTEM_READ_FILES: &[&str] = &[
     "/dev/random",
     "/dev/urandom",
     "/proc/cpuinfo",
@@ -751,8 +766,9 @@ const PENDING_FILE_GRANTS: &[&str] = &[
     "/proc/sys/vm/overcommit_memory",
 ];
 
-/// The same gap as [`PENDING_FILE_GRANTS`], for the GPU need alone.
-const PENDING_GPU_FILE_GRANTS: &[&str] = &["/dev/kfd"];
+/// Granted read and write only when the manifest asks for the GPU: the ROCm
+/// compute device, which is a character device and not a directory.
+const GPU_READ_WRITE_FILES: &[&str] = &["/dev/kfd"];
 
 /// Everything needed to start an app, assembled before anything is spawned so
 /// it can be logged, shown to the operator, or asserted on.
@@ -779,7 +795,8 @@ pub struct LaunchPlan {
 ///
 /// The manifest's own words are kept beside the resolved policy because the
 /// two are not the same shape — `needs.network` is a list of hosts and
-/// [`sandbox::Policy::network`] is a boolean — and the approval dialog and the
+/// [`sandbox::Policy::network`] is a set of TCP ports or the whole network —
+/// and the approval dialog and the
 /// logs have to be able to show what was asked for, not only what could be
 /// enforced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -800,26 +817,23 @@ pub struct Sandbox {
     /// discover that the state database is there. It cannot read a byte of
     /// it.
     pub denied: Vec<PathBuf>,
-    /// Paths this launcher wanted to grant and could not. See
-    /// [`PENDING_FILE_GRANTS`]: it is a limit of [`sandbox::Policy`]'s shape,
-    /// not a decision about this app, and it is reported at every launch
-    /// rather than left to surface as an `EACCES` inside the app.
-    pub unexpressible: Vec<PathBuf>,
     /// Exactly what [`sandbox::apply`] will be given in the forked child.
     pub policy: sandbox::Policy,
 }
 
 impl Sandbox {
     /// True when the manifest named hosts and the whole network had to be
-    /// opened to honor it.
+    /// opened to honor it: hosts with no `connect_tcp` or `bind_tcp` ports.
     ///
     /// Landlock's network rules are per-port, not per-host, so an allowlist of
     /// names cannot be installed as written. Refusing the network outright
     /// would break an app the operator approved to reach a host, so the gap is
     /// granted and reported at every launch instead of being hidden; the
-    /// design's answer for closing it is the allowlisting HTTPS proxy.
+    /// design's answer for closing it is the allowlisting HTTPS proxy. A
+    /// manifest that names ports is narrowed to them and is not coarse in
+    /// this sense, although its host list is still not enforced.
     pub fn network_is_coarse(&self) -> bool {
-        self.policy.network && !self.network_hosts.is_empty()
+        self.policy.network.is_whole() && !self.network_hosts.is_empty()
     }
 }
 
@@ -838,7 +852,7 @@ pub enum ConfinementError {
     },
 
     #[error(
-        "{app}'s manifest asks for no network, and this kernel's Landlock is ABI {abi} where \
+        "{app}'s manifest asks for no network or only some TCP ports, and this kernel's Landlock is ABI {abi} where \
          network rules arrived in ABI 4. Granting the network the manifest did not ask for is \
          not a downgrade Deckjack makes: run {app} on a node with Linux 6.7 or newer"
     )]
@@ -884,6 +898,18 @@ pub enum ConfinementError {
     },
 
     #[error(
+        "{app} asks for {path}, which is {denied} or holds it. That is part of Deckjack's \
+         install directory (the core and app binaries, app sockets, node keys, caches and \
+         session files), which no app is ever granted: a writable grant there could replace \
+         the core or another app's binary"
+    )]
+    InstallDenied {
+        app: String,
+        path: PathBuf,
+        denied: PathBuf,
+    },
+
+    #[error(
         "{app} asks for {path}, which is not a directory. Landlock grants trees, not single \
          files, so name the directory the file is in and let the app open what it needs inside \
          it"
@@ -910,9 +936,7 @@ impl LaunchPlan {
         let needs = &installed.manifest.needs;
         let socket = socket_path(install_dir, &app);
 
-        // The manifest's network list is an allowlist and not a hint, so an
-        // empty list is a denial: no hosts named means no network at all.
-        let network = !needs.network.is_empty();
+        let network = network_policy(needs);
 
         // Asked before a directory is created or a path resolved. If this node
         // cannot enforce, nothing about this app should happen at all.
@@ -933,7 +957,7 @@ impl LaunchPlan {
                 sandbox::Availability::Enforcing {
                     landlock_abi,
                     network_rules: false,
-                } if !network => {
+                } if !network.is_whole() => {
                     return Err(ConfinementError::NoNetworkRules {
                         app,
                         abi: landlock_abi,
@@ -953,7 +977,30 @@ impl LaunchPlan {
         // The one denial that is never negotiable, resolved the same way the
         // grants are so the comparisons below are between like and like.
         let hidden = working_root.join(HIDDEN_DIR);
+        // The install directory's own entries, by real path. The working
+        // directory defaults to the install directory, so `bin/` (the
+        // unconfined core) and `apps/` (every app's binary) sit right beside
+        // the operator's folders; a grant leading into one — through a
+        // symlink the manifest check cannot see, or from a working directory
+        // above the install directory — could replace either.
+        let install_root = env
+            .canonicalize(install_dir)
+            .unwrap_or_else(|_| install_dir.to_path_buf());
+        let protected: Vec<PathBuf> = crate::node::INSTALL_LAYOUT
+            .iter()
+            .flat_map(|entry| {
+                let joined = install_root.join(entry);
+                // Where an entry that is itself a link really leads, too.
+                let real = env.canonicalize(&joined).ok();
+                std::iter::once(joined).chain(real)
+            })
+            .collect();
 
+        // Resolver files only for an app that may reach a host by name. A
+        // bind-only app needs no DNS, and an app with no network has no use
+        // for the file that names its servers.
+        let resolves = network.is_whole()
+            || matches!(&network, sandbox::Network::Ports { connect_tcp, .. } if !connect_tcp.is_empty());
         let mut policy = sandbox::Policy::nothing().with_network(network);
 
         for need in &needs.working_dir {
@@ -1011,6 +1058,34 @@ impl LaunchPlan {
                     denied: hidden,
                 });
             }
+            // Both directions again: inside an entry is a grant on it, and a
+            // tree holding the install directory holds every entry.
+            // And another spelling of an entry's name, where the filesystem
+            // folds case and that spelling is the entry itself.
+            let folded = real
+                .strip_prefix(&install_root)
+                .ok()
+                .and_then(|rel| match rel.components().next() {
+                    Some(std::path::Component::Normal(first)) => {
+                        crate::node::install_entry_named(first, &install_root, |a, b| {
+                            env.same_file(a, b).unwrap_or(false)
+                        })
+                    }
+                    _ => None,
+                })
+                .map(|entry| install_root.join(entry));
+            if let Some(denied) = folded.or_else(|| {
+                protected
+                    .iter()
+                    .find(|entry| real.starts_with(entry) || entry.starts_with(&real))
+                    .cloned()
+            }) {
+                return Err(ConfinementError::InstallDenied {
+                    app,
+                    path: real,
+                    denied,
+                });
+            }
             // Checked here rather than left to Landlock, which fails the whole
             // ruleset on a non-directory rule and does it inside the forked
             // child, where the message is reduced to `EINVAL` by the time the
@@ -1028,11 +1103,15 @@ impl LaunchPlan {
 
         // Everything from here down is the launcher's own, chosen in this file
         // rather than named by a manifest, which is why it does not go through
-        // the denial check above. On a node whose working directory is the
-        // home directory the run and cache directories are *inside*
-        // `.deckjack/`, and an app has to be able to reach its own socket and
-        // its own scratch space. Those two paths are granted by name; the tree
-        // around them is not.
+        // the denial checks above: the app's own directory, the run directory
+        // and the app's private cache all live in the install directory, whose
+        // entries no manifest grant may reach, and an app has to be able to
+        // read its own assets, reach its own socket and use its own scratch
+        // space. Those paths are granted by name, narrowly; `apps/`, `run/`'s
+        // neighbors and `cache/` around them are not. With the working
+        // directory at its default (the install directory) they sit beside the
+        // operator's folders, and with `--dir ~` they are inside `.deckjack/`;
+        // neither changes what is granted here.
         policy.read.push(installed.dir.clone());
 
         // The run directory may not exist yet: `bind_socket` creates it, and
@@ -1057,26 +1136,27 @@ impl LaunchPlan {
         policy.read_write.push(home.clone());
         policy.read_write.push(tmp.clone());
 
-        let mut unexpressible = Vec::new();
-
         for path in SYSTEM_READ_DIRS {
             grant_dir(&mut policy.read, Path::new(path), env);
         }
         for path in DEV_READ_WRITE_DIRS {
             grant_dir(&mut policy.read_write, Path::new(path), env);
         }
-        for path in PENDING_FILE_GRANTS {
-            note_unexpressible(&mut unexpressible, Path::new(path), env);
+        for path in SYSTEM_READ_WRITE_FILES {
+            grant_file(&mut policy.read_write_files, Path::new(path), env);
+        }
+        for path in SYSTEM_READ_FILES {
+            grant_file(&mut policy.read_files, Path::new(path), env);
         }
         if needs.gpu {
             for path in GPU_READ_WRITE_DIRS {
                 grant_dir(&mut policy.read_write, Path::new(path), env);
             }
-            for path in PENDING_GPU_FILE_GRANTS {
-                note_unexpressible(&mut unexpressible, Path::new(path), env);
+            for path in GPU_READ_WRITE_FILES {
+                grant_file(&mut policy.read_write_files, Path::new(path), env);
             }
         }
-        if network {
+        if resolves {
             for path in RESOLVER_READ_DIRS {
                 grant_dir(&mut policy.read, Path::new(path), env);
             }
@@ -1117,11 +1197,131 @@ impl LaunchPlan {
                 gpu: needs.gpu,
                 network_hosts: needs.network.clone(),
                 denied: vec![hidden],
-                unexpressible,
                 policy,
             },
             confinement,
         })
+    }
+}
+
+/// Where the core's own front door is, as far as an app grant is concerned:
+/// its TCP listen address and the addresses whose `X-Forwarded-For` it
+/// believes over TCP (`server.trusted_proxies`). [`Host::new`] requires one,
+/// so a host cannot be built that would approve a grant reaching the core
+/// without knowing where the core is. See [`reaches_core`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreDoor {
+    pub listen: std::net::SocketAddr,
+    pub trusted_proxies: Vec<std::net::IpAddr>,
+}
+
+impl CoreDoor {
+    pub fn new(listen: std::net::SocketAddr, trusted_proxies: Vec<std::net::IpAddr>) -> CoreDoor {
+        CoreDoor {
+            listen,
+            trusted_proxies,
+        }
+    }
+}
+
+/// Whether `needs` would let an app open a TCP connection to the core at
+/// `door` from which it could pose as the proxy, and if so, what in it does.
+/// `None` means it cannot.
+///
+/// The rule (D2 in docs/APP-UI-ISOLATION.md, decided in its §5 stage 0):
+///
+/// 1. **`connect_tcp` names the core's port.** Refused whatever the listen
+///    address. Landlock's network rules are per port and know nothing of
+///    addresses, so a port grant reaches every address on the machine that
+///    serves that port, loopback and tailnet alike.
+/// 2. **The legacy whole-network grant** (hosts named, no ports — see
+///    [`network_policy`]) **while the core listens on loopback or on the
+///    unspecified address** (which accepts loopback too), **or while
+///    `trusted_proxies` names any address at all.** Such an app is under no
+///    TCP rule: it can bind any address this machine owns as its source and
+///    connect to the core from it, so any trusted address that is local is
+///    one it can arrive from — loopback, or the core's own listen address
+///    when an operator points a TCP `tailscale serve` at it. Which addresses
+///    are local is not knowable here (a tailnet address comes and goes with
+///    tailscaled), so every trusted address counts. A core bound to one
+///    specific non-loopback address with nothing trusted over TCP — the
+///    `server.unix_socket` setup — admits such an app: it arrives from an
+///    address no more trusted than any other peer.
+///
+/// `bind_tcp` is not checked: the core already holds its port, so an app
+/// cannot bind it while there is a core to impersonate. MPTCP, which
+/// Landlock does not mediate, is refused by the sandbox itself
+/// ([`crate::sandbox`]), so the port rules above are the whole of an app's
+/// TCP.
+///
+/// A pure function of the manifest and the door, so the rule is testable
+/// without a process; [`Host::approve`] and [`Host::launch`] both call it.
+/// The protocol crate's manifest validator cannot, because it does not know
+/// where the core listens.
+pub fn reaches_core(needs: &Needs, door: &CoreDoor) -> Option<String> {
+    let listen = door.listen;
+    if needs.connect_tcp.contains(&listen.port()) {
+        return Some(format!(
+            "TCP connections to port {} in needs.connect_tcp",
+            listen.port()
+        ));
+    }
+    if !network_policy(needs).is_whole() {
+        return None;
+    }
+    let ip = listen.ip().to_canonical();
+    if ip.is_loopback() || ip.is_unspecified() {
+        return Some(format!(
+            "network access to {} with no ports named, which opens every port",
+            needs.network.join(", ")
+        ));
+    }
+    if !door.trusted_proxies.is_empty() {
+        let trusted: Vec<String> = door.trusted_proxies.iter().map(|a| a.to_string()).collect();
+        return Some(format!(
+            "network access to {} with no ports named, which lets it connect from any \
+             address this machine owns while server.trusted_proxies believes {}",
+            needs.network.join(", "),
+            trusted.join(", ")
+        ));
+    }
+    None
+}
+
+fn refuse_if_reaches_core(app: &str, needs: &Needs, door: &CoreDoor) -> Result<(), HostError> {
+    match reaches_core(needs, door) {
+        None => Ok(()),
+        Some(reason) => Err(HostError::ReachesCore {
+            app: app.to_string(),
+            reason,
+            listen: door.listen,
+            port: door.listen.port(),
+        }),
+    }
+}
+
+/// What a manifest's network keys come to under Landlock.
+///
+/// - Nothing named: no TCP at all. The host list is an allowlist and not a
+///   hint, so an empty one is a denial.
+/// - Hosts and no ports: the whole network, as before ports could be named.
+///   Kept so an approved manifest means what it meant when it was approved;
+///   reported at every launch as [`Sandbox::network_is_coarse`].
+/// - Any port named: TCP connect and bind on exactly those ports and no
+///   others. The hosts stay what the operator read when approving; Landlock
+///   has no way to hold an app to them, and does not filter UDP at all.
+pub fn network_policy(needs: &Needs) -> sandbox::Network {
+    if needs.connect_tcp.is_empty() && needs.bind_tcp.is_empty() {
+        if needs.network.is_empty() {
+            sandbox::Network::denied()
+        } else {
+            sandbox::Network::Whole
+        }
+    } else {
+        sandbox::Network::Ports {
+            connect_tcp: needs.connect_tcp.clone(),
+            bind_tcp: needs.bind_tcp.clone(),
+        }
     }
 }
 
@@ -1137,10 +1337,14 @@ fn grant_dir(into: &mut Vec<PathBuf>, path: &Path, env: &dyn Env) {
     }
 }
 
-/// Record a path that exists and is needed but cannot be granted yet. See
-/// [`PENDING_FILE_GRANTS`].
-fn note_unexpressible(into: &mut Vec<PathBuf>, path: &Path, env: &dyn Env) {
-    if env.exists(path) {
+/// Add a system file to a grant list, if it is there and is not a directory.
+///
+/// Absent is not an error, for the same reason as [`grant_dir`]: `/dev/kfd`
+/// exists only on a machine with an AMD GPU and the driver loaded. A path that
+/// turned out to be a directory is skipped rather than granted, because the
+/// file list's rights are not what a directory grant means.
+fn grant_file(into: &mut Vec<PathBuf>, path: &Path, env: &dyn Env) {
+    if env.exists(path) && !env.is_dir(path) {
         into.push(path.to_path_buf());
     }
 }
@@ -1536,6 +1740,51 @@ impl Runtime {
     }
 }
 
+/// Where an installed app stands with the operator's approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalState {
+    /// It asks for nothing in `[needs]`.
+    NotNeeded,
+    /// A stored approval covers exactly what it asks for.
+    Approved,
+    /// Nothing is approved for it.
+    Required,
+    /// An approval is stored, but for a different manifest — or under the
+    /// fingerprint scheme SHA-256 replaced — so it is asked again.
+    Stale,
+}
+
+impl ApprovalState {
+    /// The word `system.apps` reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalState::NotNeeded => "not-needed",
+            ApprovalState::Approved => "approved",
+            ApprovalState::Required => "required",
+            ApprovalState::Stale => "stale",
+        }
+    }
+
+    /// Whether the operator has to approve it before it can run.
+    pub fn awaits_operator(self) -> bool {
+        matches!(self, ApprovalState::Required | ApprovalState::Stale)
+    }
+}
+
+/// The one comparison: the stored grant's fingerprint against the manifest's.
+fn approval_of(installed: &Installed, grants: &dyn Grants) -> Result<ApprovalState, HostError> {
+    if installed.manifest.needs.is_empty() {
+        return Ok(ApprovalState::NotNeeded);
+    }
+    Ok(match grants.grant(&installed.name)? {
+        Some(grant) if grant.fingerprint == installed.manifest.fingerprint() => {
+            ApprovalState::Approved
+        }
+        Some(_) => ApprovalState::Stale,
+        None => ApprovalState::Required,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum HostError {
     #[error("no app named {0:?} is installed on this node; `deckjack install {0}` first")]
@@ -1544,23 +1793,51 @@ pub enum HostError {
     #[error("{app} is installed but not runnable: {reason}")]
     Unavailable { app: String, reason: String },
 
+    // Both point at the shell's palette entry, the one re-approval path that
+    // exists; there is no `deckjack approve`, and these used to name it.
     #[error(
-        "{app} has not been approved for what it asks ({summary}). Approve it in Settings \
-         or with `deckjack approve {app}`"
+        "{app} has not been approved for what it asks ({summary}). {}",
+        crate::install::how_to_approve(.title)
     )]
-    NotApproved { app: String, summary: String },
+    NotApproved {
+        app: String,
+        /// What the shell calls it, so the palette entry can be named.
+        title: String,
+        summary: String,
+    },
 
     #[error(
-        "{app}'s approval covers an older manifest: it now asks for {summary}. Review and \
-         approve the change with `deckjack approve {app}`"
+        "{app}'s approval covers an older manifest, or was recorded before the approval \
+         fingerprint became SHA-256: it now asks for {summary}. {}",
+        crate::install::how_to_approve(.title)
     )]
-    GrantStale { app: String, summary: String },
+    GrantStale {
+        app: String,
+        title: String,
+        summary: String,
+    },
 
     #[error(transparent)]
     Grant(#[from] GrantError),
 
     #[error(transparent)]
     Confinement(#[from] ConfinementError),
+
+    /// D2 (docs/APP-UI-ISOLATION.md): an app that can open a TCP
+    /// connection to the core can speak HTTP to it as a local peer, and
+    /// loopback is exactly what an operator lists in `trusted_proxies` for a
+    /// TCP `tailscale serve`. See [`reaches_core`].
+    #[error(
+        "{app} asks for {reason}, which would let it reach this node's own front door at \
+         {listen}. Refused so an app can never pose as the proxy in front of Deckjack: name \
+         the ports it really needs in needs.connect_tcp, leaving out {port}"
+    )]
+    ReachesCore {
+        app: String,
+        reason: String,
+        listen: std::net::SocketAddr,
+        port: u16,
+    },
 
     #[error("cannot start {app}: {source}")]
     Spawn {
@@ -1588,18 +1865,26 @@ pub enum HostError {
 pub struct Host<E: Env> {
     install_dir: PathBuf,
     working_dir: PathBuf,
+    /// The core's own front door. Required by [`Host::new`], not a builder
+    /// or a [`Policy`] default, because a host that does not know it would
+    /// approve and launch an app granted the core's port, and nothing would
+    /// fail to say so. See [`reaches_core`].
+    core_door: CoreDoor,
     env: E,
     policy: Policy,
     grants: Box<dyn Grants>,
     installed: BTreeMap<String, Installed>,
     problems: Vec<Problem>,
     runtimes: BTreeMap<String, Runtime>,
+    /// See [`Host::set_command_risks`].
+    risks: Option<Arc<dyn CommandRisks>>,
 }
 
 impl<E: Env> Host<E> {
     pub fn new(
         install_dir: PathBuf,
         working_dir: PathBuf,
+        core_door: CoreDoor,
         env: E,
         policy: Policy,
         grants: Box<dyn Grants>,
@@ -1607,12 +1892,14 @@ impl<E: Env> Host<E> {
         Host {
             install_dir,
             working_dir,
+            core_door,
             env,
             policy,
             grants,
             installed: BTreeMap::new(),
             problems: Vec::new(),
             runtimes: BTreeMap::new(),
+            risks: None,
         }
     }
 
@@ -1998,6 +2285,9 @@ impl<E: Env> Host<E> {
             .installed
             .get(app)
             .ok_or_else(|| HostError::NotInstalled(app.to_string()))?;
+        // Refused at approval as well as at launch, so the operator is not
+        // asked to approve something that could never run.
+        refuse_if_reaches_core(app, &installed.manifest.needs, &self.core_door)?;
         let grant = Grant {
             app: app.to_string(),
             fingerprint: installed.manifest.fingerprint(),
@@ -2015,6 +2305,49 @@ impl<E: Env> Host<E> {
         Ok(())
     }
 
+    /// The `[ui] invoke` entries the operator approved for this app: what its
+    /// window may call beyond the commands its own process registers.
+    ///
+    /// From the **stored** approval, and only while that approval matches
+    /// what the installed manifest asks for now. A manifest edited on disk
+    /// after approval is a new request, so its `[ui]` reaches nothing until
+    /// the operator approves it; an app that asks for nothing has no
+    /// approval and so no `[ui]` either. Empty, never an error: a window
+    /// whose approval cannot be read calls only its own commands.
+    pub fn approved_ui_invoke(&self, app: &str) -> Vec<String> {
+        let Some(installed) = self.installed.get(app) else {
+            return Vec::new();
+        };
+        match self.grants.grant(app) {
+            Ok(Some(grant)) if grant.fingerprint == installed.manifest.fingerprint() => {
+                grant.needs.ui.invoke
+            }
+            Ok(_) => Vec::new(),
+            Err(e) => {
+                tracing::warn!(app, error = %e, "app approval unreadable; its window gets only its own commands");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Let approval summaries name how risky each command an app's window
+    /// asks for is. Without it, [`summarize`] can only list the ids.
+    ///
+    /// Set by [`crate::apphost::AppHost::new`] from the registry the bus
+    /// dispatches from, so the risk the operator reads is the risk the bus
+    /// routes by.
+    pub fn set_command_risks(&mut self, risks: Arc<dyn CommandRisks>) {
+        self.risks = Some(risks);
+    }
+
+    /// [`summarize`] with this host's view of command risks.
+    pub fn summary(&self, needs: &Needs) -> String {
+        match &self.risks {
+            Some(risks) => summarize_with(needs, risks.as_ref()),
+            None => summarize(needs),
+        }
+    }
+
     /// Spawn an app, after checking that it may run.
     fn launch(&mut self, app: &str) -> Result<LaunchPlan, HostError> {
         let installed = self
@@ -2024,6 +2357,10 @@ impl<E: Env> Host<E> {
             .clone();
 
         self.check_grant(&installed)?;
+        // After the grant check, so an unapproved app is told to get approved
+        // first; at every launch, because a grant stored before this rule
+        // existed still holds a fingerprint that matches.
+        refuse_if_reaches_core(app, &installed.manifest.needs, &self.core_door)?;
 
         // Refuses here rather than after a spawn, so an app that may not run
         // on this node never becomes a process that has to be killed.
@@ -2046,26 +2383,8 @@ impl<E: Env> Host<E> {
                         app,
                         hosts = %plan.sandbox.network_hosts.join(", "),
                         "granting the whole network: Landlock has no per-host rules, so the \
-                         manifest's host list is not enforced on this node"
-                    );
-                }
-                if !plan.sandbox.unexpressible.is_empty() {
-                    // Not a property of this app: `sandbox::Policy` has no
-                    // list for non-directory paths, so these are skipped
-                    // rather than granted. An app that opens one of them will
-                    // see EACCES, and the operator hears it from the launcher
-                    // instead of debugging the app.
-                    tracing::warn!(
-                        app,
-                        paths = %plan
-                            .sandbox
-                            .unexpressible
-                            .iter()
-                            .map(|p| p.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        "not granted: Landlock cannot take a directory-only right on a file \
-                         and sandbox::Policy has no list for files yet"
+                         manifest's host list is not enforced on this node. Naming the ports \
+                         the app uses in needs.connect_tcp would narrow it to those"
                     );
                 }
                 tracing::info!(
@@ -2073,7 +2392,7 @@ impl<E: Env> Host<E> {
                     program = %plan.program.display(),
                     socket = %plan.socket.display(),
                     gpu = plan.sandbox.gpu,
-                    network = plan.sandbox.policy.network,
+                    network = ?plan.sandbox.policy.network,
                     read = plan.sandbox.policy.read.len(),
                     read_write = plan.sandbox.policy.read_write.len(),
                     "launching app confined"
@@ -2107,17 +2426,40 @@ impl<E: Env> Host<E> {
     /// An app may run if it asks for nothing, or if a stored grant matches
     /// what it currently asks for.
     fn check_grant(&self, installed: &Installed) -> Result<(), HostError> {
-        if installed.manifest.needs.is_empty() {
-            return Ok(());
-        }
         let app = installed.name.clone();
-        let summary = summarize(&installed.manifest.needs);
-
-        match self.grants.grant(&app)? {
-            Some(grant) if grant.fingerprint == installed.manifest.fingerprint() => Ok(()),
-            Some(_) => Err(HostError::GrantStale { app, summary }),
-            None => Err(HostError::NotApproved { app, summary }),
+        let title = installed
+            .manifest
+            .app
+            .title
+            .clone()
+            .unwrap_or_else(|| app.clone());
+        let summary = self.summary(&installed.manifest.needs);
+        match approval_of(installed, self.grants.as_ref())? {
+            ApprovalState::NotNeeded | ApprovalState::Approved => Ok(()),
+            ApprovalState::Stale => Err(HostError::GrantStale {
+                app,
+                title,
+                summary,
+            }),
+            ApprovalState::Required => Err(HostError::NotApproved {
+                app,
+                title,
+                summary,
+            }),
         }
+    }
+
+    /// Where an installed app stands with the operator's approval, for the
+    /// shell: `system.apps` reports it so an app awaiting approval — new, or
+    /// stale after its manifest or the fingerprint scheme changed — can be
+    /// approved from the palette instead of failing to open with nothing to
+    /// do about it. The same answer [`Host::open_window`] acts on.
+    pub fn approval(&self, app: &str) -> Result<ApprovalState, HostError> {
+        let installed = self
+            .installed
+            .get(app)
+            .ok_or_else(|| HostError::NotInstalled(app.to_string()))?;
+        approval_of(installed, self.grants.as_ref())
     }
 
     /// Whether an app should be running at all: a service always, an
@@ -2195,10 +2537,48 @@ impl<E: Env> Host<E> {
     }
 }
 
+/// How risky a command is, for [`summarize_with`]. `None` for a command this
+/// node does not know (yet): an app's own command before it has registered,
+/// or one the core does not have.
+pub trait CommandRisks: Send + Sync {
+    fn risk(&self, command: &str) -> Option<crate::command::RiskLevel>;
+}
+
+impl CommandRisks for crate::command::Registry {
+    fn risk(&self, command: &str) -> Option<crate::command::RiskLevel> {
+        let id = crate::command::CommandId::new(command.to_string()).ok()?;
+        self.spec(&id).map(|spec| spec.risk())
+    }
+}
+
+/// No risks known: what [`summarize`] uses, where there is no registry to
+/// ask (the `deckjack install` CLI).
+struct UnknownRisks;
+
+impl CommandRisks for UnknownRisks {
+    fn risk(&self, _command: &str) -> Option<crate::command::RiskLevel> {
+        None
+    }
+}
+
 /// One line describing what an app asks for, for an approval prompt and for
 /// the error when there is no approval.
+///
+/// The window's `[ui]` scope is listed with its ids but not grouped by risk,
+/// because nothing here knows the risks; [`summarize_with`] does.
 pub fn summarize(needs: &Needs) -> String {
+    summarize_with(needs, &UnknownRisks)
+}
+
+/// [`summarize`], with the window's `[ui] invoke` scope grouped by the
+/// highest risk it reaches, highest first, so the line the operator reads
+/// leads with the worst thing the window could do on their behalf
+/// (docs/APP-UI-ISOLATION.md §4.8).
+pub fn summarize_with(needs: &Needs, risks: &dyn CommandRisks) -> String {
     let mut parts: Vec<String> = Vec::new();
+    if let Some(ui) = ui_scope(&needs.ui, risks) {
+        parts.push(ui);
+    }
     if needs.gpu {
         parts.push("the GPU".to_string());
     }
@@ -2209,7 +2589,17 @@ pub fn summarize(needs: &Needs) -> String {
         parts.push("calling commands on the command bus".to_string());
     }
     if !needs.network.is_empty() {
-        parts.push(format!("network access to {}", needs.network.join(", ")));
+        let mut part = format!("network access to {}", needs.network.join(", "));
+        if !needs.connect_tcp.is_empty() {
+            part.push_str(&format!(" on TCP {}", ports(&needs.connect_tcp)));
+        }
+        parts.push(part);
+    }
+    if !needs.bind_tcp.is_empty() {
+        parts.push(format!(
+            "listening for TCP connections on {}",
+            ports(&needs.bind_tcp)
+        ));
     }
     for need in &needs.working_dir {
         let how = if need.write { "read and write" } else { "read" };
@@ -2219,6 +2609,61 @@ pub fn summarize(needs: &Needs) -> String {
         "nothing beyond the command bus".to_string()
     } else {
         parts.join("; ")
+    }
+}
+
+/// The `[ui]` part of [`summarize_with`]: "its window can, on your behalf:
+/// remove or overwrite data (files.delete); read (files.list, files.read)".
+fn ui_scope(ui: &UiNeeds, risks: &dyn CommandRisks) -> Option<String> {
+    use crate::command::RiskLevel;
+    if ui.is_empty() {
+        return None;
+    }
+    let mut groups: Vec<String> = Vec::new();
+    if !ui.invoke.is_empty() {
+        let mut by_risk: BTreeMap<Option<RiskLevel>, Vec<&str>> = BTreeMap::new();
+        for id in &ui.invoke {
+            by_risk.entry(risks.risk(id)).or_default().push(id);
+        }
+        // Highest first. A command whose risk is unknown leads, because "not
+        // known" must not read as "harmless": it may be destructive.
+        let unknown = by_risk.remove(&None);
+        let what = |risk: RiskLevel| match risk {
+            RiskLevel::Destructive => "remove or overwrite data",
+            RiskLevel::Outbound => "send things off this machine",
+            RiskLevel::CrossProject => "act outside the project",
+            RiskLevel::Write => "change things",
+            RiskLevel::ReadOnly => "read",
+        };
+        if let Some(ids) = unknown {
+            // The same words when every risk is unknown, which is what the
+            // install CLI shows (it has no registry to ask).
+            groups.push(format!(
+                "call commands whose risk this node does not know yet ({})",
+                ids.join(", ")
+            ));
+        }
+        for (risk, ids) in by_risk.into_iter().rev() {
+            if let Some(risk) = risk {
+                groups.push(format!("{} ({})", what(risk), ids.join(", ")));
+            }
+        }
+    }
+    if !ui.events.is_empty() {
+        groups.push(format!("watch events ({})", ui.events.join(", ")));
+    }
+    Some(format!(
+        "its window can, on your behalf: {}",
+        groups.join("; ")
+    ))
+}
+
+/// "port 443" or "ports 80, 443", for [`summarize`].
+fn ports(list: &[u16]) -> String {
+    let names: Vec<String> = list.iter().map(u16::to_string).collect();
+    match names.as_slice() {
+        [one] => format!("port {one}"),
+        _ => format!("ports {}", names.join(", ")),
     }
 }
 
@@ -2336,8 +2781,13 @@ async fn serve(host: Arc<dyn UiHost>, app: String, path: String) -> Response {
 fn asset_response(asset: UiAsset) -> Response {
     // Hashed files may be cached forever; the entry document never, or an
     // app update would be invisible until a hard reload.
+    //
+    // `private`, never `public`: these bytes are served behind the session
+    // (and, from stage 4, a capability path), and `public` authorizes a
+    // shared cache to hand them to a client that has neither.
+    // docs/APP-UI-ISOLATION.md §4.2.
     let cache = if asset.immutable {
-        "public, max-age=31536000, immutable"
+        "private, max-age=31536000, immutable"
     } else {
         "no-store"
     };
@@ -2355,6 +2805,16 @@ fn asset_response(asset: UiAsset) -> Response {
 /// 503, not 500: the app is coming back, and the window should say so rather
 /// than close. The header is for the shell, the body for anyone who reached
 /// the URL directly.
+///
+/// The body also reloads itself. The shell's panel waits for the app before
+/// loading its frame, but a frame still lands here when its app restarts
+/// under an open window (or when the URL is opened by hand), and a frame
+/// cannot act on `Retry-After`, so without the refresh the window showed
+/// this page until closed. No `url=`, so the reload
+/// keeps the query: the window id and the file the app was opened on. A later
+/// file posted into this page is lost with it; the shell's frame hands its
+/// last one over again on the reload. An app that gives up answers 404, which
+/// does not refresh, so nothing spins.
 fn reconnecting(app: &str) -> Response {
     axum::http::Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -2363,8 +2823,8 @@ fn reconnecting(app: &str) -> Response {
         .header("x-deckjack-app-status", "reconnecting")
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .body(axum::body::Body::from(format!(
-            "<!doctype html><meta charset=utf-8><title>Reconnecting</title>\
-<p>{app} is restarting.</p>"
+            "<!doctype html><meta charset=utf-8><meta http-equiv=\"refresh\" content=\"1\">\
+<title>Reconnecting</title><p>{app} is restarting.</p>"
         )))
         .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())
 }

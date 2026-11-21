@@ -99,10 +99,17 @@ impl Workspace {
         Root::open(&self.root).unwrap()
     }
 
+    /// The install directory `register_commands` is given (its thumbnail
+    /// cache goes under `<install>/cache/files`), beside the working
+    /// directory and never inside it.
+    fn install(&self) -> PathBuf {
+        self.root.parent().unwrap().join("install")
+    }
+
     /// The whole file layer plus the bus, as the server wires it.
     fn bus(&self) -> Bus {
         let registry = Arc::new(Registry::new());
-        register_commands(&registry, &self.root, "r620").unwrap();
+        register_commands(&registry, &self.root, "r620", &self.install()).unwrap();
         Bus::new(registry, NodeId::new("r620"), Arc::new(OsEnv))
     }
 }
@@ -249,6 +256,20 @@ impl Fs for FakeFs {
         unimplemented!("not reached by the resolution tests")
     }
     fn rename(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+        unimplemented!("not reached by the resolution tests")
+    }
+    fn copy_file(
+        &self,
+        _from: &Path,
+        _to: &Path,
+        _chunk: &mut dyn FnMut(u64) -> bool,
+    ) -> io::Result<u64> {
+        unimplemented!("not reached by the resolution tests")
+    }
+    fn read_link(&self, _path: &Path) -> io::Result<PathBuf> {
+        unimplemented!("not reached by the resolution tests")
+    }
+    fn symlink(&self, _target: &Path, _at: &Path) -> io::Result<()> {
         unimplemented!("not reached by the resolution tests")
     }
 }
@@ -1154,7 +1175,7 @@ fn reads_are_read_only_and_no_file_command_asks_the_operator_to_confirm() {
     // confirmation to; what keeps an agent out of them is the grant.
     let ws = Workspace::new();
     let registry = Registry::new();
-    register_commands(&registry, &ws.root, "r620").unwrap();
+    register_commands(&registry, &ws.root, "r620", &ws.install()).unwrap();
 
     for id in ["files.list", "files.read", "files.stat"] {
         let spec = registry.spec(&CommandId::new(id).unwrap()).unwrap();
@@ -1192,7 +1213,7 @@ fn a_saved_files_contents_never_reach_the_audit_log() {
     // into the log.
     let ws = Workspace::new();
     let registry = Arc::new(Registry::new());
-    register_commands(&registry, &ws.root, "r620").unwrap();
+    register_commands(&registry, &ws.root, "r620", &ws.install()).unwrap();
     let journal = Arc::new(Captured::default());
     let bus = Bus::new(registry, NodeId::new("r620"), Arc::new(OsEnv))
         .with_journal(Arc::clone(&journal) as Arc<dyn Journal>);
@@ -1348,12 +1369,15 @@ fn every_file_command_is_registered_under_the_files_namespace() {
     // never reachable. A command the browser cannot address is the same bug.
     let ws = Workspace::new();
     let registry = Registry::new();
-    register_commands(&registry, &ws.root, "r620").unwrap();
+    register_commands(&registry, &ws.root, "r620", &ws.install()).unwrap();
 
     let ids: Vec<String> = registry
         .list(None)
         .into_iter()
         .map(|l| l.spec.id().as_str().to_string())
+        // The editor's commands ride on this namespace too; they have their
+        // own count in tests/editor.rs.
+        .filter(|id| id.starts_with("files."))
         .collect();
     for id in [
         "files.list",
@@ -1363,10 +1387,19 @@ fn every_file_command_is_registered_under_the_files_namespace() {
         "files.mkdir",
         "files.rename",
         "files.delete",
+        "files.move",
+        "files.copy",
+        "files.trash",
+        "files.trash.list",
+        "files.trash.restore",
+        "files.trash.empty",
+        "files.space",
+        "files.thumbnail",
+        "files.archive.list",
     ] {
         assert!(ids.contains(&id.to_string()), "{id} is not on the bus");
     }
-    assert_eq!(ids.len(), 7, "registered: {ids:?}");
+    assert_eq!(ids.len(), 16, "registered: {ids:?}");
 }
 
 #[test]
@@ -1375,7 +1408,7 @@ fn a_node_id_that_cannot_appear_in_an_address_fails_at_registration() {
     // round-trip.
     let ws = Workspace::new();
     let registry = Registry::new();
-    let e = register_commands(&registry, &ws.root, "not a node name").unwrap_err();
+    let e = register_commands(&registry, &ws.root, "not a node name", &ws.install()).unwrap_err();
     assert!(e.to_string().contains("node"), "{e}");
     assert!(!registry.contains(&CommandId::new("files.list").unwrap()));
 }
@@ -1404,4 +1437,39 @@ fn a_listing_puts_directories_first_and_then_names_case_insensitively() {
         .unwrap();
     let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, vec!["banana", "Mango", "apple.md", "Zebra.md"]);
+}
+
+#[test]
+fn the_open_that_reads_a_file_refuses_a_named_pipe_swapped_in_after_the_stat() {
+    // `Root::read` and `read_range` stat the path and refuse anything that is
+    // not a regular file, then open it by name. A FIFO put in its place
+    // between the two used to block that open until a writer appeared, on a
+    // blocking-pool thread nothing can cancel; the thumbnailer reads the same
+    // way. So the open itself must not wait, and must refuse what it finds.
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("swapped.png");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path; mkfifo only reads it.
+    assert_eq!(
+        unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+        0,
+        "mkfifo failed"
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let at = fifo.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(deckjack_core::files::OsFs.read_range(&at, 0, 1024));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(read) => {
+            let e = read.expect_err("a named pipe was read as a file");
+            assert!(e.to_string().contains("not a regular file"), "{e}");
+        }
+        Err(_) => {
+            // Release the blocked open so the thread can finish, then fail.
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("reading a file blocked on a named pipe");
+        }
+    }
 }

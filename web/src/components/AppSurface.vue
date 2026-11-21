@@ -17,7 +17,7 @@ const props = defineProps<{ window: ShellWindow; compact?: boolean }>();
 
 const shell = useShell();
 const contract = computed(() => shell.windows.contract(props.window));
-const panel = computed(() => panelFor(props.window.app, props.window.appId));
+const panel = computed(() => panelFor(props.window.appId, shell.apps.isInstalled));
 const reason = computed(() =>
   shell.bus.detached.value
     ? "The shell node's command bus is not connected, so no app has registered."
