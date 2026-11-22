@@ -205,6 +205,13 @@ export function createWindows(bus: Bus, env: WindowsEnv, apps: AppTable): Window
   // operator never chose.
   const layout = ref<LayoutMode>(env.storage.read(LAYOUT_KEY) === "tiling" ? "tiling" : "floating");
   let launches = 0;
+  /**
+   * Windows opened here whose `shell.window.open` the node has not answered
+   * yet. A list from the node that predates the open — the snapshot handed
+   * over with the seat can cross it on the wire — does not know them, and
+   * must not take them away.
+   */
+  const opening = new Set<string>();
 
   function list(): ShellWindow[] {
     return order.value.flatMap((id) => {
@@ -381,7 +388,12 @@ export function createWindows(bus: Bus, env: WindowsEnv, apps: AppTable): Window
       // The cascade position above is still computed and still recorded: it is
       // what the window goes back to when tiling is turned off, and it is what
       // the other device class uses, which does not share this mode.
-      await record("shell.window.open", { app, id, ...rect });
+      opening.add(id);
+      try {
+        await record("shell.window.open", { app, id, ...rect });
+      } finally {
+        opening.delete(id);
+      }
       arrange(true);
       // Until an app backend exists there is nothing to wait for, so the
       // skeleton would never clear. The server's `windows` event is what will
@@ -592,6 +604,10 @@ export function createWindows(bus: Bus, env: WindowsEnv, apps: AppTable): Window
           existing.loading = false;
           continue;
         }
+        // The app's own minimum where the shell knows the app: the node
+        // keeps a width only, and a window another device opened should
+        // resize here the way one opened here does.
+        const known = apps.contract(w.app).minSize;
         byId.set(w.id, {
           id: w.id,
           app: w.app,
@@ -604,16 +620,35 @@ export function createWindows(bus: Bus, env: WindowsEnv, apps: AppTable): Window
           restore: null,
           snap: null,
           loading: false,
-          minSize: { w: w.minWidth, h: w.minHeight },
+          minSize: { w: Math.max(known.w, w.minWidth), h: Math.max(known.h, w.minHeight) },
         });
       }
+      // Kept: a window still being opened here, which the node's list may
+      // simply predate. It stays on top, where it was opened.
+      const pending = order.value.filter((id) => opening.has(id) && !seen.has(id));
       for (const id of [...byId.keys()]) {
-        if (!seen.has(id)) byId.delete(id);
+        if (!seen.has(id) && !opening.has(id)) byId.delete(id);
       }
-      order.value = [...seen].sort((a, b) => (byId.get(a)?.z ?? 0) - (byId.get(b)?.z ?? 0));
+      order.value = [
+        ...[...seen].sort((a, b) => (byId.get(a)?.z ?? 0) - (byId.get(b)?.z ?? 0)),
+        ...pending,
+      ];
       focusHistory.value = focusHistory.value.filter((id) => seen.has(id));
+      // A split whose half the node no longer lists is gone, as `close`
+      // ends it: the compact view draws a split only when both halves
+      // resolve, and would otherwise show nothing at all.
+      const pair = split.value;
+      if (pair && !(byId.has(pair.left) && byId.has(pair.right))) split.value = null;
       if (focusedId.value && !seen.has(focusedId.value)) {
         focusedId.value = focusHistory.value[0] ?? null;
+      }
+      // Windows this device has never focused (another device opened them,
+      // and this one has just taken the seat) are remembered top first, so
+      // the compact view, which shows the most recent, has one to show.
+      const unknown = [...order.value].reverse().filter((id) => !focusHistory.value.includes(id));
+      focusHistory.value = [...focusHistory.value, ...unknown];
+      if (!focusedId.value) {
+        focusedId.value = focusHistory.value.find((id) => !byId.get(id)?.minimized) ?? null;
       }
     },
   };

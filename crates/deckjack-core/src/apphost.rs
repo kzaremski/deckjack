@@ -763,6 +763,14 @@ async fn pump(
                     }
                     Ok(AppFrame::Progress { id, fraction, message }) => {
                         if let Some((progress, _)) = calls.get(&id) {
+                            // Progress on a live call is use. The dispatch
+                            // noted activity once, when it began; without
+                            // this an on-demand app with no window open is
+                            // stopped for idleness in the middle of a long
+                            // command (a video export) that is still
+                            // reporting. Counted even when the caller has
+                            // gone, because the app is still doing the work.
+                            invocations.host.host().note_activity(&app);
                             progress.step(fraction, message);
                         }
                     }

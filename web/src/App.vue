@@ -8,6 +8,7 @@ import ConnectionCard from "./components/ConnectionCard.vue";
 import QuickLook from "./components/QuickLook.vue";
 import DesktopShell from "./components/DesktopShell.vue";
 import NoticeStack from "./components/NoticeStack.vue";
+import SeatTakeover from "./components/SeatTakeover.vue";
 import TopBar from "./components/TopBar.vue";
 import WindowSwitcher from "./components/WindowSwitcher.vue";
 import { provideShell, type Shell } from "./shell/context.ts";
@@ -45,6 +46,9 @@ function onKeyDown(event: KeyboardEvent) {
   }
   const command = shell.keyboard.resolve(event);
   if (!command) return;
+  // Another device has the workspace: nothing a shortcut names could run,
+  // except the kill switch, which the node runs for any signed-in device.
+  if (!shell.seat.showWorkspace.value && command !== "system.lockdown") return;
   event.preventDefault();
   event.stopPropagation();
   void shell.commands.dispatch(command);
@@ -99,12 +103,22 @@ watch(
       one bar for both: compact used to carry its own header as well, which
       meant a phone spent two rows of a short screen saying where it was.
     -->
-    <TopBar />
-    <DesktopShell v-if="shell.viewport.mode.value === 'desktop'" />
-    <CompactShell v-else />
+    <!--
+      The workspace only while this connection may use it (the single seat:
+      crates/deckjack-core/src/seat.rs). Another device holding it replaces
+      the workspace with the takeover screen rather than covering it, so the
+      panels unmount and stop polling for terminals they no longer own, and
+      remount — and reattach — when the seat comes back.
+    -->
+    <template v-if="shell.seat.showWorkspace.value">
+      <TopBar />
+      <DesktopShell v-if="shell.viewport.mode.value === 'desktop'" />
+      <CompactShell v-else />
 
-    <CommandPalette />
-    <WindowSwitcher />
+      <CommandPalette />
+      <WindowSwitcher />
+    </template>
+    <SeatTakeover v-else />
     <NoticeStack />
     <!--
       Above the dialogs and below the connection card: a preview covers the

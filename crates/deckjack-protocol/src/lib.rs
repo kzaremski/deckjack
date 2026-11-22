@@ -397,10 +397,15 @@ impl UiNeeds {
 /// - `system`: approvals, grants, lockdown and recovery codes (D5: all of it).
 /// - `shell`: shell operations go only through the broker's own `shell` op.
 /// - `auth`: sign-in, sessions and passkeys.
+/// - `seat`: which device is using the workspace. A window that could take
+///   the seat could move the operator's terminals to its own session. This
+///   covers `as_app` calls; an app UI's own socket, which is a plain browser
+///   connection, is refused the seat's commands by the core's seat itself
+///   (`deckjack-core/src/seat.rs`, "Devices and attendants").
 ///
 /// One constant, applied to commands **and** event topics: in manifest
 /// validation here, and again by the core at dispatch.
-pub const HARD_DENY: &[&str] = &["terminal", "system", "shell", "auth"];
+pub const HARD_DENY: &[&str] = &["terminal", "system", "shell", "auth", "seat"];
 
 /// Whether a command id or an event topic falls under [`HARD_DENY`].
 ///
@@ -421,7 +426,7 @@ pub fn is_hard_denied(id: &str) -> bool {
 /// `files.*`. Every namespace the core registers must be in this list;
 /// `deckjack-core`'s tests check that against the core's real registry.
 pub const RESERVED_NAMESPACES: &[&str] = &[
-    "auth", "editor", "files", "git", "shell", "system", "terminal",
+    "auth", "editor", "files", "git", "seat", "shell", "system", "terminal",
 ];
 
 /// Whether `name` is a core namespace no app may take.

@@ -1,0 +1,89 @@
+# The Office app: read, comment on and export office documents.
+#
+# Lane 6a (docs/lanes/6-office.md). Pages come from LibreOffice, loaded as
+# LibreOfficeKit in a worker process this app spawns per job; the worker
+# inherits this app's Landlock and seccomp confinement and adds its own
+# memory, CPU and wall-clock limits. The reading view and comments are this
+# app's own OOXML reader and patcher: a comment is added by rewriting only
+# the parts of the package that must change and copying every other entry
+# byte for byte. Nothing here runs in the core.
+#
+# Its name `office` is not a core namespace (APP-UI-ISOLATION §4.6).
+
+[app]
+name = "office"
+version = "0.1.0"
+protocol = 1
+title = "Office"
+lifecycle = "on-demand"
+# The reading view and the comment sheet need this much; the page view is a
+# zoomable image and would go narrower.
+min_width = 360
+tag = "Of"
+summary = "Read, comment on and export office documents"
+default_width = 900
+default_height = 700
+
+# The folders documents arrive in. Not "." -- the validator refuses the
+# working directory itself, which would hand over `.deckjack/` with it. A
+# document anywhere else is refused with a message naming the folder to add,
+# until the core can pass one file's handle per call (the brief's platform
+# item (c), deferred).
+#
+# No gpu: LibreOffice probes /dev/dri and falls back to software rendering
+# when it is refused. No network of any kind.
+[needs]
+working_dir = [
+  { path = "Documents", write = true },
+  { path = "Downloads", write = true },
+]
+
+# What this app's window calls beyond its own commands: the folder listing
+# for the picker, and the trash, which is what makes "save over the
+# original" undoable (the original goes to the trash before the commented
+# copy takes its name). Nothing here deletes for good.
+[ui]
+invoke = ["files.list", "files.trash"]
+
+[[commands]]
+id = "office.open"
+summary = "Describe an office document and what editing it would keep"
+risk = "read"
+
+[[commands]]
+id = "office.pages"
+summary = "Lay out a document as pages and count them"
+risk = "read"
+
+[[commands]]
+id = "office.page.render"
+summary = "Render one page of a document as an image"
+risk = "read"
+
+[[commands]]
+id = "office.text"
+summary = "A document's text, with its comments and tracked changes marked"
+risk = "read"
+
+[[commands]]
+id = "office.cancel"
+summary = "Stop a page layout or export that is still running"
+risk = "read"
+
+# Writes a new file beside the document; never overwrites one.
+[[commands]]
+id = "office.comment.add"
+summary = "Add a comment, or a reply, to a Word document"
+risk = "write"
+
+# Takes the original's name for a prepared copy, and only once the original
+# is gone (in the trash): it refuses while anything is at that name.
+[[commands]]
+id = "office.save.inplace"
+summary = "Give a commented copy its original's name"
+risk = "write"
+
+[[commands]]
+id = "office.export_pdf"
+summary = "Export a document as a PDF beside it"
+risk = "write"

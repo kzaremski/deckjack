@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Office</title>
+    <link rel="stylesheet" href="/kit/kit.css" />
+    <style>
+      .dj-bar {
+        flex-wrap: wrap;
+        row-gap: 0.25rem;
+      }
+      .group {
+        display: flex;
+        gap: 0.25rem;
+        align-items: center;
+      }
+      #title {
+        overflow: hidden;
+        max-width: 40vw;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .dj-button {
+        min-height: var(--dj-touch, 2rem);
+      }
+      .dj-button[aria-pressed="true"] {
+        border-color: var(--dj-color-accent, #7aa2f7);
+        color: var(--dj-color-accent, #7aa2f7);
+      }
+      #page-now {
+        width: 3.5rem;
+        min-height: var(--dj-touch, 2rem);
+        border: 1px solid var(--dj-color-border, #2a2e38);
+        border-radius: var(--dj-radius-sm, 4px);
+        background: var(--dj-color-surface, #16181d);
+        color: inherit;
+        font: inherit;
+        text-align: center;
+      }
+      main {
+        position: relative;
+        display: flex;
+        flex: 1;
+        min-height: 0;
+      }
+
+      /* Pages: one column, zoomed by a custom property so a pinch is a
+         style change and not a re-render. */
+      #pages {
+        flex: 1;
+        overflow: auto;
+        background: var(--dj-color-surface-sunken, #0f1115);
+        touch-action: pan-x pan-y;
+        overscroll-behavior: contain;
+      }
+      #column {
+        --zoom: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+        align-items: center;
+        width: calc((100% - 2rem) * var(--zoom) + 2rem);
+        min-width: 100%;
+        padding: 1rem;
+      }
+      .page {
+        width: 100%;
+        background: #fff;
+        box-shadow: 0 1px 4px rgb(0 0 0 / 40%);
+      }
+      .page img {
+        display: block;
+        width: 100%;
+        height: 100%;
+        user-select: none;
+        -webkit-user-select: none;
+        -webkit-touch-callout: none;
+      }
+
+      /* Reading: reflowing text with changes and comments marked. */
+      #reading {
+        flex: 1;
+        overflow: auto;
+        padding: 1rem;
+      }
+      #article {
+        max-width: 42rem;
+        margin: 0 auto;
+        font-size: var(--dj-text-md, 1rem);
+        line-height: 1.6;
+      }
+      .para {
+        margin: 0 0 0.75em;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .para.item {
+        position: relative;
+        padding-left: calc(1.5em + var(--level, 0) * 1.5em);
+      }
+      .para.item::before {
+        position: absolute;
+        left: calc(var(--level, 0) * 1.5em);
+        content: attr(data-marker);
+      }
+      ins {
+        color: var(--dj-color-success, #9ece6a);
+        text-decoration: underline;
+      }
+      del {
+        color: var(--dj-color-danger, #f7768e);
+        text-decoration: line-through;
+      }
+      .commented {
+        background: var(--dj-color-highlight, rgb(224 175 104 / 22%));
+        border-bottom: 2px solid var(--dj-color-warning, #e0af68);
+      }
+      .commented.lit,
+      .mark.lit {
+        background: var(--dj-color-warning, #e0af68);
+        color: #000;
+      }
+      .mark::after {
+        content: "\1F4AC";
+        font-size: 0.8em;
+      }
+      .object::before {
+        content: "[" attr(data-what) "]";
+        color: var(--dj-color-text-muted, #9aa0ad);
+        font-style: italic;
+      }
+      .table {
+        overflow-x: auto;
+        margin: 0 0 1em;
+      }
+      table {
+        border-collapse: collapse;
+      }
+      td {
+        padding: 0.25rem 0.5rem;
+        border: 1px solid var(--dj-color-border, #2a2e38);
+        vertical-align: top;
+      }
+      td .para {
+        margin: 0;
+      }
+
+      /* Comments: a side panel on wide screens, a sheet over the text on
+         narrow ones. */
+      #comments {
+        flex: none;
+        width: 18rem;
+        overflow-y: auto;
+        border-left: 1px solid var(--dj-color-border, #2a2e38);
+        background: var(--dj-color-surface-raised, #1b1e25);
+      }
+      @media (width <= 40rem) {
+        #comments {
+          position: absolute;
+          inset: auto 0 0 0;
+          width: auto;
+          max-height: 60%;
+          border-top: 1px solid var(--dj-color-border, #2a2e38);
+          border-left: 0;
+        }
+      }
+      .thread {
+        padding: 0.5rem 0.75rem;
+        border-bottom: 1px solid var(--dj-color-border, #2a2e38);
+        cursor: pointer;
+      }
+      .comment.reply {
+        margin-top: 0.5rem;
+        padding-left: 0.75rem;
+        border-left: 2px solid var(--dj-color-border, #2a2e38);
+      }
+      .who {
+        color: var(--dj-color-text-muted, #9aa0ad);
+        font-size: var(--dj-text-xs, 0.75rem);
+      }
+      .body {
+        white-space: pre-wrap;
+      }
+      .reply-button {
+        margin-top: 0.5rem;
+      }
+
+      #comment-button {
+        position: absolute;
+        right: 1rem;
+        bottom: calc(1rem + var(--keyboard, 0px));
+        z-index: 3;
+        padding: 0.5rem 1rem;
+        border-color: var(--dj-color-accent, #7aa2f7);
+        box-shadow: 0 2px 8px rgb(0 0 0 / 40%);
+      }
+      #composer {
+        position: absolute;
+        inset: auto 0 var(--keyboard, 0px) 0;
+        z-index: 4;
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+        padding: 0.75rem;
+        border-top: 1px solid var(--dj-color-border, #2a2e38);
+        background: var(--dj-color-surface-raised, #1b1e25);
+        box-shadow: 0 -4px 12px rgb(0 0 0 / 40%);
+      }
+      #composer-quote {
+        overflow: hidden;
+        max-height: 3em;
+        margin: 0;
+        color: var(--dj-color-text-muted, #9aa0ad);
+        font-style: italic;
+      }
+      #composer textarea,
+      #composer input,
+      #picker-path {
+        width: 100%;
+        min-height: var(--dj-touch, 2rem);
+        padding: 0.375rem 0.5rem;
+        border: 1px solid var(--dj-color-border, #2a2e38);
+        border-radius: var(--dj-radius-sm, 4px);
+        background: var(--dj-color-surface, #16181d);
+        color: inherit;
+        font: inherit;
+      }
+      #composer textarea {
+        min-height: 5rem;
+        resize: vertical;
+      }
+      .row {
+        display: flex;
+        gap: 0.5rem;
+        justify-content: flex-end;
+      }
+
+      #picker {
+        position: absolute;
+        inset: 0;
+        z-index: 5;
+        display: flex;
+        flex-direction: column;
+        background: var(--dj-color-surface, #16181d);
+      }
+      #picker .row {
+        padding: 0.5rem 0.75rem;
+      }
+      #picker-list {
+        flex: 1;
+        overflow-y: auto;
+      }
+      #keeps {
+        margin: 0;
+        padding: 0.25rem 0.75rem;
+        color: var(--dj-color-text-muted, #9aa0ad);
+        font-size: var(--dj-text-xs, 0.75rem);
+      }
+      #keeps:empty {
+        display: none;
+      }
+      .dj-status[data-kind="error"] {
+        color: var(--dj-color-danger, #f7768e);
+      }
+      [hidden] {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="dj-bar">
+      <div class="group">
+        <button class="dj-button" id="open">Open</button>
+        <h1 class="dj-title" id="title">Office</h1>
+      </div>
+      <div class="group" role="group" aria-label="View">
+        <button class="dj-button" id="view-pages" aria-pressed="true">Pages</button>
+        <button class="dj-button" id="view-read" aria-pressed="false" hidden>Read</button>
+      </div>
+      <div class="group" role="group" aria-label="Page">
+        <button class="dj-button" id="prev" aria-label="Previous page">‹</button>
+        <input id="page-now" type="number" min="1" value="1" inputmode="numeric" aria-label="Go to page" />
+        <span>/ <span id="page-count">0</span></span>
+        <button class="dj-button" id="next" aria-label="Next page">›</button>
+      </div>
+      <div class="group" role="group" aria-label="Zoom">
+        <button class="dj-button" id="zoom-out" aria-label="Zoom out">−</button>
+        <button class="dj-button" id="zoom-fit" aria-label="Fit width">100%</button>
+        <button class="dj-button" id="zoom-in" aria-label="Zoom in">+</button>
+      </div>
+      <span class="dj-spacer"></span>
+      <div class="group">
+        <button class="dj-button" id="comments-toggle" hidden>Comments</button>
+        <button class="dj-button" id="save-over" hidden>Save over original</button>
+        <button class="dj-button" id="export">Export PDF</button>
+      </div>
+    </header>
+    <p id="keeps"></p>
+
+    <main>
+      <div id="pages" aria-label="Pages"><div id="column"></div></div>
+      <div id="reading" hidden><article id="article" aria-label="Document text"></article></div>
+      <aside id="comments" aria-label="Comments" hidden><div id="comment-list"></div></aside>
+
+      <button class="dj-button" id="comment-button" hidden>Comment</button>
+
+      <div id="composer" role="dialog" aria-label="Add a comment" hidden>
+        <p id="composer-quote"></p>
+        <textarea id="composer-text" placeholder="Comment" aria-label="Comment"></textarea>
+        <input id="composer-author" type="text" placeholder="Your name" aria-label="Your name" autocomplete="name" />
+        <div class="row">
+          <button class="dj-button" id="composer-cancel">Cancel</button>
+          <button class="dj-button" id="composer-save">Save comment</button>
+        </div>
+      </div>
+
+      <div id="picker" hidden>
+        <div class="row">
+          <input id="picker-path" type="text" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Path" />
+          <button class="dj-button" id="picker-go">Go</button>
+          <button class="dj-button" id="picker-close">Cancel</button>
+        </div>
+        <div id="picker-list" aria-label="Documents"></div>
+      </div>
+    </main>
+
+    <p class="dj-status" id="status" role="status">Loading…</p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

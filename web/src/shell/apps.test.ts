@@ -42,6 +42,16 @@ async function answer(rig: Harness, command: string, value: unknown) {
   await flushPromises();
 }
 
+/** The node says this connection holds the seat. */
+function seated(rig: Harness) {
+  rig.socket().deliver({
+    type: "event",
+    topic: "seat",
+    payload: { held: true, claimable: false, holder: { device: "here", since_ms: 0, connected: true } },
+    at_ms: 0,
+  });
+}
+
 async function withPhotoInstalled(): Promise<Harness> {
   const rig = harness();
   rig.connect();
@@ -130,6 +140,12 @@ describe("a launch shortcut", () => {
 
     rig.connect();
     await flushPromises();
+    // Connected is not enough: the workspace is not this device's until the
+    // node says it holds the seat, and a window opened before then would be
+    // overwritten by the snapshot that comes with it.
+    expect(invokes(rig, "shell.window.open"), "opened before the seat was this device's").toHaveLength(0);
+    seated(rig);
+    await flushPromises();
     const opened = invokes(rig, "shell.window.open");
     expect(opened.map((f) => (f.params as Record<string, unknown>).app)).toEqual(["terminal"]);
   });
@@ -138,6 +154,7 @@ describe("a launch shortcut", () => {
     const rig = harness();
     openWhenReady(rig.shell, "photo");
     rig.connect();
+    seated(rig);
     await flushPromises();
     expect(invokes(rig, "shell.window.open"), "opened before the app was known").toHaveLength(0);
 
@@ -151,6 +168,7 @@ describe("a launch shortcut", () => {
     rig.advance(60_000);
     expect(rig.sockets.length, "the bus never reconnected").toBeGreaterThan(1);
     rig.socket().open();
+    seated(rig);
     await flushPromises();
     await answer(rig, "system.apps", { apps: [photo] });
     const opened = [first, rig.socket()]
@@ -163,6 +181,7 @@ describe("a launch shortcut", () => {
     const rig = harness();
     openWhenReady(rig.shell, "nope");
     rig.connect();
+    seated(rig);
     await answer(rig, "system.apps", { apps: [photo] });
     expect(invokes(rig, "shell.window.open")).toHaveLength(0);
   });

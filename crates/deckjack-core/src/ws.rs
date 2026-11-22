@@ -54,6 +54,7 @@
 //! let ctx = ws::WsCtx::new(
 //!     auth,
 //!     bus,
+//!     Arc::new(ws::NoPresence),
 //!     Arc::clone(&hub),
 //!     clock,
 //!     node_id,
@@ -316,6 +317,12 @@ pub enum ClientFrame {
         /// identified. Never trusted for a decision.
         #[serde(default)]
         client: Option<String>,
+        /// What the operator calls this device ("Chrome on Pixel"), shown to
+        /// the other devices while this connection holds the single seat
+        /// (`crate::seat`). A label, not an identity: it is sanitized and
+        /// shown, and decides nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<String>,
     },
     /// Run a command. `id` is echoed on every frame that answers it.
     Invoke {
@@ -584,6 +591,32 @@ pub type Dispatched = Pin<Box<dyn Future<Output = Outcome> + Send + 'static>>;
 /// lookup method to drift out of step with what is registered.
 pub trait Dispatch: Send + Sync + 'static {
     fn dispatch(&self, call: Call, progress: ProgressSink) -> Dispatched;
+}
+
+/// Told when a connection finishes its handshake and when it ends.
+///
+/// The second thing this module reports outward, after calls. It exists for
+/// the single seat (`crate::seat`), which has to know which sockets are open
+/// and for which session, and which hears about one only once the version is
+/// agreed — a socket that never says hello is not a client. Like
+/// [`Dispatch`], a trait so this module knows nothing about what listens.
+///
+/// Both methods are called from the connection's own task and must not
+/// block: they run between frames.
+pub trait Presence: Send + Sync + 'static {
+    /// The handshake succeeded. `device` is the hello's label, unsanitized.
+    fn joined(&self, connection: ConnectionId, session: &SessionId, device: Option<&str>);
+    /// The connection ended, for whatever reason. Called once, and only for
+    /// a connection that `joined`.
+    fn left(&self, connection: ConnectionId);
+}
+
+/// A [`Presence`] that listens to nothing, for a transport tested on its own.
+pub struct NoPresence;
+
+impl Presence for NoPresence {
+    fn joined(&self, _connection: ConnectionId, _session: &SessionId, _device: Option<&str>) {}
+    fn left(&self, _connection: ConnectionId) {}
 }
 
 /// One invocation, as the bus receives it.
@@ -1040,6 +1073,28 @@ impl Hub {
         sent
     }
 
+    /// Push an event to one connection. Returns whether it was queued.
+    ///
+    /// For what differs per connection (whether *this* socket holds the
+    /// seat) and for what only one connection needs (the window snapshot a
+    /// connection is handed when it takes the seat). Droppable like any
+    /// event.
+    pub fn send_to(
+        &self,
+        connection: ConnectionId,
+        topic: impl Into<String>,
+        payload: Value,
+    ) -> bool {
+        let frame = ServerFrame::Event {
+            topic: topic.into(),
+            payload,
+            at_ms: millis_since_epoch(self.clock.as_ref()),
+        };
+        self.connections()
+            .get(&connection)
+            .is_some_and(|conn| conn.out.try_send(Outbound::Frame(frame)).is_ok())
+    }
+
     /// Push an event only to the connections belonging to one session.
     pub fn publish_to_session(
         &self,
@@ -1119,6 +1174,7 @@ impl Hub {
 pub struct WsCtx {
     auth: Arc<Ctx>,
     dispatch: Arc<dyn Dispatch>,
+    presence: Arc<dyn Presence>,
     hub: Arc<Hub>,
     clock: Arc<dyn Clock>,
     node_id: String,
@@ -1127,9 +1183,14 @@ pub struct WsCtx {
 }
 
 impl WsCtx {
+    // Required rather than a builder, like every port of the bus: a
+    // transport assembled without `presence` would have no seat holder, and
+    // that is not something a test of the transport alone would notice.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         auth: Arc<Ctx>,
         dispatch: Arc<dyn Dispatch>,
+        presence: Arc<dyn Presence>,
         hub: Arc<Hub>,
         clock: Arc<dyn Clock>,
         node_id: String,
@@ -1139,6 +1200,7 @@ impl WsCtx {
         Arc::new(WsCtx {
             auth,
             dispatch,
+            presence,
             hub,
             clock,
             node_id,
@@ -1346,9 +1408,17 @@ async fn serve(ctx: Arc<WsCtx>, mut socket: WebSocket, peer: Peer) {
         .register(peer.session.clone(), out.clone(), Arc::clone(&registry));
     tracing::info!(%conn, ip = %peer.ip, "ws open");
 
-    let ending = match handshake(&ctx, &mut socket, conn).await {
-        Ok(()) => pump(&ctx, &mut socket, &mut rx, &out, &registry, &peer, conn).await,
-        Err(e) => e,
+    let (ending, joined) = match handshake(&ctx, &mut socket, conn).await {
+        Ok(device) => {
+            // After the welcome is on the wire and before any frame is read,
+            // so whatever presence pushes in answer (the seat, a window
+            // snapshot) is queued behind the welcome and ahead of every
+            // response.
+            ctx.presence.joined(conn, &peer.session, device.as_deref());
+            let ending = pump(&ctx, &mut socket, &mut rx, &out, &registry, &peer, conn).await;
+            (ending, true)
+        }
+        Err(e) => (e, false),
     };
 
     // Order matters: stop accepting work and cancel what is running before
@@ -1356,6 +1426,9 @@ async fn serve(ctx: Arc<WsCtx>, mut socket: WebSocket, peer: Peer) {
     // silently closed channel.
     registry.cancel_all();
     ctx.hub.unregister(conn);
+    if joined {
+        ctx.presence.left(conn);
+    }
 
     tracing::info!(%conn, code = ending.code(), reason = %ending, "ws closed");
     if ending.worth_announcing() {
@@ -1384,11 +1457,12 @@ fn fits_in_close_frame(reason: &str) -> Utf8Bytes {
     Utf8Bytes::from(reason[..end].to_string())
 }
 
+/// Agree the version. Returns the hello's device label.
 async fn handshake(
     ctx: &Arc<WsCtx>,
     socket: &mut WebSocket,
     conn: ConnectionId,
-) -> Result<(), Ending> {
+) -> Result<Option<String>, Ending> {
     let timeout = ctx.settings.handshake_timeout;
     let first = tokio::time::timeout(timeout, socket.recv())
         .await
@@ -1412,7 +1486,12 @@ async fn handshake(
 
     let frame: ClientFrame =
         serde_json::from_str(&text).map_err(|e| Ending::BadFrame(e.to_string()))?;
-    let ClientFrame::Hello { protocol, client } = frame else {
+    let ClientFrame::Hello {
+        protocol,
+        client,
+        device,
+    } = frame
+    else {
         return Err(Ending::BadFrame(
             "first frame must be hello; nothing is accepted before the version is agreed".into(),
         ));
@@ -1428,7 +1507,8 @@ async fn handshake(
         node_id: ctx.node_id.clone(),
         host_name: ctx.host_name.clone(),
     };
-    send_now(socket, &welcome).await
+    send_now(socket, &welcome).await?;
+    Ok(device)
 }
 
 /// Write one frame straight to the socket, bypassing the queue. Only used

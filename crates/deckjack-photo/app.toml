@@ -1,0 +1,95 @@
+# The Photos app: a non-destructive developer for JPEG, PNG, TIFF and RAW.
+#
+# This file is the single source of truth about what the app is: the binary
+# embeds it and registers exactly what it declares, and the core compares
+# that registration against its own copy of this file.
+#
+# The design, the spikes behind it and what is deferred are in
+# docs/lanes/5a-photo.md; the sidecar and the pipeline math are in
+# docs/formats/photo-edit-v1.md.
+
+[app]
+name = "photo"
+version = "0.1.0"
+protocol = 1
+title = "Photos"
+lifecycle = "on-demand"
+# The curves editor needs 280 px of square to drag a point reliably; with
+# the gutters that is a 360 px window.
+min_width = 360
+tag = "Ph"
+summary = "Develop photos and RAW files, non-destructively"
+default_width = 900
+default_height = 620
+
+# Photos under `Photos/` in the working directory, read and written. Write
+# is needed for the sidecars beside the photos and for exports, and it means
+# the process *could* overwrite an original: Landlock's rights cannot allow
+# an atomic sidecar rename and forbid replacing a photo in the same folder.
+# "Never writes an original" is therefore a tested property of the app
+# (tests/original.rs), not something the sandbox enforces. No network, no
+# ports, no GPU: the GPU that matters is the viewer's, through WebGL2.
+[needs]
+working_dir = [{ path = "Photos", write = true }]
+
+# Reads. Nothing here touches a file.
+
+[[commands]]
+id = "photo.list"
+summary = "List photos in a folder"
+risk = "read"
+
+[[commands]]
+id = "photo.open"
+summary = "Open a photo: size, camera, and its edit"
+risk = "read"
+
+[[commands]]
+id = "photo.proxy"
+summary = "A photo's unadjusted preview image"
+risk = "read"
+
+[[commands]]
+id = "photo.lut"
+summary = "Bake an edit into preview lookup tables"
+risk = "read"
+
+[[commands]]
+id = "photo.render"
+summary = "Render an edit at preview size"
+risk = "read"
+
+[[commands]]
+id = "photo.preview.embedded"
+summary = "The camera's own preview inside a RAW"
+risk = "read"
+
+[[commands]]
+id = "photo.describe"
+summary = "Describe a photo's edit, histogram and clipping"
+risk = "read"
+
+# Writes. None is destructive or outbound: the original is never written, a
+# sidecar save is undoable through the history it carries, and an export
+# creates a new file and never replaces one. So an agent can edit and export
+# without going through the Inbox; that is deliberate (APP-SUITE.md §11).
+
+[[commands]]
+id = "photo.edit.save"
+summary = "Save an edit to the photo's sidecar"
+risk = "write"
+
+[[commands]]
+id = "photo.edit.step"
+summary = "Undo or redo an edit"
+risk = "write"
+
+[[commands]]
+id = "photo.export"
+summary = "Export an edited photo as a new JPEG or 16-bit TIFF"
+risk = "write"
+
+[[commands]]
+id = "photo.export.cancel"
+summary = "Stop an export in progress"
+risk = "write"

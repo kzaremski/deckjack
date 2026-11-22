@@ -1477,7 +1477,12 @@ mod tests {
             .into_iter()
             .map(|a| a.name)
             .collect();
-        assert_eq!(names, vec!["filer", "notes", "scribe", "tasks"]);
+        assert_eq!(
+            names,
+            vec![
+                "filer", "notes", "office", "photo", "scribe", "tasks", "video"
+            ]
+        );
         let _ = fs::remove_dir_all(root);
     }
 

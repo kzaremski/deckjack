@@ -1,0 +1,235 @@
+/*
+ * The Video app's layout. Phone portrait is stacked: monitor, transport,
+ * timeline, toolbars. From 600 px the bin docks beside the monitor. Every
+ * value is a design token with a fallback, so the app follows the desktop's
+ * theme; the timeline canvas reads the same tokens when it draws.
+ */
+
+:root {
+  --dj-video-clip: #3d5a80;
+  --dj-audio-clip: #3f6e5a;
+  --dj-video-marker: #e0af68;
+  --dj-video-playhead: #f7768e;
+}
+
+body {
+  overflow-y: auto;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+.narrow {
+  display: none;
+  margin: var(--dj-space-4, 1rem);
+}
+
+/* Below the minimum width the app says so rather than shrinking. */
+@media (width < 360px) {
+  .narrow {
+    display: block;
+  }
+  body > :not(.narrow) {
+    display: none !important;
+  }
+}
+
+main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.stage {
+  display: flex;
+  flex: none;
+  gap: var(--dj-space-2, 0.5rem);
+}
+
+.viewer {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.monitor {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  max-height: 45vh;
+  background: #000;
+}
+
+.monitor img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  margin: 0;
+  color: var(--dj-color-text-muted, #9aa0ad);
+}
+
+.overlay {
+  position: absolute;
+  right: var(--dj-space-2, 0.5rem);
+  bottom: var(--dj-space-2, 0.5rem);
+  padding: 0 var(--dj-space-1, 0.25rem);
+  border-radius: var(--dj-radius-sm, 4px);
+  background: rgb(0 0 0 / 60%);
+  color: #fff;
+  font-family: var(--dj-font-mono, ui-monospace, monospace);
+  font-size: var(--dj-text-xs, 0.75rem);
+}
+
+.transport,
+.toolbar,
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--dj-space-1, 0.25rem);
+  align-items: center;
+  padding: var(--dj-space-1, 0.25rem) var(--dj-space-2, 0.5rem);
+}
+
+.transport .dj-button,
+.toolbar .dj-button {
+  min-width: var(--dj-touch, 2.5rem);
+  min-height: var(--dj-touch, 2.5rem);
+}
+
+.tc,
+.field {
+  min-height: var(--dj-touch, 2.5rem);
+  padding: 0 var(--dj-space-2, 0.5rem);
+  border: 1px solid var(--dj-color-border, #2a2e38);
+  border-radius: var(--dj-radius-sm, 4px);
+  background: var(--dj-color-surface-raised, #1b1e25);
+  color: var(--dj-color-text, #e7e9ee);
+  font: inherit;
+}
+
+.tc {
+  width: 7.5rem;
+  font-family: var(--dj-font-mono, ui-monospace, monospace);
+  text-align: center;
+}
+
+.field {
+  flex: 1;
+  min-width: 10rem;
+}
+
+.toggle[aria-pressed="true"] {
+  background: var(--dj-color-selection, #2d3344);
+  outline: 1px solid var(--dj-color-accent, #7aa2f7);
+}
+
+.timeline-wrap {
+  flex: none;
+  border-top: 1px solid var(--dj-color-border, #2a2e38);
+  border-bottom: 1px solid var(--dj-color-border, #2a2e38);
+}
+
+#timeline {
+  display: block;
+  width: 100%;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.nudge .label {
+  color: var(--dj-color-text-muted, #9aa0ad);
+  font-family: var(--dj-font-mono, ui-monospace, monospace);
+  font-size: var(--dj-text-xs, 0.75rem);
+}
+
+/* The bin: a sheet on a phone, docked beside the monitor from 600 px. */
+.bin {
+  display: none;
+  flex-direction: column;
+  width: 16rem;
+  max-height: 45vh;
+  overflow-y: auto;
+  border-right: 1px solid var(--dj-color-border, #2a2e38);
+}
+
+.bin.open {
+  display: flex;
+}
+
+@media (width < 600px) {
+  .stage {
+    flex-direction: column;
+  }
+  .bin {
+    width: 100%;
+    border-right: 0;
+    border-bottom: 1px solid var(--dj-color-border, #2a2e38);
+  }
+}
+
+@media (width >= 600px) {
+  .bin {
+    display: flex;
+  }
+  #bin-toggle {
+    display: none;
+  }
+}
+
+.heading {
+  margin: var(--dj-space-2, 0.5rem) var(--dj-space-3, 0.75rem) var(--dj-space-1, 0.25rem);
+  color: var(--dj-color-text-muted, #9aa0ad);
+  font-size: var(--dj-text-xs, 0.75rem);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.list .dj-row {
+  min-height: var(--dj-touch, 2.5rem);
+  align-items: center;
+}
+
+.sheet {
+  padding: var(--dj-space-2, 0.5rem) 0;
+  border-bottom: 1px solid var(--dj-color-border, #2a2e38);
+  background: var(--dj-color-surface-raised, #1b1e25);
+}
+
+.hint {
+  margin: var(--dj-space-1, 0.25rem) var(--dj-space-3, 0.75rem);
+  color: var(--dj-color-text-muted, #9aa0ad);
+  font-size: var(--dj-text-xs, 0.75rem);
+}
+
+.check {
+  gap: var(--dj-space-2, 0.5rem);
+}
+
+.job {
+  display: flex;
+  gap: var(--dj-space-2, 0.5rem);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--dj-space-1, 0.25rem) var(--dj-space-3, 0.75rem);
+}
+
+.banner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--dj-space-2, 0.5rem);
+  align-items: center;
+  padding: var(--dj-space-2, 0.5rem) var(--dj-space-3, 0.75rem);
+  background: var(--dj-color-selection, #2d3344);
+}

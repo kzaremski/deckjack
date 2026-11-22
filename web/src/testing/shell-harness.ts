@@ -24,6 +24,7 @@ import { ShellKey, type Shell } from "../shell/context.ts";
 import { createBus, type BusEnv, type SocketLike } from "../stores/bus.ts";
 import { createCommands } from "../stores/commands.ts";
 import { createUi } from "../stores/ui.ts";
+import { closeOverlaysOnLoss, createDeviceLabel, createSeat, followWindows } from "../stores/seat.ts";
 import { createWindows } from "../stores/windows.ts";
 import { createThemeController } from "../tokens/index.ts";
 import { createKeyboard, DEFAULT_SHORTCUTS } from "../shell/keyboard.ts";
@@ -89,7 +90,7 @@ export class FakeSocket implements SocketLike {
   }
 }
 
-function memoryStorage() {
+export function memoryStorage() {
   const map = new Map<string, string>();
   return {
     read: (k: string) => map.get(k) ?? null,
@@ -119,6 +120,10 @@ export interface HarnessOptions {
   size?: { w: number; h: number };
   /** True for a touch device, which flips the shell to its compact mode. */
   coarsePointer?: boolean;
+  /** The user agent the device label defaults from. Default Firefox on Linux. */
+  userAgent?: string;
+  /** Per-device storage, to share between two harnesses as a reload would. */
+  storage?: { read(key: string): string | null; write(key: string, value: string): void };
 }
 
 export interface Harness {
@@ -150,7 +155,7 @@ export function harness(options: HarnessOptions = {}): Harness {
   const size = options.size ?? { w: 1600, h: 900 };
   /** Where a command asked the browser to go, instead of actually going. */
   const navigated: string[] = [];
-  const storage = memoryStorage();
+  const storage = options.storage ?? memoryStorage();
 
   const busEnv: BusEnv = {
     url: "wss://pocket.example.ts.net/ws",
@@ -176,7 +181,8 @@ export function harness(options: HarnessOptions = {}): Harness {
     },
   };
 
-  const bus = createBus(busEnv);
+  const device = createDeviceLabel(storage, options.userAgent ?? "Mozilla/5.0 (X11; Linux x86_64) Firefox/140.0");
+  const bus = createBus({ ...busEnv, device: () => device.label.value });
   const ui = createUi({
     delay(ms, fn) {
       const entry = { at: clock + ms, fn, dead: false };
@@ -229,6 +235,9 @@ export function harness(options: HarnessOptions = {}): Harness {
   const unbindApps = bindApps({ bus, commands, windows, apps });
   bindConfirmations({ bus, ui });
   const frames = createFrameBridge({ commands, origin: HARNESS_ORIGIN, apps });
+  const seat = createSeat({ bus, ui, device });
+  const unfollowWindows = followWindows({ bus, windows, seat });
+  const stopClosingOverlays = closeOverlaysOnLoss({ seat, ui, quicklook });
 
   const shell: Shell = {
     bus,
@@ -242,8 +251,12 @@ export function harness(options: HarnessOptions = {}): Harness {
     inboxPending,
     apps,
     frames,
+    seat,
     dispose() {
       unbindApps();
+      unfollowWindows();
+      stopClosingOverlays();
+      seat.dispose();
       viewport.stop();
       bus.close();
     },

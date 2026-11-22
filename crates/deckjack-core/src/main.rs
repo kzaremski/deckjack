@@ -414,6 +414,19 @@ fn main() -> anyhow::Result<()> {
     // Signing out kills the shells that session opened. A pty is a process
     // running as the host user; leaving one behind after the browser that
     // asked for it has gone is a shell nobody is watching.
+    // The single seat: one connection using the workspace at a time, any
+    // signed-in device able to take it over. The terminals and the windows
+    // follow it — the shells change owner and the windows are handed to the
+    // device that takes it. The same seat is the transport's presence (who
+    // is connected) and the dispatcher's gate (who may run anything). Built
+    // before the sign-in context so an ended session frees it too.
+    let hub = ws::Hub::new(Arc::new(ws::SystemClock));
+    let seat = deckjack_core::seat::Seat::new(
+        Arc::clone(&hub),
+        Arc::new(ws::SystemClock),
+        vec![Arc::clone(&terminals) as _, Arc::clone(&windows) as _],
+    );
+    let seat_reaper = Arc::clone(&seat);
     let reaper = Arc::clone(&terminals);
     let sign_in_store = Arc::clone(&store);
     let sign_in_watchdog = Arc::clone(&watchdog);
@@ -430,6 +443,7 @@ fn main() -> anyhow::Result<()> {
             node_id.clone(),
         )
         .on_session_end(move |hash| reaper.close_for_session(hash))
+        .on_session_end(move |hash| seat_reaper.session_ended(hash))
         .on_sign_in(move |ip| {
             let now = std::time::SystemTime::now();
             let known = {
@@ -583,13 +597,17 @@ fn main() -> anyhow::Result<()> {
     wiring::register_apps(&registry, Arc::clone(&app_host))
         .context("cannot register the app commands")?;
 
+    deckjack_core::seat::register(&registry, &seat).context("cannot register the seat commands")?;
+
     let ws_ctx = ws::WsCtx::new(
         Arc::clone(&ctx),
         BusDispatch::new(
             Arc::clone(&bus),
             deckjack_core::ticket::Tickets::new(Arc::new(ws::SystemClock)),
+            Arc::clone(&seat),
         ),
-        ws::Hub::new(Arc::new(ws::SystemClock)),
+        seat,
+        hub,
         Arc::new(ws::SystemClock),
         node_id.clone(),
         node::host_name(),

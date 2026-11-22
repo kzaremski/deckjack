@@ -1,0 +1,184 @@
+# The Video app: a cuts-and-audio editor. See docs/lanes/5d-video.md.
+#
+# This file is the single source of truth about what Video is: the binary
+# embeds it with include_str! and registers exactly what it declares, and the
+# core compares that registration against its own copy of this file.
+#
+# The engine is FilmCraft's, linked into this process (spike S2 in the lane
+# brief). Every edit is a command here with its own risk level; there is no
+# passthrough to FilmCraft's ~700 commands, because one risk level for all of
+# them would be wrong for most of them.
+#
+# Nothing here is destructive or outbound. Nothing leaves the machine, and
+# nothing that cannot be undone is offered: an edit has undo, a save keeps
+# the rolling Auto-Save copies, and an export never overwrites. Deleting a
+# project or media is Files' job, through the trash.
+
+[app]
+name = "video"
+version = "0.1.0"
+protocol = 1
+title = "Video"
+lifecycle = "on-demand"
+# One video and one audio track, editable, with a 16:9 monitor about 200 px
+# tall. Below this the app says it needs more room rather than shrinking.
+min_width = 360
+tag = "Vi"
+summary = "Cut and export video in the working directory"
+default_width = 1100
+default_height = 720
+
+# `Videos/` and nothing else. Footage elsewhere (a phone sync into Photos/)
+# is moved here with Files first; a second folder is a manifest change and a
+# re-approval, which is the intended friction.
+#
+# No GPU: FilmCraft's CPU renderer is the path this build links (its wgpu
+# crate is not a dependency), so asking for /dev/dri would be asking for
+# something unused. No network, no ports, no bus invocations, and no
+# [ui] invoke: the window calls only this app's own commands.
+[needs]
+working_dir = [{ path = "Videos", write = true }]
+
+[[commands]]
+id = "video.project.list"
+summary = "List video projects"
+risk = "read"
+
+[[commands]]
+id = "video.project.new"
+summary = "Create a video project"
+risk = "write"
+
+[[commands]]
+id = "video.project.open"
+summary = "Open a video project"
+risk = "read"
+
+# Write rather than destructive: earlier versions survive in the rolling
+# Auto-Save copies beside the project.
+[[commands]]
+id = "video.project.save"
+summary = "Save a video project and its OTIO sidecar"
+risk = "write"
+
+[[commands]]
+id = "video.project.recover"
+summary = "Recover a video project's unsaved changes after a crash"
+risk = "write"
+
+[[commands]]
+id = "video.project.describe"
+summary = "Describe a video project's tracks, clips and markers"
+risk = "read"
+
+# The app protocol has no app-emitted events, so a window long-polls this to
+# hear about edits made elsewhere (another window, an agent).
+[[commands]]
+id = "video.project.wait"
+summary = "Wait for a video project to change"
+risk = "read"
+
+[[commands]]
+id = "video.media.list"
+summary = "List media files in Videos/"
+risk = "read"
+
+[[commands]]
+id = "video.media.import"
+summary = "Import media into a video project's bin"
+risk = "write"
+
+[[commands]]
+id = "video.clip.insert"
+summary = "Insert a clip, pushing later clips along"
+risk = "write"
+
+[[commands]]
+id = "video.clip.overwrite"
+summary = "Overwrite the timeline with a clip"
+risk = "write"
+
+[[commands]]
+id = "video.clip.move"
+summary = "Move a clip"
+risk = "write"
+
+[[commands]]
+id = "video.clip.trim"
+summary = "Trim a clip's start or end"
+risk = "write"
+
+[[commands]]
+id = "video.clip.split"
+summary = "Split clips at a frame"
+risk = "write"
+
+[[commands]]
+id = "video.clip.lift"
+summary = "Remove clips, leaving a gap"
+risk = "write"
+
+[[commands]]
+id = "video.clip.ripple_delete"
+summary = "Remove clips and close the gap"
+risk = "write"
+
+[[commands]]
+id = "video.clip.link"
+summary = "Link clips together"
+risk = "write"
+
+[[commands]]
+id = "video.clip.unlink"
+summary = "Unlink clips from their partners"
+risk = "write"
+
+[[commands]]
+id = "video.clip.gain"
+summary = "Set clip audio gain"
+risk = "write"
+
+[[commands]]
+id = "video.marker.add"
+summary = "Add a timeline marker"
+risk = "write"
+
+[[commands]]
+id = "video.marker.move"
+summary = "Move or rename a timeline marker"
+risk = "write"
+
+[[commands]]
+id = "video.marker.remove"
+summary = "Remove a timeline marker"
+risk = "write"
+
+[[commands]]
+id = "video.edit.undo"
+summary = "Undo the last video edit"
+risk = "write"
+
+[[commands]]
+id = "video.edit.redo"
+summary = "Redo a video edit"
+risk = "write"
+
+[[commands]]
+id = "video.frame.render"
+summary = "Render a still of the program at a frame"
+risk = "read"
+
+[[commands]]
+id = "video.export.start"
+summary = "Export a video project to MP4"
+risk = "write"
+
+[[commands]]
+id = "video.export.cancel"
+summary = "Cancel a running export"
+risk = "write"
+
+[[commands]]
+id = "video.export.list"
+summary = "List exports and their progress"
+risk = "read"

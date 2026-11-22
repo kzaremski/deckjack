@@ -1,0 +1,46 @@
+[package]
+name = "deckjack-photo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Deckjack app: a non-destructive photo developer for JPEG, PNG, TIFF and camera RAW"
+
+[[bin]]
+name = "deckjack-photo"
+path = "src/main.rs"
+
+[lib]
+name = "deckjack_photo"
+path = "src/lib.rs"
+
+[dependencies]
+deckjack-app.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+image.workspace = true
+libc.workspace = true
+rust-embed.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+# Half floats for the 3D LUT the frame uploads as an RGB16F texture.
+half = "2.7.1"
+# Camera RAW. Pure Rust (DNGLab), LGPL-2.1. Its API is not SemVer-stable, so
+# it is pinned exactly; spike 3 in docs/lanes/5a-photo.md chose it.
+rawler = "=0.8.0"
+# TIFF in and 16-bit TIFF out. Used directly rather than through `image`'s
+# `tiff` feature, which would turn TIFF decoding on in the core's thumbnailer
+# too (cargo unifies a dependency's features across the workspace).
+tiff = "0.11.3"
+rayon = "1.11.0"
+# The sRGB ICC profile embedded in every export. Already in the tree through
+# `image`; pinned to the same version.
+moxcms = "0.8.1"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -124,9 +124,69 @@ pub struct Ctx {
     id: u64,
     out: mpsc::UnboundedSender<String>,
     bus: Bus,
+    cancel: Cancellation,
+}
+
+/// Whether a command has been asked to stop.
+///
+/// The core sends a `cancel` frame naming a call; the frame loop flips this
+/// for that call and nothing else. Cancellation is **cooperative**: the
+/// handler keeps running until it looks, and it decides what stopping means
+/// (an export deletes its partial file; a read just returns). A handler that
+/// never looks runs to its end, which is what every handler did before this
+/// existed.
+///
+/// Cheap to clone, and a clone can move into `spawn_blocking`, where the
+/// work that most needs stopping runs. An app may also call [`cancel`]
+/// itself, for a cancel that arrives as a command of its own.
+///
+/// [`cancel`]: Cancellation::cancel
+#[derive(Clone, Default)]
+pub struct Cancellation {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Cancellation {
+    pub fn new() -> Cancellation {
+        Cancellation::default()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Ask the command to stop. Idempotent.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    /// Resolves once cancelled; at once if it already was.
+    pub async fn cancelled(&self) {
+        loop {
+            // Registered before the flag is read, so a cancel landing between
+            // the two is not missed.
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl Ctx {
+    /// This call's cancellation. See [`Cancellation`].
+    pub fn cancellation(&self) -> &Cancellation {
+        &self.cancel
+    }
+
+    /// Shorthand for `cancellation().is_cancelled()`.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
     /// The command bus, to call commands of this core's own or of another
     /// app's. Needs the `invoke_commands` capability; see the crate doc.
     pub fn bus(&self) -> &Bus {
@@ -493,6 +553,15 @@ impl App {
                 path: path.clone(),
                 source,
             })?;
+        self.serve_on(stream, commands).await
+    }
+
+    /// The frame loop on an already-connected socket.
+    async fn serve_on(
+        self,
+        stream: UnixStream,
+        commands: Vec<RegisteredCommand>,
+    ) -> Result<(), AppError> {
         let (read, mut write) = stream.into_split();
         let mut reader = BufReader::new(read);
 
@@ -565,6 +634,9 @@ impl App {
         // an invocation in flight when the core goes away fails rather than
         // hanging.
         let _fail_pending = FailPending(Arc::clone(&bus.waiting));
+        // The cancellation of every call still running, by the core's id.
+        // Removed when the call answers, so a late cancel finds nothing.
+        let running: Arc<Mutex<HashMap<u64, Cancellation>>> = Arc::default();
 
         loop {
             let frame: CoreFrame = match read_frame(&mut reader).await {
@@ -594,20 +666,30 @@ impl App {
                         id,
                         out: out.clone(),
                         bus: bus.clone(),
+                        cancel: Cancellation::new(),
                     };
                     match handlers.get(&command) {
                         Some((handler, _)) => {
+                            running
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .insert(id, cx.cancel.clone());
                             // Spawned, so a slow command does not stop this
                             // loop reading the next one. An app that wants to
                             // serialize its own work does that inside its
                             // handlers.
                             let future = handler(params, cx.clone());
                             let out = out.clone();
+                            let running = Arc::clone(&running);
                             tokio::spawn(async move {
                                 let (result, error) = match future.await {
                                     Ok(value) => (Some(value), None),
                                     Err(message) => (None, Some(message)),
                                 };
+                                running
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .remove(&id);
                                 send(&out, &AppFrame::Result { id, result, error });
                             });
                         }
@@ -624,11 +706,25 @@ impl App {
                         ),
                     }
                 }
-                CoreFrame::Cancel { id: _ } => {
-                    // TODO(cancel): handlers have no cancellation signal yet,
-                    // so this is dropped rather than answered. Saying so here
-                    // beats a silent ignore: a cancel that does nothing is
-                    // the same bug the core has at its own wiring seam.
+                CoreFrame::Cancel { id } => {
+                    // Flips the call's signal and nothing else: the call
+                    // still answers with whatever its handler returns, so
+                    // the core hears exactly one result per call. An id that
+                    // is not running (finished, or never sent) is ignored.
+                    //
+                    // Not yet sent by the core: `apphost.rs` does not
+                    // forward a client's cancel to an app (see the photo
+                    // lane brief, "Deferred"). Until it does, an app that
+                    // must be cancellable from its UI also takes a cancel
+                    // command of its own and calls `Cancellation::cancel`.
+                    let cancel = running
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .get(&id)
+                        .cloned();
+                    if let Some(cancel) = cancel {
+                        cancel.cancel();
+                    }
                 }
                 CoreFrame::Ui { id, path } => {
                     let asset = assets
@@ -849,6 +945,138 @@ mod tests {
             .unwrap()
             .expect_err("an invocation survived the connection ending");
         assert!(matches!(error, CallError::Disconnected { .. }), "{error}");
+    }
+
+    /// A core on the other end of a socket pair, speaking frames.
+    struct FakeCore {
+        reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+        writer: tokio::net::unix::OwnedWriteHalf,
+    }
+
+    impl FakeCore {
+        async fn send(&mut self, frame: &CoreFrame) {
+            self.writer
+                .write_all(encode_frame(frame).unwrap().as_bytes())
+                .await
+                .unwrap();
+        }
+
+        async fn recv(&mut self) -> AppFrame {
+            let fut = read_frame::<AppFrame>(&mut self.reader);
+            tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+                .await
+                .expect("the app sent nothing within 5 s")
+                .unwrap()
+        }
+    }
+
+    const MANIFEST: &str = r#"
+[app]
+name = "demo"
+version = "0.1.0"
+protocol = 1
+title = "Demo"
+
+[[commands]]
+id = "demo.wait"
+summary = "Wait until cancelled"
+risk = "read"
+"#;
+
+    #[derive(serde::Deserialize, schemars::JsonSchema)]
+    struct NoParams {}
+
+    /// The app, serving one command that runs until it is cancelled (or
+    /// for at most ten seconds), and a fake core connected to it.
+    async fn waiting_app() -> FakeCore {
+        let app =
+            App::new(MANIFEST)
+                .unwrap()
+                .command("demo.wait", |_p: NoParams, cx: Ctx| async move {
+                    let stopped = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        cx.cancellation().cancelled(),
+                    )
+                    .await;
+                    match stopped {
+                        Ok(()) if cx.is_cancelled() => Err("cancelled".to_string()),
+                        _ => Ok(serde_json::json!("ran to the end")),
+                    }
+                });
+        let commands = app.registration().unwrap();
+        let (core, app_end) = UnixStream::pair().unwrap();
+        tokio::spawn(app.serve_on(app_end, commands));
+        let (read, writer) = core.into_split();
+        let mut core = FakeCore {
+            reader: BufReader::new(read),
+            writer,
+        };
+        core.send(&CoreFrame::Hello(deckjack_protocol::Hello {
+            protocol: PROTOCOL_VERSION,
+            core_version: "test".to_string(),
+            app: "demo".to_string(),
+        }))
+        .await;
+        assert!(matches!(core.recv().await, AppFrame::Register(_)));
+        core
+    }
+
+    fn call(id: u64) -> CoreFrame {
+        CoreFrame::Call {
+            id,
+            command: "demo.wait".to_string(),
+            params: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancel_frame_stops_only_the_call_it_names() {
+        // Two calls in flight; cancelling 2 must end 2 with the handler's
+        // own answer and leave 1 running. Before this, the frame was
+        // dropped and an export the operator cancelled ran to the end.
+        let mut core = waiting_app().await;
+        core.send(&call(1)).await;
+        core.send(&call(2)).await;
+        core.send(&CoreFrame::Cancel { id: 2 }).await;
+        let AppFrame::Result { id, result, error } = core.recv().await else {
+            panic!("expected a result");
+        };
+        assert_eq!((id, result, error.as_deref()), (2, None, Some("cancelled")));
+        // Call 1 is still running: nothing else answers for a while.
+        let quiet = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            read_frame::<AppFrame>(&mut core.reader),
+        )
+        .await;
+        assert!(quiet.is_err(), "call 1 answered too: {quiet:?}");
+        // A cancel for a call that is not running is ignored, not fatal.
+        core.send(&CoreFrame::Cancel { id: 99 }).await;
+        core.send(&CoreFrame::Cancel { id: 1 }).await;
+        let AppFrame::Result { id, error, .. } = core.recv().await else {
+            panic!("expected a result");
+        };
+        assert_eq!((id, error.as_deref()), (1, Some("cancelled")));
+    }
+
+    #[tokio::test]
+    async fn cancelled_resolves_for_a_cancel_before_or_during_the_wait() {
+        let early = Cancellation::new();
+        early.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), early.cancelled())
+            .await
+            .expect("an already-cancelled signal did not resolve");
+        let late = Cancellation::new();
+        let waiter = tokio::spawn({
+            let late = late.clone();
+            async move { late.cancelled().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!late.is_cancelled());
+        late.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("a cancel during the wait was missed")
+            .unwrap();
     }
 
     #[tokio::test]

@@ -32,6 +32,7 @@ pub mod passkeypage;
 pub mod proxy;
 pub mod registry;
 pub mod sandbox;
+pub mod seat;
 pub mod shell;
 pub mod space;
 pub mod store;

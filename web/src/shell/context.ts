@@ -5,6 +5,14 @@ import { createBus, browserBusEnv, type Bus } from "../stores/bus.ts";
 import { createCommands, type CommandsStore } from "../stores/commands.ts";
 import { createUi, browserUiEnv, type UiStore } from "../stores/ui.ts";
 import {
+  closeOverlaysOnLoss,
+  createDeviceLabel,
+  createSeat,
+  followWindows,
+  refineFromClientHints,
+  type SeatStore,
+} from "../stores/seat.ts";
+import {
   browserWindowsEnv,
   createWindows,
   type WindowsStore,
@@ -56,6 +64,8 @@ export interface Shell {
   apps: AppTable;
   /** Requests from app frames for shell-only things, such as Quick Look. */
   frames: FrameBridge;
+  /** Whether this connection is the one using the workspace. */
+  seat: SeatStore;
   dispose(): void;
 }
 
@@ -66,8 +76,15 @@ export function createShell(): Shell {
   const theme = createThemeController(browserThemeEnv());
   installTokenStylesheet(document);
 
-  const bus = createBus(browserBusEnv());
+  // The device's name rides on every hello, so it is read before the bus
+  // connects and from the same storage the operator renames it in.
+  const device = createDeviceLabel(storage, navigator.userAgent, {
+    touchPoints: navigator.maxTouchPoints,
+  });
+  refineFromClientHints(device, navigator);
+  const bus = createBus({ ...browserBusEnv(), device: () => device.label.value });
   const ui = createUi(browserUiEnv());
+  const seat = createSeat({ bus, ui, device });
   const apps = createAppTable();
   const windows = createWindows(bus, browserWindowsEnv(), apps);
   const commands = createCommands({ storage });
@@ -107,9 +124,6 @@ export function createShell(): Shell {
    */
   const offBus = bus.on((event) => {
     switch (event.kind) {
-      case "windows":
-        windows.adopt(event.windows);
-        break;
       case "commands":
         commands.adopt(event.commands, async (id, node) => {
           const outcome = await bus.call(id, {}, node);
@@ -128,7 +142,11 @@ export function createShell(): Shell {
           ui.notify("error", "This workspace is locked down. Unlock it on the host.");
         }
         break;
+      // Windows are followed by `followWindows`, below, which knows whether
+      // this connection holds the seat.
+      case "windows":
       case "node":
+      case "seat":
       // Progress is no longer an event: it is correlated to a call and
       // delivered to that call's own handler, so a stray one cannot be
       // attributed to the wrong command.
@@ -138,6 +156,8 @@ export function createShell(): Shell {
   });
 
   bindConfirmations({ bus, ui });
+  const unfollowWindows = followWindows({ bus, windows, seat });
+  const stopClosingOverlays = closeOverlaysOnLoss({ seat, ui, quicklook });
 
   bus.connect();
 
@@ -164,9 +184,13 @@ export function createShell(): Shell {
     inboxPending,
     apps,
     frames,
+    seat,
     dispose() {
       window.removeEventListener("message", onFrameMessage);
       unbindApps();
+      unfollowWindows();
+      stopClosingOverlays();
+      seat.dispose();
       offBus();
       viewport.stop();
       bus.close();

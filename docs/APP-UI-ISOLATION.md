@@ -210,7 +210,10 @@ Each app's inline `<script type="module">` moves into a file, such as
     later.
 - **`HARD_DENY`** is one constant in the protocol crate: `terminal.*`,
   `system.*` (D5; this includes lockdown and recovery codes), `shell.*`
-  (shell operations go only through the broker's `shell` op) and `auth.*`.
+  (shell operations go only through the broker's `shell` op), `auth.*` and
+  `seat.*` (which device is using the workspace; DESIGN.md "The single
+  seat"; an app UI's own `/kit/bus.js` socket, which this list does not
+  see, is refused the seat's commands by the seat itself).
   It applies to commands **and to event topics**. It is checked in four
   places:
   1. manifest validation, so a manifest naming a denied id or topic fails

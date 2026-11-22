@@ -14,6 +14,7 @@ import {
   type CorrelationId,
   type Progress,
   type ServerEvent,
+  type SeatStatus,
   type ServerFrame,
   type WireWindow,
 } from "../protocol.ts";
@@ -86,6 +87,12 @@ export interface BusEnv {
   online(): boolean;
   /** Subscribes to network up/down; returns an unsubscribe. */
   watchOnline(fn: (online: boolean) => void): () => void;
+  /**
+   * What to call this device in the hello, read at each connection so a
+   * rename reaches the next one. Optional: a bus without it sends none and
+   * the node names the device itself.
+   */
+  device?(): string;
 }
 
 export function browserBusEnv(path = "/ws"): BusEnv {
@@ -172,7 +179,7 @@ function flatten(id: CorrelationId, outcome: import("../protocol.ts").Outcome): 
     const refused = outcome.error.code === "refused";
     return refused
       ? { id, status: "refused", message: outcome.error.message }
-      : { id, status: "error", message: outcome.error.message };
+      : { id, status: "error", message: outcome.error.message, code: outcome.error.code };
   }
   const v = outcome.value as { status?: string; pending?: string } | null;
   if (v && typeof v === "object") {
@@ -205,6 +212,8 @@ function topicToEvent(topic: string, payload: unknown): ServerEvent {
       return { kind: "inbox", pending: (payload as { pending: number }).pending };
     case "lockdown":
       return { kind: "lockdown", active: (payload as { active: boolean }).active };
+    case "seat":
+      return { kind: "seat", seat: payload as SeatStatus };
     default:
       return { kind: "other", topic, payload };
   }
@@ -398,7 +407,13 @@ export function createBus(env: BusEnv): Bus {
       status.value = "open";
       lastError.value = null;
       retryAt.value = null;
-      send({ type: "hello", protocol: PROTOCOL_VERSION, client: "deckjack-shell" });
+      const device = env.device?.();
+      send({
+        type: "hello",
+        protocol: PROTOCOL_VERSION,
+        client: "deckjack-shell",
+        ...(device ? { device } : {}),
+      });
       startHeartbeat();
     };
 

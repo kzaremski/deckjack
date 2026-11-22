@@ -50,18 +50,60 @@ use crate::ws;
 /// It also holds the operator's confirmations: the bus says a call needs
 /// one, this issues the ticket, and only a `confirm` frame presenting that
 /// ticket on the same socket runs the call. See [`crate::ticket`].
+///
+/// And it holds the single seat's line (`crate::seat`): a call on a socket
+/// that does not hold the seat is refused here, before the bus, with
+/// [`crate::seat::NOT_HELD`]. Here because this is the one door a browser's
+/// session reaches the bus through — the shell's own calls and its app
+/// windows' (`as_app`) alike — and the paths that are not a browser using the
+/// workspace (the CLI, agents, the Inbox, app backends) never pass it.
 pub struct BusDispatch {
     bus: Arc<Bus>,
     tickets: Arc<crate::ticket::Tickets>,
+    seat: Arc<crate::seat::Seat>,
 }
 
 impl BusDispatch {
     /// `tickets` is required, not defaulted: a dispatcher built without the
     /// table could not confirm anything, and one that built its own would
-    /// not share the node's clock.
-    pub fn new(bus: Arc<Bus>, tickets: Arc<crate::ticket::Tickets>) -> Arc<BusDispatch> {
-        Arc::new(BusDispatch { bus, tickets })
+    /// not share the node's clock. `seat` likewise: the same seat the
+    /// transport reports connections to, or nobody would ever hold it.
+    pub fn new(
+        bus: Arc<Bus>,
+        tickets: Arc<crate::ticket::Tickets>,
+        seat: Arc<crate::seat::Seat>,
+    ) -> Arc<BusDispatch> {
+        Arc::new(BusDispatch { bus, tickets, seat })
     }
+}
+
+/// The refusal for a call on a socket that does not hold the seat. Says who
+/// does, and carries the seat's status as `detail` so the shell can draw its
+/// takeover screen from the refusal alone.
+fn seat_refusal(status: &crate::seat::Status) -> ws::CommandError {
+    let message = match &status.holder {
+        Some(holder) => format!(
+            "Deckjack is in use on {}. Take over on this device to use it here; nothing was run",
+            holder.device
+        ),
+        None => "this connection does not hold the seat; nothing was run".to_string(),
+    };
+    ws::CommandError::new(crate::seat::NOT_HELD, message).with_detail(status.to_json())
+}
+
+/// What the client is told about a command that ran and failed.
+///
+/// A change refused because the seat moved while the call ran
+/// ([`crate::seat::LostSeat`]) gets the gate's answer, [`crate::seat::NOT_HELD`]
+/// with the seat's status, so the shell shows the takeover screen rather than
+/// a failure. Everything else is `failed`.
+fn failure(e: crate::command::CommandError) -> ws::CommandError {
+    if let crate::command::CommandError::Failed(inner) = &e
+        && let Some(lost) = inner.downcast_ref::<crate::seat::LostSeat>()
+    {
+        return seat_refusal(&lost.status);
+    }
+    ws::CommandError::new("failed", e.to_string())
 }
 
 /// The longest ticket text looked up. A real one is 32 characters; anything
@@ -117,6 +159,7 @@ impl ws::Dispatch for BusDispatch {
     fn dispatch(&self, call: ws::Call, progress: ws::ProgressSink) -> ws::Dispatched {
         let bus = Arc::clone(&self.bus);
         let tickets = Arc::clone(&self.tickets);
+        let seat = Arc::clone(&self.seat);
 
         Box::pin(async move {
             let id = match crate::command::CommandId::new(call.command.to_string()) {
@@ -144,6 +187,19 @@ impl ws::Dispatch for BusDispatch {
                 Err(e) => return ws::Outcome::error(e),
             };
             let connection = call.issuer.connection();
+
+            // The seat, before any ticket is looked at, so a socket that may
+            // not run anything spends nothing. An app's window is held to the
+            // same line as the shell it runs in: it is that device using the
+            // workspace. `seat.*` passes here and is refused to an app window
+            // by the bus's hard-deny list instead.
+            if !crate::seat::exempt(id.as_str())
+                && let Err(status) = seat.admit(connection)
+            {
+                tracing::debug!(%connection, command = %id, "refused: the seat is held elsewhere");
+                return ws::Outcome::error(seat_refusal(&status));
+            }
+
             let digest = crate::ticket::params_digest(&call.params);
             let bind = |target: Option<&str>| {
                 crate::ticket::Binding::new(connection, issuer.clone(), id.clone(), digest, target)
@@ -163,7 +219,8 @@ impl ws::Dispatch for BusDispatch {
                     tickets.redeem(&ticket, &bind(now.as_deref()))
                 }
             });
-            let mut request = Request::new(id.clone(), call.params, issuer.clone());
+            let mut request =
+                Request::new(id.clone(), call.params, issuer.clone()).via_connection(connection.0);
             match spent {
                 None => {}
                 Some(Ok(())) => request = request.confirmed(),
@@ -224,9 +281,7 @@ impl ws::Dispatch for BusDispatch {
                         Err(e @ crate::command::CommandError::Cancelled { .. }) => {
                             ws::Outcome::error(ws::CommandError::new("cancelled", e.to_string()))
                         }
-                        Err(e) => {
-                            ws::Outcome::error(ws::CommandError::new("failed", e.to_string()))
-                        }
+                        Err(e) => ws::Outcome::error(failure(e)),
                     }
                 }
                 // Both of these are answers, not failures: the command has
@@ -352,7 +407,7 @@ fn attach_owned(
         TerminalId::parse(id).ok_or_else(|| failed(format!("{id} is not a terminal id")))?;
     let unknown = || failed(format!("there is no terminal {id}"));
     let session = terminals.attach(&parsed).map_err(|_| unknown())?;
-    if session.opened_by() != &opener_of(cx) {
+    if session.opened_by() != opener_of(cx) {
         return Err(unknown());
     }
     Ok(session)
@@ -468,6 +523,15 @@ impl Command for Read {
     async fn run(&self, params: ReadParams, cx: Context) -> Result<Chunk, CommandError> {
         let session = attach_owned(&self.terminals, &params.id, &cx)?;
         let out = session.output_after(params.cursor).await;
+        // Ownership again, after the wait. The check above was at the start
+        // of a long poll, and the terminal can change owner while it is
+        // parked (the single seat moving to another session hands it over),
+        // so the output that wakes it may be the new owner's. A read parked
+        // by the previous owner is answered as if the terminal were gone,
+        // exactly as a fresh one from that session would be.
+        if session.opened_by() != opener_of(&cx) {
+            return Err(failed(format!("there is no terminal {}", params.id)));
+        }
         // Sample the exit status BEFORE reading it off the session again. A
         // shell that exits between `output_after` returning and a re-sample
         // would otherwise be reported as exited on a chunk that does not
@@ -758,9 +822,19 @@ pub fn register_terminal_with(
 ///
 /// This is the seam where the two halves were written apart, and it is worth
 /// naming rather than hiding: the honest end state is one id, minted by the
-/// server and adopted by the client on the response. That needs the server to
-/// push `windows` events so a second device learns about a window it did not
-/// open — which does not exist yet, so neither does the simplification.
+/// server and adopted by the client on the response. The server now pushes a
+/// `windows` event on every change, and hands a snapshot to the connection
+/// that takes the single seat (`crate::seat`), both keyed by the client's id
+/// — so the map stays, and is what lets the device that takes over adopt
+/// the windows another device opened under the ids it chose.
+///
+/// # What is pushed
+///
+/// The `windows` event's payload is the whole list, in the shape
+/// `web/src/protocol.ts` calls `WireWindow`: the client's id, the app, the
+/// title and the desktop placement. The whole list rather than a delta, so a
+/// connection that missed one (events are droppable) is corrected by the
+/// next.
 pub struct Windows {
     set: std::sync::Mutex<window::WindowSet>,
     ids: std::sync::Mutex<std::collections::HashMap<String, window::WindowId>>,
@@ -778,7 +852,26 @@ pub struct Windows {
     /// window for an app simply does not start anything — which is what the
     /// server did for as long as the app host was never constructed.
     host: std::sync::OnceLock<Arc<crate::apphost::AppHost>>,
+    /// Where changes are pushed. Attached by the seat, which is handed these
+    /// windows as part of the workspace (`seat::Workspace::attach`); until
+    /// then a change is simply not announced.
+    hub: std::sync::OnceLock<Arc<ws::Hub>>,
+    /// The single seat, attached with the hub. Asked, at the moment a window
+    /// command changes anything, whether the connection it came from still
+    /// holds the seat ([`crate::seat::Seat::admits_now`]).
+    seat: std::sync::OnceLock<std::sync::Weak<crate::seat::Seat>>,
+    /// Held across a window command's check, change and announcement, and
+    /// across taking the snapshot handed to a connection that acquires the
+    /// seat. With the seat's own bookkeeping updated before the snapshot is
+    /// taken, a change either lands before the snapshot (and is in it, and
+    /// was pushed before the new holder held the seat) or is refused — never
+    /// after the snapshot, unseen by the device that took over.
+    op: std::sync::Mutex<()>,
 }
+
+/// The topic window changes and snapshots go out under. The shell's bus
+/// already maps it onto its window store (`web/src/stores/bus.ts`).
+pub const WINDOWS_TOPIC: &str = "windows";
 
 impl Windows {
     pub fn new(node_id: String) -> Arc<Windows> {
@@ -789,7 +882,103 @@ impl Windows {
             clock: Arc::new(window::SystemClock),
             node_id,
             host: std::sync::OnceLock::new(),
+            hub: std::sync::OnceLock::new(),
+            seat: std::sync::OnceLock::new(),
+            op: std::sync::Mutex::new(()),
         })
+    }
+
+    /// Every open window, as the shell's `WireWindow`, back to front.
+    ///
+    /// Windows the client never named (none today: every window is opened by
+    /// `shell.window.open`, which names one) are left out, because the shell
+    /// could not address them.
+    pub fn wire(&self) -> Value {
+        let ids: Vec<(String, window::WindowId)> = self
+            .ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(client, server)| (client.clone(), *server))
+            .collect();
+        let set = self.set();
+        let stacking = set.desktop().stacking();
+        let mut rows: Vec<(usize, Value)> = ids
+            .into_iter()
+            .filter_map(|(client, server)| {
+                let w = set.window(server)?;
+                let place = set.desktop().placement(server)?;
+                let z = stacking.iter().position(|s| *s == server).unwrap_or(0);
+                Some((
+                    z,
+                    serde_json::json!({
+                        "id": client,
+                        "app": w.app.app,
+                        "title": w.title,
+                        "minWidth": w.min_width,
+                        "minHeight": 0,
+                        "desktop": {
+                            "x": place.frame.x,
+                            "y": place.frame.y,
+                            "w": place.frame.width,
+                            "h": place.frame.height,
+                            "z": z,
+                            "minimized": place.minimized,
+                            "maximized": place.snap == window::Snap::Maximized,
+                        },
+                    }),
+                ))
+            })
+            .collect();
+        rows.sort_by_key(|(z, _)| *z);
+        Value::Array(rows.into_iter().map(|(_, row)| row).collect())
+    }
+
+    /// Run one window command: check the seat, change, announce, all under
+    /// [`Windows::op`]. `connection` is the shell socket the call came over,
+    /// `None` for the CLI and agents, which the seat does not apply to.
+    fn run_change(
+        &self,
+        connection: Option<u64>,
+        change: impl FnOnce(&Windows) -> Result<Value, CommandError>,
+    ) -> Result<Value, CommandError> {
+        let seat = self.seat.get().and_then(std::sync::Weak::upgrade);
+        {
+            let _op = self
+                .op
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let seated = match (&seat, connection) {
+                (Some(seat), Some(c)) => seat.admits_now(ws::ConnectionId(c)),
+                _ => true,
+            };
+            if seated {
+                let out = change(self);
+                // Every window command changes something, and a refused one
+                // changed nothing, so this is the one place to announce.
+                if out.is_ok() {
+                    self.changed();
+                }
+                return out;
+            }
+        }
+        // Refused, and the status asked for only after `op` is let go: the
+        // seat takes its own lock first and `op` second, so asking it under
+        // `op` would take them in the other order.
+        let status = match (seat, connection) {
+            (Some(seat), Some(c)) => seat.status(Some(ws::ConnectionId(c))),
+            _ => unreachable!("only a seated check refuses"),
+        };
+        Err(CommandError::Failed(anyhow::Error::new(
+            crate::seat::LostSeat { status },
+        )))
+    }
+
+    /// Tell every open shell the windows changed.
+    fn changed(&self) {
+        if let Some(hub) = self.hub.get() {
+            hub.publish(WINDOWS_TOPIC, self.wire());
+        }
     }
 
     /// Give the window commands the app host.
@@ -887,6 +1076,13 @@ impl Windows {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(p.id.clone(), id);
+        // Where the shell put it, when it said: the cascade above is the
+        // server's own guess, and the device that takes the seat next should
+        // see the window where the operator had it.
+        if let (Some(x), Some(y), Some(width), Some(height)) = (p.x, p.y, p.width, p.height) {
+            let frame = window::Rect::new(x, y, width.max(1), height.max(1));
+            let _ = self.set().place(id, frame, assumed_work_area());
+        }
         if status.is_some() {
             self.apps_by_window
                 .lock()
@@ -1017,14 +1213,19 @@ macro_rules! window_command {
             type Params = $params;
             type Output = Value;
 
-            async fn run(&self, params: $params, _cx: Context) -> Result<Value, CommandError> {
+            async fn run(&self, params: $params, cx: Context) -> Result<Value, CommandError> {
                 let f: fn(&Windows, $params) -> Result<Value, CommandError> = $body;
-                f(&self.windows, params)
+                self.windows
+                    .run_change(cx.connection, move |w| f(w, params))
             }
         }
     };
 }
 
+/// What the shell sends to open a window. The shell sends its rect as
+/// `x`, `y`, `w`, `h` (`web/src/stores/windows.ts`); `w` and `h` were never
+/// read under the names this declared, so every window was recorded at the
+/// default size. Both spellings are accepted.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OpenWindow {
     pub id: String,
@@ -1032,8 +1233,12 @@ pub struct OpenWindow {
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
-    pub width: Option<u32>,
+    pub x: Option<i32>,
     #[serde(default)]
+    pub y: Option<i32>,
+    #[serde(default, alias = "w")]
+    pub width: Option<u32>,
+    #[serde(default, alias = "h")]
     pub height: Option<u32>,
 }
 
@@ -1049,6 +1254,8 @@ pub struct Maximize {
     pub maximized: bool,
 }
 
+/// A drag's end. `w`/`h` accepted for the reason [`OpenWindow`] gives:
+/// without them every drag the shell recorded was a 1x1 frame.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct Place {
     pub id: String,
@@ -1056,9 +1263,9 @@ pub struct Place {
     pub x: i32,
     #[serde(default)]
     pub y: i32,
-    #[serde(default)]
+    #[serde(default, alias = "w")]
     pub width: u32,
-    #[serde(default)]
+    #[serde(default, alias = "h")]
     pub height: u32,
 }
 
@@ -1169,6 +1376,22 @@ window_command!(
     NoParams,
     |w, _p| w.do_unsplit()
 );
+
+impl crate::seat::Workspace for Windows {
+    fn attach(&self, hub: &Arc<ws::Hub>, seat: &std::sync::Weak<crate::seat::Seat>) {
+        let _ = self.hub.set(Arc::clone(hub));
+        let _ = self.seat.set(seat.clone());
+    }
+
+    fn snapshot(&self) -> Option<(String, Value)> {
+        // Under `op`, so no window command is halfway through a change.
+        let _op = self
+            .op
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some((WINDOWS_TOPIC.to_string(), self.wire()))
+    }
+}
 
 /// Put the window commands on the bus.
 pub fn register_windows(
@@ -2008,4 +2231,34 @@ pub fn register_apps(
     })?;
     registry.register(RevokeApp { host })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_change_refused_for_a_lost_seat_is_answered_like_the_gate() {
+        let status = crate::seat::Status {
+            held: false,
+            claimable: false,
+            holder: Some(crate::seat::HolderView {
+                device: "Pixel 7".to_string(),
+                since_ms: 1,
+                connected: true,
+            }),
+        };
+        let lost = failure(CommandError::Failed(anyhow::Error::new(
+            crate::seat::LostSeat {
+                status: status.clone(),
+            },
+        )));
+        assert_eq!(lost.code, crate::seat::NOT_HELD);
+        assert!(lost.message.contains("Pixel 7"), "{}", lost.message);
+        assert_eq!(lost.detail, Some(status.to_json()));
+
+        let other = failure(failed("the disk is full"));
+        assert_eq!(other.code, "failed");
+        assert_eq!(other.message, "the disk is full");
+    }
 }

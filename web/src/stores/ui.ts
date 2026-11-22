@@ -33,6 +33,8 @@ export interface Confirmation {
    * shown as text here too, never as markup.
    */
   target?: string;
+  /** The accept button's words, when "Confirm" is not what it does. */
+  action?: string;
   resolve(ok: boolean): void;
 }
 

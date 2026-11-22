@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/deckjack-app", "crates/deckjack-core", "crates/deckjack-editor", "crates/deckjack-files", "crates/deckjack-notes", "crates/deckjack-protocol", "crates/deckjack-tasks", "xtask"]
+members = ["crates/deckjack-app", "crates/deckjack-core", "crates/deckjack-editor", "crates/deckjack-files", "crates/deckjack-notes", "crates/deckjack-office", "crates/deckjack-photo", "crates/deckjack-protocol", "crates/deckjack-tasks", "crates/deckjack-video", "xtask"]
 
 [workspace.package]
 version = "0.1.0"

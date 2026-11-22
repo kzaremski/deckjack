@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Video</title>
+    <!--
+      The kit from the core's bundle, this app's own styles beside it. No
+      inline script (APP-UI-ISOLATION D4), no network, no content route: stills
+      arrive in command results and are shown from blob: URLs.
+    -->
+    <link rel="stylesheet" href="/kit/kit.css" />
+    <link rel="stylesheet" href="./video.css" />
+  </head>
+  <body>
+    <p class="narrow" role="alert">Video needs a window at least 360 pixels wide.</p>
+
+    <div class="dj-bar">
+      <h1 class="dj-title" id="title">Video</h1>
+      <span class="dj-spacer"></span>
+      <button class="dj-button" id="switch" title="Open or create a project">Projects</button>
+      <button class="dj-button" id="save" disabled title="Save (Ctrl+S)">Save</button>
+      <button class="dj-button" id="export" disabled title="Export an MP4">Export</button>
+    </div>
+
+    <div id="recovery" class="banner" hidden role="alert">
+      <span id="recovery-text"></span>
+      <button class="dj-button" id="recover">Recover</button>
+      <button class="dj-button" id="recovery-dismiss">Not now</button>
+    </div>
+
+    <main id="editor" hidden>
+      <section class="stage">
+        <aside id="bin" class="bin" aria-label="Media">
+          <h2 class="heading">In this project</h2>
+          <div id="bin-items" class="list"></div>
+          <div class="row">
+            <button class="dj-button" id="insert" disabled title="Insert at the playhead, pushing later clips along">Insert</button>
+            <button class="dj-button" id="overwrite" disabled title="Overwrite at the playhead">Overwrite</button>
+          </div>
+          <h2 class="heading">In Videos/</h2>
+          <div id="files" class="list"></div>
+        </aside>
+
+        <div class="viewer">
+          <div class="monitor" id="monitor">
+            <img id="still" alt="Program monitor" hidden />
+            <p class="placeholder" id="placeholder">Insert a clip from the bin.</p>
+            <span class="overlay" id="overlay">00:00:00:00</span>
+          </div>
+          <div class="transport">
+            <button class="dj-button" id="back10" title="Back 10 frames (Shift+Left)">−10</button>
+            <button class="dj-button" id="back1" title="Back 1 frame (Left)">−1</button>
+            <input id="timecode" class="tc" inputmode="numeric" aria-label="Playhead timecode" value="00:00:00:00" />
+            <button class="dj-button" id="fwd1" title="Forward 1 frame (Right)">+1</button>
+            <button class="dj-button" id="fwd10" title="Forward 10 frames (Shift+Right)">+10</button>
+            <button class="dj-button" id="marker" title="Add a marker at the playhead (M)">Marker</button>
+          </div>
+        </div>
+      </section>
+
+      <div class="timeline-wrap">
+        <canvas id="timeline" aria-label="Timeline"></canvas>
+      </div>
+
+      <div id="nudge" class="toolbar nudge" hidden>
+        <span class="label" id="nudge-label">Trim</span>
+        <button class="dj-button" id="edge" title="Which edge the nudges move">Out</button>
+        <button class="dj-button" data-nudge="-10">−10</button>
+        <button class="dj-button" data-nudge="-1">−1</button>
+        <button class="dj-button" data-nudge="1">+1</button>
+        <button class="dj-button" data-nudge="10">+10</button>
+        <button class="dj-button" id="link" title="Unlink picture and sound (for J- and L-cuts)">Unlink</button>
+        <button class="dj-button" id="marker-remove" hidden>Remove marker</button>
+      </div>
+
+      <div class="toolbar">
+        <button class="dj-button" id="undo" disabled title="Undo (Ctrl+Z)">Undo</button>
+        <button class="dj-button" id="redo" disabled title="Redo (Ctrl+Shift+Z)">Redo</button>
+        <button class="dj-button" id="split" title="Split at the playhead (S)">Split</button>
+        <button class="dj-button" id="lift" disabled title="Remove, leaving a gap (Delete)">Lift</button>
+        <button class="dj-button" id="ripple-delete" disabled title="Remove and close the gap (Shift+Delete)">Ripple delete</button>
+        <button class="dj-button toggle" id="ripple" aria-pressed="false" title="Trims move later clips">Ripple</button>
+        <button class="dj-button toggle" id="snap" aria-pressed="true" title="Snap to edges, markers and the playhead">Snap</button>
+        <button class="dj-button" id="zoom-out" title="Zoom out (-)">−</button>
+        <button class="dj-button" id="zoom-in" title="Zoom in (+)">+</button>
+        <button class="dj-button" id="bin-toggle" title="Show the media bin">Bin</button>
+      </div>
+    </main>
+
+    <section id="projects" class="sheet" aria-label="Projects">
+      <h2 class="heading">Projects in Videos/</h2>
+      <div id="project-list" class="list"></div>
+      <form id="new-project" class="row">
+        <input id="new-name" class="field" placeholder="New project name" aria-label="New project name" />
+        <button class="dj-button" type="submit">Create</button>
+      </form>
+      <p class="hint">
+        Video sees only the Videos folder. Move footage there with Files first.
+      </p>
+    </section>
+
+    <section id="export-sheet" class="sheet" hidden aria-label="Export">
+      <h2 class="heading">Export MP4 (H.264 and AAC)</h2>
+      <div class="row" role="radiogroup" aria-label="Size">
+        <button class="dj-button toggle" data-size="source" aria-pressed="false">Source</button>
+        <button class="dj-button toggle" data-size="1080p" aria-pressed="true">1080p</button>
+        <button class="dj-button toggle" data-size="720p" aria-pressed="false">720p</button>
+      </div>
+      <div class="row">
+        <input id="export-name" class="field" placeholder="File name (the project's by default)" aria-label="File name" />
+      </div>
+      <label class="row check">
+        <input type="checkbox" id="loudness" />
+        Normalize loudness to −14 LUFS
+      </label>
+      <div class="row">
+        <button class="dj-button" id="export-start">Export</button>
+        <button class="dj-button" id="export-close">Close</button>
+      </div>
+      <p class="hint">An export never replaces a file: a name in use gets a number.</p>
+      <div id="jobs" class="list"></div>
+    </section>
+
+    <p class="dj-status" id="status" role="status">Loading…</p>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

@@ -1,10 +1,254 @@
 ## Lane 5a — Photo editor
 
-Scoping brief, 2026-11-16. Research only: nothing here is built and nothing was
-measured. Crate versions come from the crates.io API on this date. Timings and
-sizes marked *(est.)* are inferred, not measured.
+Scoping brief, 2026-11-16, with the first build pass and the measured spikes
+added 2026-11-21 (the two sections right below). Everything after them is the
+original brief, unchanged; where the build departed from it, "Deviations"
+says so. Timings and sizes marked *(est.)* in the original are inferred, not
+measured.
 
-**Exists:** nothing. Related pieces: `thumbnail.rs` in the core decodes
+### Spikes 1–3, as measured (2026-11-21)
+
+All three ran on the laptop (Ryzen AI / Radeon 890M, 24 threads, Arch). The
+R620 and the phone were not available to this pass, so nothing below is an
+R620 or phone number.
+
+**Spike 1, LUT preview parity: passes. Option D stands.**
+
+- Harness: `crates/deckjack-photo/examples/parity.rs` writes the production
+  proxy, the production LUT bake and the direct Rust render;
+  `spike/lut-parity.mjs` draws the proxy through the production shader
+  (`ui/gl.js`) in headless Chromium via the repo's Playwright, and
+  `spike/compare.py` scores CIEDE2000 (validated against Sharma's test pairs)
+  against the direct render quantized to 8 bits.
+- Photo: the operator's own `IMG_2058.JPG` (Canon 750D), proxy 683×1024.
+- Recipe A (the brief's spike recipe: +0.7 EV, temperature +30, tint −10, an
+  S-curve, one radial mask +0.7 EV):
+
+  | | mean ΔE2000 | p99 | max |
+  | --- | --- | --- | --- |
+  | 33³, SwiftShader | 0.115 | 0.973 | 1.72 |
+  | 33³, Radeon 890M (ANGLE/Vulkan) | 0.136 | 0.846 | 1.82 |
+  | 17³, SwiftShader | 0.359 | 1.205 | 2.01 |
+  | 17³, Radeon 890M | 0.377 | 1.166 | 1.99 |
+
+- Recipe B (stress: +2 EV, temperature +80, tint +30, saturation +0.6,
+  levels, a hard master S-curve plus a red curve, a radial −1.5 EV mask):
+  33³ mean 0.168, p99 1.110 on both renderers; 17³ mean 0.52, **p99 3.24**,
+  which misses the 33³ bar but is only shown while a control moves.
+- The GPU matches the Rust trilinear model of the shader to within 0.02 mean
+  ΔE, so the error is LUT interpolation, not the GPU. That is what lets
+  `tests/parity.rs` stand in for the GPU in `cargo test`: preview (model)
+  against export at the same scale on a synthetic card with the exit-check
+  recipe gives mean **0.23**, p99 0.72 (bar: mean < 1.5).
+- **The numbers above are the sRGB path only** (a JPEG in the spike, a PNG
+  card in the test). The RAW path, the exit check's main case, goes through
+  an 8-bit log proxy with dither and log-indexed LUTs, and scores worse.
+  Measured after review with `tests/parity.rs`'s own `score()` and
+  exit-check recipe at a 640 px proxy (production model of the shader, the
+  proxy resampled; not the spike's LUT-only model):
+
+  | photo | 33³ mean | 33³ p99 | 17³ mean | 17³ p99 |
+  | --- | --- | --- | --- | --- |
+  | `IMG_2058.CR2` (750D) | 1.045 | 4.57 | 1.163 | 4.50 |
+  | `DSC00870.ARW` (ZV-1) | 0.838 | 4.43 | 0.998 | 4.41 |
+  | `IMG_2058.JPG`, same model | 0.472 | 3.98 | 0.509 | 3.97 |
+  | synthetic Bayer DNG card (in `cargo test`) | 0.600 | 2.32 | 0.723 | 2.43 |
+  | synthetic PNG card (in `cargo test`) | 0.226 | 0.72 | 0.241 | — |
+
+  The RAW means pass the 1.5 bar, but by less than the sRGB figures
+  suggested, and every real photo's p99 is over the spike's 3.0 bar. The
+  JPEG's p99 is close to the RAWs', so most of that tail is probably the
+  proxy's resampling at edges and fine texture rather than color; that is
+  inferred, not isolated. `tests/parity.rs` now scores a Bayer DNG card
+  through the RAW path too (mean < 1.5 at both sizes, p99 < 3.5), so a log
+  or dither regression fails a test; it was checked by breaking the log
+  encoding, doubling the dither and turning a RAW proxy sRGB.
+- Cost: baking a 33³ LUT takes 3.7 ms, a 17³ one 0.5 ms; a 33³ LUT is 216 KB
+  raw, 288 KB as base64. Uploading one and drawing a 683×1024 frame took
+  15 ms (33³) and 2 ms (17³) in the harness, base64 decode included.
+- **Not measured:** ≥10 LUT updates a second from the R620 to the phone over
+  `/ws`. No phone or R620 in this pass. The bake is not the limit; the link
+  is unknown.
+
+**Spike 2, 8-bit log proxy banding: banding confirmed on a clean gradient;
+dither kept; the precise fix does not fit the frame budget.**
+
+- `examples/banding.rs`: a synthetic sky (0.03–0.12 linear, 2 EV under),
+  developed +2 EV through a strong S-curve, each 8-bit proxy variant against
+  the f32 reference, through the pipeline directly (no LUT).
+
+  | proxy | longest flat run (px) | largest step (codes) | column-mean error (codes) | PNG, 2048×256 |
+  | --- | --- | --- | --- | --- |
+  | f32 reference | 24 | 1 | — | — |
+  | 8-bit sRGB | 60 | 4 | 2.00 | 8.6 KB |
+  | 8-bit sRGB + dither | 20 | 7 | 1.05 | 480 KB |
+  | **8-bit log** | **112** | **6** | **3.00** | 8.5 KB |
+  | **8-bit log + dither** | 18 | 12 | 1.07 | 481 KB |
+  | 16-bit log | — | — | — | 21.5 KB |
+
+  Undithered 8-bit log bands visibly (112 px plateaus with 6-code steps).
+  Dither removes the bands in the mean (error ~1 code) and trades them for
+  per-pixel grain up to 12 codes under this edit.
+- The same edit on the two real RAWs at a 2048 px proxy, ΔE2000 per pixel
+  against the f32 reference: CR2 8-bit log mean 0.69 / p99 2.90, dithered
+  1.10 / 5.06; ARW 0.58 / 2.23, dithered 0.94 / 3.91. Per-pixel ΔE punishes
+  grain, so it favors no dither; a smooth sky is where bands show, so the
+  brief's dither is kept. Sizes: 8-bit log PNG 3.1 MB (CR2) / 4.7 MB (ARW),
+  dithered 3.2 / 4.8 MB; **16-bit log PNG 14.6 / 16.3 MB**.
+- Decision: v1 ships 8-bit log + dither for RAW proxies (`render::quantize`).
+  A 16-bit or hi/lo proxy at 2048 px is 2× the 8 MiB socket frame before
+  base64, so the precise fix needs either a ≤1024 px 16-bit proxy or the
+  binary transfer D6 deferred. Exports never see this: they render from f32.
+  The proxy defaults to 1600 px long edge in the UI.
+
+**Spike 3, RAW decoder: rawler 0.8.0.**
+
+- On disk: 192 CR2 from a Canon EOS 750D (rawler says "Rebel T6i") under
+  `~/Nextcloud/Photography`, and a zip of Sony ZV-1 ARWs. One of each was
+  copied to the scratchpad; nothing was downloaded.
+- Both decoders read both cameras. LibRaw is the system's 0.22.2 (via its
+  `dcraw_emu`, AHD, 16-bit linear); rawler 0.8.0 through
+  `RawDevelop::develop_intermediate` (PPG demosaic, as-shot WB, camera matrix).
+
+  | | rawler: decode + develop | rawler peak RSS | LibRaw wall | LibRaw peak RSS |
+  | --- | --- | --- | --- | --- |
+  | CR2, 24 MP | 0.18 + 0.16 s (0.76 s process) | 750 MiB | 0.75 s | 289 MiB |
+  | ARW, 20 MP | 0.06 + 0.14 s (0.52 s process) | 625 MiB | 0.44 s | 249 MiB |
+
+- Color agreement, aligned and box-downscaled 4×: mean ΔE2000 2.35 (CR2) and
+  2.07 (ARW) between the two, rawler ~6% brighter. At 1:1 the two demosaics
+  look alike on the CR2's fine texture (no measurement of zipper or maze
+  artifacts was made).
+- Licensing: rawler LGPL-2.1, pure Rust, no system dependency. LibRaw would
+  need either the system `libraw.so` (present here, absent on Termux and the
+  R620 unless installed) or `rsraw`'s C++ build.
+- Decision: **rawler**, pinned `=0.8.0`. It decodes the operator's actual
+  cameras, costs no C toolchain, and keeps the Android build cheap. Its cost
+  is ~2.5× LibRaw's peak memory. Two findings it forced: rawler's own
+  `RawImage::orientation` read "Normal" for a CR2 whose EXIF says 8, so the
+  EXIF value is used; and rawler lists its extensions in upper case, which
+  the first extension check missed (found by the spike, now tested).
+
+### Built in the first pass, and deferred
+
+Crate `crates/deckjack-photo` (app id `photo`, title "Photos"), its UI in
+`ui/`, the format spec `docs/formats/photo-edit-v1.md`, and cancellation in
+the `deckjack-app` SDK.
+
+Built:
+
+- **Open:** JPEG, PNG, WebP (via `image`), TIFF 8/16-bit/float, chunky or
+  planar (via `tiff` directly, so the core's thumbnailer does not gain TIFF
+  through feature unification), and camera RAW/DNG through rawler, each
+  under `catch_unwind`. EXIF orientation applied. 120 MP decode cap. The
+  `tiff` crate's default 256 MiB buffer limit is raised to that cap: left
+  in place, it refused any 16-bit RGB TIFF over ~44.7 MP, the app's own
+  `tiff16` export of a 45 MP RAW included (found in review; a 45.4 MP
+  16-bit TIFF now opens in `tests/tiff.rs`).
+- **Decode memory:** one full-resolution job at a time, a decode or an
+  export's full-size render and encode (`Engine::heavy`), and the cached
+  photo is dropped before a different one is decoded. The sandbox sets no
+  memory limit, so this is the only bound besides the pixel cap. Measured
+  (release, two threads opening two different 10950×10950 black PNGs, peak
+  RSS): 1.76 GB with the gate, 3.46 GB without it. One decode inside the
+  cap still peaks near 2 GB for an 8-bit display file (15 bytes a pixel:
+  the decoded bytes plus the `f32` copy); that single-decode peak is not
+  reduced, and an export of such a file still adds its full-size render.
+  This is serialization, not a byte budget: an open waits behind a running
+  export.
+- **Edit model:** exposure, white balance (temperature/tint), levels (master
+  and per channel), curves (master and per channel, monotone cubic, 16
+  points), saturation, quarter turns, flips, straighten ±45°, crop, up to four
+  radial masks with exposure and saturation. `deny_unknown_fields` and range
+  validation that names the field.
+- **Sidecar** `<photo>.deckjack.json`: schema, original's size and SHA-256,
+  decoder, revision, recipe, bounded history (100) with a position. Atomic
+  write through a temporary file created with `O_EXCL`, so a symlink
+  planted at the predictable temporary name is passed over rather than
+  written through (found in review: `File::create` would have truncated a
+  photo the link pointed at); `base_rev` refuses a stale save with "edited
+  elsewhere since you opened it"; undo/redo are revisions too
+  (`photo.edit.step`).
+- **Preview (option D):** `photo.proxy` (8-bit sRGB, or log + dither for
+  RAW, PNG), `photo.lut` (17³/33³ half floats, global plus one per mask),
+  the WebGL2 shader in `ui/gl.js` with context-loss rebuild, and
+  `photo.render` as fallback A when WebGL2 is missing.
+- **Export:** JPEG or 16-bit TIFF with an embedded sRGB ICC profile (moxcms),
+  full size or a long-edge limit, progress, `-edit`/`-edit (n)` naming,
+  `renameat2(RENAME_NOREPLACE)` (hard-link fallback), a hidden partial name
+  removed on every non-success path, cancellation. Original's SHA-256
+  asserted unchanged in `tests/original.rs`.
+- **Agents:** `photo.describe` (named changes, output size, history position,
+  histogram, clipped fractions) and `photo.list`.
+- **`photo.preview.embedded`:** the RAW's embedded JPEG (or a scaled decode
+  of a display photo), oriented and capped.
+- **SDK:** `deckjack_app::Cancellation` on `Ctx`, flipped by the core's
+  `cancel` frame for that call only (`deckjack-app` tests over a real socket
+  pair).
+- **UI:** plain JS, no build step, `ui/main.js` as a file (no inline script),
+  only command results for pixels. Tabs Light, Levels, Curves, Crop, Local,
+  Export; a canvas preview on a fixed gray; sliders with a whole-row hit
+  target, numeric entry and double-tap reset; a curves editor with a touch
+  offset, drag-off and long-press delete and an input → output readout; crop
+  handles at touch size with aspect chips, turns, flips and straighten;
+  radial mask pin, outline through the geometry, and a tint overlay; Before
+  (button, press-and-hold on the photo, `\`); undo/redo (`Ctrl+Z`,
+  `Ctrl+Shift+Z`); `C` for crop; the open-photo picker; `?path=` and
+  `deckjack.app.open` only open. One LUT call in flight, newest recipe next;
+  saves debounced and stopped on a conflict. `await save()` waits out every
+  save in flight and any started after it, however many callers are
+  waiting, and a save's answer is dropped if another photo was opened
+  meanwhile (found in review: two waiters could let an undo go out on the
+  revision before a save still in flight, which marked the window stale for
+  no reason; tested in `web/src/apps/photo.test.js`, not in a browser).
+- **Verified live** (release build, `cargo xtask install` into a throwaway
+  home, `deckjack --debug` on 127.0.0.1:8781, app approved and running
+  confined): the CR2, the ARW and the JPEG open (0.3–0.6 s), edits preview
+  and save, a 4000×5002 16-bit TIFF export took 0.4 s and carried the sRGB
+  profile, a second export was named `-edit (2)`, a cancelled export
+  answered "export cancelled; nothing was written" and left no file, and
+  the three originals' SHA-256 were unchanged. Screens checked at 1280×800
+  and 360×780.
+
+Deferred, each a known gap:
+
+- **The core does not forward a client's `cancel` to an app.** The SDK now
+  honors the frame, but `apphost.rs` never sends it and `wiring.rs` only
+  drops `terminal.read` on cancel, and `kit/bus.js` has no cancel at all.
+  Until those land (core and shell changes, outside this lane), the UI
+  cancels an export through the app's own `photo.export.cancel {job}`, which
+  flips the same `Cancellation`.
+- **Quick Look does not call `photo.preview.embedded` yet.** The command is
+  built and tested; wiring it into `web/src/shell/quicklook.ts` is a shell
+  change left for the merge.
+- Brush and linear-gradient masks; vibrance; contrast/highlights/shadows as
+  named controls (a curve does it today); WB picker and as-shot temperature
+  for RAW.
+- 1:1 zoom and `photo.tile`, pinch zoom and pan, `/kit/gestures.js`; fine
+  slider control by moving the finger away; the crop's image-under-a-fixed-
+  frame interaction (the frame moves instead); two-finger rotate and the
+  level-line tool; a live histogram in the UI (it is in `photo.describe`).
+- Reading embedded ICC profiles on input; EXIF copied into exports; PNG
+  export; the on-disk proxy/LUT cache under `$HOME/.cache/photo/` (proxies
+  are cached in memory, four at a time, plus one decoded photo); a byte
+  budget for decodes and exports (full-resolution jobs are serialized
+  instead, see "Decode memory"), or a lower pixel cap for phone hosts;
+  strip-wise export (a 24 MP RAW export holds the f32 image, ~290 MB, plus
+  rawler's ~750 MB peak).
+- Spike 4 (45–61 MP export memory), 5 (HEIC), 8 (WebKit), 9 (touch on the
+  devices), 10 (moxcms against lcms2) were not run.
+
+Deviations from the brief:
+
+- Linear working space is sRGB/Rec.709 primaries, not Rec.2020: rawler's
+  `Calibrate` step already lands there, and nothing in v1 needs the wider
+  gamut. Out-of-gamut RAW colors clip at step 3.
+- `photo.render` (whole picture at a size) instead of `photo.tile` (a rect at
+  a scale); it serves as fallback A and as the parity reference.
+- Two commands the brief did not list: `photo.list` (the picker), and
+  `photo.export.cancel` plus `photo.edit.step` (see above).
+
+**Exists (before this lane):** nothing. Related pieces: `thumbnail.rs` in the core decodes
 JPEG/PNG/GIF/WebP/BMP with the `image` crate for Files thumbnails. Quick Look
 refuses camera RAW and lists "RAW previews (needs a node-side developer)" as
 still owed. `web/src/shell/gestures.ts` has the pinch, pan and swipe geometry,

@@ -315,6 +315,21 @@ describe("opening the file fully", () => {
     expect(calls).toEqual([["open", "scribe"]]);
   });
 
+  it("hands an office document to Office when Office is installed", () => {
+    const opened: Opened = [];
+    const ql = createQuickLook(env({ apps: ["scribe", "office"], opened }));
+    ql.open("/Downloads/Report.docx");
+    expect(ql.handoff.value?.app).toBe("office");
+    expect(ql.openFully()).toBe(true);
+    expect(opened).toEqual([{ app: "office", path: "/Downloads/Report.docx" }]);
+  });
+
+  it("offers nothing for an office document when Office is not installed", () => {
+    const ql = createQuickLook(env({ apps: ["scribe"] }));
+    ql.open("/Downloads/Deck.pptx");
+    expect(ql.handoff.value, "a text editor is not where a deck opens").toBeNull();
+  });
+
   it("offers the source of an HTML page to the editor too", () => {
     // The preview of a web page is sandboxed and inert; editing it is what
     // "open fully" means for a file someone is writing.

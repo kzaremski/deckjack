@@ -191,7 +191,9 @@ fn the_three_client_frames_deserialize_from_what_the_shell_sends() {
     )
     .unwrap();
     match hello {
-        ClientFrame::Hello { protocol, client } => {
+        ClientFrame::Hello {
+            protocol, client, ..
+        } => {
             assert_eq!(protocol, 1);
             assert_eq!(client.as_deref(), Some("deckjack-shell"));
         }
@@ -1422,6 +1424,7 @@ impl Server {
         let ctx = WsCtx::new(
             Arc::clone(&auth),
             Arc::clone(&bus) as Arc<dyn Dispatch>,
+            Arc::new(ws::NoPresence),
             Arc::clone(&hub),
             Arc::clone(&clock) as Arc<dyn ws::Clock>,
             "node-under-test".into(),

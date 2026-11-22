@@ -3,6 +3,7 @@ import { watch } from "vue";
 import { awaitsApproval, type AppContract, type AppTable, type InstalledApp } from "../stores/apps.ts";
 import type { CommandEntry, CommandsStore } from "../stores/commands.ts";
 import type { UiStore } from "../stores/ui.ts";
+import type { SeatStore } from "../stores/seat.ts";
 import type { WindowsStore } from "../stores/windows.ts";
 import type { Bus } from "../stores/bus.ts";
 import type { Risk } from "../protocol.ts";
@@ -471,14 +472,22 @@ export function bindApps(deps: AppBindingDeps): () => void {
   const { bus, commands, windows, apps } = deps;
   let unregister: (() => void) | null = null;
   let unregisterApprove: (() => void) | null = null;
-  const load = () =>
-    apps.load((command, params) =>
-      bus
-        .call(command, params ?? {})
-        .then((outcome) =>
-          outcome.status === "ok" ? outcome.value : Promise.reject(new Error("refused")),
-        ),
+  /**
+   * Whether the list has been asked for on this connection and not refused
+   * for want of the seat. A device that connects while another holds the
+   * seat is refused `system.apps`; it asks again when the seat is its own.
+   */
+  let asked = false;
+  const load = () => {
+    asked = true;
+    return apps.load((command, params) =>
+      bus.call(command, params ?? {}).then((outcome) => {
+        if (outcome.status === "ok") return outcome.value;
+        if (outcome.status === "error" && outcome.code === "seat_not_held") asked = false;
+        return Promise.reject(new Error("refused"));
+      }),
     );
+  };
   const stopApproveWatch = watch(
     apps.installed,
     (installed) => {
@@ -497,8 +506,8 @@ export function bindApps(deps: AppBindingDeps): () => void {
     { immediate: true },
   );
   const offBus = bus.on((event) => {
-    if (event.kind !== "node") return;
-    void load();
+    if (event.kind === "node") void load();
+    else if (event.kind === "seat" && event.seat.held && !asked) void load();
   });
   return () => {
     stopWatch();
@@ -511,7 +520,8 @@ export function bindApps(deps: AppBindingDeps): () => void {
 }
 
 /**
- * Opens an app once the shell can: the node connected and the app known.
+ * Opens an app once the shell can: the node connected, this device holding
+ * the seat, and the app known.
  *
  * For the PWA's `/?open=<app>` shortcuts. Dispatching at page load, as this
  * used to, ran while the socket was still connecting, and opening a window is
@@ -520,15 +530,20 @@ export function bindApps(deps: AppBindingDeps): () => void {
  * once `system.apps` has answered. A name that never becomes known is never
  * opened, and it opens at most once.
  *
+ * The seat, because the socket being open is not yet permission to change
+ * the workspace: until the node says this connection holds the seat, an open
+ * may be refused (another device has it), and one sent before the node's
+ * window snapshot arrives is overwritten by that snapshot.
+ *
  * Returns a function that gives up waiting.
  */
 export function openWhenReady(
-  deps: Pick<AppBindingDeps, "bus" | "apps" | "commands">,
+  deps: Pick<AppBindingDeps, "bus" | "apps" | "commands"> & { seat: Pick<SeatStore, "held"> },
   app: string,
 ): () => void {
   let done = false;
   const stop = watch(
-    () => deps.bus.status.value === "open" && deps.apps.isKnown(app),
+    () => deps.bus.status.value === "open" && deps.seat.held.value && deps.apps.isKnown(app),
     (ready) => {
       if (!ready || done) return;
       done = true;

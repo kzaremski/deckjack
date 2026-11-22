@@ -35,7 +35,7 @@ const pending = computed(() => shell.ui.confirmation.value);
       <div class="actions">
         <button type="button" class="ghost" @click="pending.resolve(false)">Cancel</button>
         <button type="button" class="go" autofocus @click="pending.resolve(true)">
-          {{ pending.risk === "destructive" ? "Do it" : "Confirm" }}
+          {{ pending.action ?? (pending.risk === "destructive" ? "Do it" : "Confirm") }}
         </button>
       </div>
     </div>

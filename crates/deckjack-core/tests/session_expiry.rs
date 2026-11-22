@@ -234,13 +234,21 @@ async fn the_assembled_node_reaps_expired_sessions_on_its_own() {
         )
         .expect("a fresh journal"),
     );
+    let hub = ws::Hub::new(Arc::new(ws::SystemClock));
+    let seat = deckjack_core::seat::Seat::new(
+        Arc::clone(&hub),
+        Arc::new(ws::SystemClock),
+        vec![Arc::clone(&r.terminals) as _],
+    );
     let ws_ctx = ws::WsCtx::new(
         Arc::clone(&r.ctx),
         wiring::BusDispatch::new(
             Arc::clone(&r.bus),
             deckjack_core::ticket::Tickets::new(Arc::new(ws::SystemClock)),
+            Arc::clone(&seat),
         ),
-        ws::Hub::new(Arc::new(ws::SystemClock)),
+        seat,
+        hub,
         Arc::new(ws::SystemClock),
         NODE.to_string(),
         node::host_name(),

@@ -172,7 +172,7 @@ export function viewerFor(name: string, mime?: string): Viewer {
     return {
       kind: "none",
       sandboxed: false,
-      why: `There is no converter for .${ext} documents on the node yet, so there is nothing honest to show.`,
+      why: `Quick Look does not draw .${ext} documents. Open it in Office, where this node has it.`,
     };
   }
 
@@ -335,16 +335,26 @@ export const EDITOR_APP = "scribe";
 /**
  * Which app opens a file fully, by viewer.
  *
- * Only text-like files, and only the editor: it is the one app whose contract
- * is "open any file by path". A photograph, a video or an archive has no
- * owning app in the suite yet, and guessing one would be a button that opens
- * the wrong thing.
+ * Text-like files go to the editor, whose contract is "open any file by
+ * path"; office documents go to Office (below, by extension). A photograph,
+ * a video or an archive has no owning app in the suite yet, and guessing one
+ * would be a button that opens the wrong thing.
  */
 const HANDOFF: Partial<Record<ViewerKind, string>> = {
   text: EDITOR_APP,
   markdown: EDITOR_APP,
   web: EDITOR_APP,
 };
+
+/** The Office app's name in the app table (Lane 6a). */
+export const OFFICE_APP = "office";
+
+/** The app a file goes to by its extension, when its viewer kind has none:
+ * office documents, which Quick Look cannot draw and Office can. */
+function handoffFor(path: string): string | undefined {
+  const kind = viewerFor(path).kind;
+  return HANDOFF[kind] ?? (OFFICE.has(extensionOf(path)) ? OFFICE_APP : undefined);
+}
 
 export interface QuickLookStore {
   visible: Ref<boolean>;
@@ -398,7 +408,7 @@ export function createQuickLook(env: QuickLookEnv): QuickLookStore {
 
   const handoff = computed(() => {
     if (!current.value) return null;
-    const app = HANDOFF[viewerFor(current.value).kind];
+    const app = handoffFor(current.value);
     if (!app || !env.apps.isKnown(app)) return null;
     return { app, title: env.apps.contract(app).title };
   });

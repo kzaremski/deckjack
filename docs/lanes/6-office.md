@@ -42,6 +42,205 @@ the proposal.
 
 ---
 
+### Status: 6a first pass built (2026-11-21)
+
+Crate `crates/deckjack-office` (app id `office`, binary `deckjack-office`).
+Everything below was run on this machine (Arch, LibreOffice 26.8.1,
+poppler 26.10, Linux 7.2.15, Landlock ABI 4). Pandoc is not installed and
+nothing here needs it.
+
+**What the spikes measured.**
+
+- **S1, LOK under the real launcher: works.** The test
+  (`tests/confined.rs`) installs the app the way `deckjack install` lays it
+  out, builds the plan with the real `LaunchPlan::build` and `OsEnv`, and
+  spawns through `Env::spawn`: Landlock *and* seccomp, not `setpriv`. docx,
+  xlsx and pptx all convert to PDF. Confined, debug build: 0.4–1.9 s per
+  conversion with a fresh profile, 0.5–0.7 s once fontconfig's cache exists;
+  peak RSS 240–380 MiB. Unconfined with a cold profile: 2.7–2.9 s,
+  430–440 MiB. The whole app (`tests/app.rs`) also runs confined end to end:
+  open, pages, page image, reading view, comment, reply, save in place,
+  export, all through its socket.
+- **The Unix-socket gap is real.** strace on the confined worker: successful
+  `connect()` to `/run/cups/cups.sock` (5), `/run/dbus/system_bus_socket` (2)
+  and `/run/systemd/resolve/io.systemd.Resolve` (2). Landlock ABI 4 does not
+  stop it. Pointing `CUPS_SERVER` and `DBUS_SYSTEM_BUS_ADDRESS` at paths
+  that do not exist (`worker::WORKER_ENV`) removed every one of them, the
+  resolver's included; the only connects left are `ENOENT` probes for
+  `nvidia-mps`. That is a mitigation for this app, not a fix: any other app
+  can still reach those sockets. Platform item, unchanged.
+- **`RLIMIT_AS` is not a usable memory bound.** LOK will not boot under 8 GiB
+  of address space on this 24-core machine (8 GiB fails, 9 GiB works) though
+  it touches about 0.4 GiB. **`RLIMIT_DATA` is**: a toy docx fails at 256 MiB
+  and converts at 512 MiB. The worker sets data 2 GiB, address space 16 GiB
+  as a backstop, CPU 120 s, core 0, and the app kills it at 120 s wall clock.
+  `tests/confined.rs` proves the data limit is applied (a 64 MiB worker
+  writes no PDF).
+- **No lock file.** With the source loaded in place and both lock settings
+  turned back on, LOK 26.8 wrote no `.~lock` file beside it. The brief's
+  spike saw one; the copy into the job directory stays anyway (it also keeps
+  a read-only grant sufficient), but no test can tell the two apart here.
+- **S3 on LibreOffice only.** A file patched by the app, converted by
+  LibreOffice to ODT, holds both new comments with authors and initials, the
+  reply threaded on its parent (`loext:parent-name`), and the range ending
+  exactly after the selected words. This is a permanent assertion in
+  `tests/app.rs`. **Word, Word for iOS and Google Docs are not verified**:
+  none is available here.
+- **S6, partly.** One page of the toy docx at 1100 px as JPEG q82: 42 KiB,
+  rasterized in 20 ms. Dense real pages, phones and Tailscale latency are not
+  measured.
+- S2 (fidelity corpus), S5 (IronCalc) and S7 (iOS selection) were not run.
+  S4 is covered by unit tests for fields, hyperlinks, tracked changes,
+  entities, surrogate pairs and table cells, on documents built in the tests
+  rather than files from Word.
+
+**Built.**
+
+- `lok.rs`: a vendored FFI (`dlopen` + `libreofficekit_hook_2`, five table
+  slots, each read only when `nSize` reaches it). The layout is checked at
+  run time by `getVersionInfo` returning LibreOffice's JSON.
+- `worker.rs`: the job protocol (`--worker <dir>`, `job.json` in,
+  `result.json` out, `_exit`), limits, one process group per job, kill on
+  cancel, timeout and drop, two concurrent workers each with its own profile
+  slot, the profile seeded on every job (macros off, Java off, lock files
+  off, update check and crash reporting off; the engine's own records are
+  wiped each time).
+- `pages.rs`: PDF cache keyed by SHA-256 of the bytes plus the engine's
+  version, `pdfinfo` page sizes, `pdftoppm` page images (JPEG default; there
+  is no WebP in pdftoppm), 1 GiB cache ceiling.
+- `ooxml/`: a hardened package reader (size, entry, per-part, total and
+  ratio caps; path, case-duplicate, method and encryption refusals; DTDs and
+  absurd nesting refused), one scanner shared by the reading view and the
+  patcher, styles/numbering/comments/threads, the surgical patcher with a
+  post-patch check (the package diff must be exactly the expected parts, and
+  the comment must cover exactly the selected text, or nothing is written),
+  and the CriticMarkup text for agents.
+- Commands: `office.open`, `office.pages`, `office.page.render`,
+  `office.text`, `office.cancel` (read); `office.comment.add`,
+  `office.save.inplace`, `office.export_pdf` (write). Nothing is
+  destructive; nothing overwrites.
+- UI (`ui/`): page view (lazy, three pages ahead, pinch and ctrl+wheel zoom
+  around the focus, double tap to fit, swipe and arrow keys, go to page),
+  reading view (headings, lists with real markers, tables with spans,
+  placeholders, changes as `ins`/`del` with author and date, highlighted
+  comments, thread list), selection-to-comment with a bottom sheet above the
+  keyboard, replies, export with Quick Look on the result, a picker over the
+  granted folders. Built for stage 4: no inline script, no fetch, no content
+  route, no wasm, no `window.confirm` (no `allow-modals`; saving over the
+  original takes a second tap instead).
+- Quick Look hands office files to Office ("Open in Office") when it is
+  installed (`web/src/shell/quicklook.ts`).
+
+**Review fixes (2026-11-21, after the first pass).** Each with a test that
+was seen to fail with the fix reverted.
+
+- **List-marker bomb, fixed.** A hostile `numbering.xml` (`w:start`
+  4,000,000,000, `lowerLetter`, a `lvlText` of thirty `%1`) made `Docx::open`
+  build a 153 MB marker or abort on a 4.6 GB allocation, in the app process,
+  which has no memory limit. Now `w:start` is clamped to 32,767 (Word's own
+  ceiling), letters past "zzzz" (item 104) are written as digits, and a
+  marker is expanded in one pass and cut at 64 characters.
+- **Quadratic comment handling, fixed in three places.** `text::render`
+  searched all comments per root (200,000 comments: 66 s, measured by the
+  review), `anchored_order` searched its output per id, and the scanner
+  walked every comment marker at the end of every run (found while writing
+  the test: 50,000 references took 35 s to open in a debug build). All three
+  are indexed now; 50,000 comments, each referenced from the body, open and
+  render in well under a second in a debug build. A reply is listed once
+  even under many roots that share its parent's id. `office.text` also runs
+  its open, render and serialization in `spawn_blocking`, off the runtime's
+  threads.
+- **Results over the frame limit, fixed.** The core drops an app's whole
+  connection, every call in flight with it, on a frame over 8 MiB. A result
+  over 8 MiB less 64 KiB (`app::MAX_RESULT_BYTES`) is now an error naming
+  its size and what to ask for instead. `office.text` takes `only: "text"`
+  or `only: "blocks"`; the reading view asks for blocks only. A
+  1,100-paragraph test document over the limit with both fits with either
+  alone. `office.page.render` goes through the same bound (a PNG at
+  2400 px), but no test produces an image that large; only the bound itself
+  is tested.
+- **Folders from the installed manifest.** The refusal tells the operator to
+  add a folder to Office's `app.toml` and approve again, but the app read
+  the copy compiled into it, so that never worked. It now reads the
+  installed `app.toml` beside its binary (the copy the core reads and the
+  Landlock grant is built from), falling back to the compiled one when there
+  is none or it is not Office's.
+- **Comments corrected.** `Limits::default` now says `RLIMIT_DATA` is the
+  memory bound and `RLIMIT_AS` only a backstop. `WORKER_ENV` now says the
+  redirect removed the resolver's connect too (why that one went as well
+  was not traced).
+- **A vacuous assertion removed.** `tests/confined.rs` compared the working
+  directory before and after, but its worker never touches it, so the check
+  could not fail. The test no longer claims it. The real check, that nothing
+  but the commands' own files lands in `Documents/`, is in `tests/app.rs`,
+  through the app.
+- Re-run after the fixes, confined, debug build: docx 517 ms / 378 MiB,
+  xlsx 362 ms / 348 MiB, pptx 326 ms / 245 MiB; page 1 at 1100 px, 42 KiB
+  JPEG in 28 ms.
+
+**Not fixed, known.** The app process itself has no memory limit (only the
+worker does), so any remaining unbounded allocation in the OOXML code is an
+abort or the OOM killer, not an error. One such shape is left: every text
+inline carries the ids of all the comment ranges open over it, so a
+`document.xml` that opens many thousands of overlapping ranges and then has
+many runs costs ranges × runs in memory. It was found reading the scanner
+while fixing the above. It has not been measured.
+
+**Deviations from this brief, each for a reason.**
+
+- **Anchors are flat**: `p/N` is the Nth body paragraph in document order
+  (tables and block content controls included, drawings excluded). Simpler
+  than `tbl/2/r3/c1/p/0`, equally stable for an unchanged file, and the
+  reader and patcher share the one scanner that counts them.
+- **`office.comment.list` and `office.changes.list` are folded into
+  `office.text`**, which returns blocks, comments (threaded), anchored order
+  and changes in one call (`only` trims it to the text or the blocks when
+  a long document does not fit one reply with both).
+- **`office.pages` is separate from `office.open`.** Opening is instant
+  (metadata and the survival report); laying out pages is the slow,
+  cancellable part.
+- **`office.export` is `office.export_pdf`.** Other targets need pandoc
+  (6c) or are lossy pairs the loss report does not cover yet.
+- **`[ui] invoke` is `files.list` and `files.trash`**; `files.stat` was not
+  needed.
+- **Cancel is the app's own** (`office.cancel {job}`): the core never
+  forwards a client's cancel to an app (`wiring::DROPPED_ON_CANCEL`, and the
+  SDK drops `CoreFrame::Cancel`). A job also dies with the handler future
+  and at its timeout.
+- **Save in place** is the UI calling `files.trash` on the original and then
+  `office.save.inplace`, which refuses while anything has the target name.
+  So "the original goes to the trash first" is enforced by the command, not
+  trusted to the caller.
+- **Repeated comments** go into the same working copy: each new version is
+  written beside it, the previous version goes to the trash, and the new one
+  takes its name. Every step is undoable from the trash.
+- **The gesture math stayed in `office.js`** (tested there) rather than
+  moving into `/kit/`, to keep shared changes out of this lane.
+- **A comment is limited to one paragraph.** A selection that runs past its
+  paragraph is cut at the paragraph's end, and the composer says so.
+
+**Trying it.** `cargo xtask install` (or `--prefix DIR` for a throwaway
+node, with a short path: the app sockets live under it and a Unix socket
+path is limited to 108 bytes), restart the server, approve Office from the
+palette ("Approve Office"), put a `.docx` in `Documents/` or `Downloads/`,
+and open it from Files: Quick Look offers "Open in Office". Or open Office
+from the dock and use Open. In Read, select words, tap Comment, write, Save:
+a `… (commented).docx` appears beside the original. This whole path was run
+on 2026-11-21 against a `--debug` node on a scratch port with Playwright
+(approve, launch, pages, comment, reply, export, a deck at phone width, a
+refusal outside the folders).
+
+**Deferred.** 6b spreadsheets; 6c pandoc; the core's per-call file handles
+(platform item (c)); the S2 corpus and the Carlito/Caladea fonts (not
+installed here, not yet an install requirement); verification in Word and
+Google Docs; phones and iOS selection; accepting or rejecting changes;
+resolving, editing or deleting comments; entries in `commentsIds.xml` and
+`commentsExtensible.xml` (Word regenerates them, unverified); pptx speaker
+notes; a fuller survival report in the UI (today one line); the broker
+transport and second socket (stage 4 and 6 of APP-UI-ISOLATION).
+
+---
+
 ### Goal
 
 Open the office files that arrive — `.docx`, `.xlsx`, `.pptx`, their ODF

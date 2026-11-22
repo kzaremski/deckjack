@@ -846,3 +846,109 @@ async fn opening_an_app_awaiting_approval_says_how_to_approve_it() {
     assert!(why.contains("cloud.example.net"), "{why}");
     assert!(!why.contains("see the log"), "{why}");
 }
+
+// ---------------------------------------------------------------------------
+// Idleness and long commands
+// ---------------------------------------------------------------------------
+
+/// Progress on a live call keeps an on-demand app with no window from being
+/// stopped for idleness: a long command (a video export) that is still
+/// reporting is use. Afterwards, with nothing running, the idle sweep does
+/// stop it, so the first half is not passing because the sweep never runs.
+///
+/// This one does launch something, because the idle sweep only touches an
+/// app the host started: a shell script that sleeps, standing in for the
+/// app's process, while the test speaks the protocol over the socket.
+#[tokio::test]
+async fn progress_on_a_long_call_keeps_an_idle_app_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("install");
+    install_app(&install, "demo", &manifest("demo"));
+    let binary = install.join("apps").join("demo").join("deckjack-demo");
+    std::fs::write(&binary, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+
+    let store = Arc::new(std::sync::Mutex::new(Store::open(dir.path()).unwrap()));
+    let registry = Arc::new(Registry::new());
+    let bus = Arc::new(Bus::new(
+        Arc::clone(&registry),
+        NodeId::new("apphost-node"),
+        Arc::new(BusEnv),
+    ));
+    let host = AppHost::new(
+        apps::Host::new(
+            install.clone(),
+            dir.path().to_path_buf(),
+            apps::CoreDoor::new("127.0.0.1:7878".parse().unwrap(), vec![]),
+            apps::OsEnv::new(),
+            apps::Policy {
+                idle_secs: 2,
+                // The stand-in asks for nothing; confining a shell script
+                // is not what is under test.
+                confinement: apps::Confinement::Unconfined,
+                ..apps::Policy::default()
+            },
+            Box::new(StoreGrants::new(store)),
+        ),
+        Arc::clone(&registry),
+        install.clone(),
+        Duration::from_millis(80),
+    );
+    host.start().await;
+    let rig = Rig {
+        host,
+        registry,
+        bus,
+        install,
+        _dir: dir,
+    };
+
+    rig.host.open_window("demo");
+    let mut app = rig.connect("demo").await;
+    rig.until("demo.echo", true).await;
+    assert_eq!(rig.host.window_status("demo"), apps::WindowStatus::Live);
+    rig.host.close_window("demo");
+
+    let request = Request::new(
+        CommandId::new("demo.echo".to_string()).unwrap(),
+        json!({}),
+        Issuer::operator(),
+    );
+    let Ok(Admitted::Running(running)) = rig.bus.dispatch(request) else {
+        panic!("not admitted");
+    };
+    let (mut rx, done) = running.split();
+    let finished = tokio::spawn(done);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let id = app.recv().await["id"].as_u64().unwrap();
+
+    // Twice the idle timeout, reporting progress throughout.
+    for step in 0..16 {
+        app.send(json!({ "frame": "progress", "id": id, "fraction": step as f32 / 16.0, "message": "working" }))
+            .await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        rig.host.poll();
+        assert_eq!(
+            rig.host.window_status("demo"),
+            apps::WindowStatus::Live,
+            "stopped for idleness {}ms into a call that was still reporting",
+            (step + 1) * 250
+        );
+    }
+    app.send(json!({ "frame": "result", "id": id, "result": null }))
+        .await;
+    assert!(finished.await.unwrap().succeeded());
+
+    // Nothing running now: the sweep takes it once the timeout passes.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        rig.host.poll();
+        if rig.host.window_status("demo") == apps::WindowStatus::Unavailable {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            rig.host.stop_all();
+            panic!("an idle app with no call running was never stopped");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}

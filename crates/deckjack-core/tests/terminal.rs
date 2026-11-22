@@ -1399,7 +1399,7 @@ fn a_command_terminal_is_labeled_by_the_program_not_its_path() {
         .unwrap();
 
     assert_eq!(term.info().label, "git");
-    assert_eq!(term.opened_by(), &Opener::Host);
+    assert_eq!(term.opened_by(), Opener::Host);
 }
 
 #[test]

@@ -796,7 +796,11 @@ enum Life {
 pub struct TerminalSession {
     id: TerminalId,
     label: String,
-    opened_by: Opener,
+    /// Behind a lock because it can change exactly one way: the single seat
+    /// moving to another browser session hands that session the previous
+    /// holder's terminals ([`Registry::transfer_owner`]). Nothing else
+    /// writes it.
+    opened_by: Mutex<Opener>,
     opened_at: u64,
     env: Arc<dyn Env>,
     /// Shared with the output pump, which must be able to reap the child
@@ -818,7 +822,7 @@ impl std::fmt::Debug for TerminalSession {
         f.debug_struct("TerminalSession")
             .field("id", &self.id)
             .field("label", &self.label)
-            .field("opened_by", &self.opened_by)
+            .field("opened_by", &self.opened_by())
             .field("pid", &self.pty.pid())
             .finish_non_exhaustive()
     }
@@ -829,8 +833,10 @@ impl TerminalSession {
         &self.id
     }
 
-    pub fn opened_by(&self) -> &Opener {
-        &self.opened_by
+    /// Who owns this terminal now: whoever opened it, or the session the
+    /// seat moved to since.
+    pub fn opened_by(&self) -> Opener {
+        *lock(&self.opened_by)
     }
 
     pub fn size(&self) -> WinSize {
@@ -1152,6 +1158,14 @@ pub struct Registry {
     /// forgotten the session. Kept so the kill switch still reaches them;
     /// dropped once the pump is done and nothing lingers.
     closed: Mutex<Vec<Arc<dyn PtyProcess>>>,
+    /// Where a browser session's terminals went: `from -> to` for every
+    /// session whose terminals [`Registry::transfer_owner`] handed on, to
+    /// whoever has them now. A terminal that `from` asked for before the
+    /// move but that registers after it — `terminal.open` was already
+    /// running when the seat changed hands — goes the same way, instead of
+    /// landing with a session that can no longer use it. Taken after `live`,
+    /// never before.
+    moved: Mutex<HashMap<SessionHash, SessionHash>>,
 }
 
 impl Registry {
@@ -1162,6 +1176,7 @@ impl Registry {
             limits,
             live: Mutex::new(HashMap::new()),
             closed: Mutex::new(Vec::new()),
+            moved: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1196,7 +1211,7 @@ impl Registry {
             .values()
             .filter_map(|s| {
                 s.exit()
-                    .map(|e| (e.at, s.opened_at, s.id.clone(), s.opened_by))
+                    .map(|e| (e.at, s.opened_at, s.id.clone(), s.opened_by()))
             })
             .collect();
         // Oldest exit first, so within one opener the cap takes the ones
@@ -1308,10 +1323,20 @@ impl Registry {
             source: Box::new(e),
         })?;
 
+        // Under `live`, the lock `transfer_owner` holds while it moves
+        // terminals and records the move: either the move already happened
+        // and is applied here, or it happens after this pty is in `live` and
+        // moves it.
+        let opened_by = match spec.opened_by {
+            Opener::Client(asked) => {
+                Opener::Client(lock(&self.moved).get(&asked).copied().unwrap_or(asked))
+            }
+            Opener::Host => Opener::Host,
+        };
         let session = Arc::new(TerminalSession {
             id: id.clone(),
             label: spec.label(),
-            opened_by: spec.opened_by,
+            opened_by: Mutex::new(opened_by),
             opened_at: self.env.now(),
             env: Arc::clone(&self.env),
             pty,
@@ -1333,7 +1358,7 @@ impl Registry {
             terminal = %session.id,
             label = %session.label,
             pid = ?session.pty.pid(),
-            opened_by = ?session.opened_by,
+            opened_by = ?session.opened_by(),
             "terminal opened",
         );
         Ok(session)
@@ -1367,7 +1392,7 @@ impl Registry {
         self.reap_exited();
         let mut out: Vec<Info> = lock(&self.live)
             .values()
-            .filter(|s| &s.opened_by == owner)
+            .filter(|s| &s.opened_by() == owner)
             .map(|s| s.info())
             .collect();
         out.sort_by_key(|i| (i.opened_at, i.id.0.clone()));
@@ -1430,10 +1455,13 @@ impl Registry {
             let mut live = lock(&self.live);
             let ids: Vec<TerminalId> = live
                 .values()
-                .filter(|s| s.opened_by == Opener::Client(*session))
+                .filter(|s| s.opened_by() == Opener::Client(*session))
                 .map(|s| s.id.clone())
                 .collect();
-            ids.iter().filter_map(|id| live.remove(id)).collect()
+            let removed = ids.iter().filter_map(|id| live.remove(id)).collect();
+            // An ended session neither forwards nor is forwarded to.
+            lock(&self.moved).retain(|from, to| from != session && to != session);
+            removed
         };
         for session in &doomed {
             if let Err(e) = session.hangup(Hangup::Polite) {
@@ -1442,6 +1470,52 @@ impl Registry {
         }
         self.keep_closed(doomed.iter().map(|s| Arc::clone(&s.pty)));
         doomed.len()
+    }
+
+    /// Hand every terminal `from` owns to `to`. Returns how many moved.
+    ///
+    /// For the single seat (`crate::seat`): the workspace follows whoever
+    /// holds it, so when another browser session takes the seat it takes the
+    /// previous holder's shells with it. After this the new session can
+    /// reattach and the old one cannot — the ownership check in the terminal
+    /// commands is unchanged, it simply answers for the new owner — and the
+    /// shells now die with the new session rather than the old one, which is
+    /// the session that is actually using them.
+    ///
+    /// Host terminals are never moved, and moving a session's terminals to
+    /// itself moves nothing.
+    pub fn transfer_owner(&self, from: &SessionHash, to: &SessionHash) -> usize {
+        if from == to {
+            return 0;
+        }
+        let live = lock(&self.live);
+        let mut moved = 0;
+        for session in live.values() {
+            let mut owner = lock(&session.opened_by);
+            if *owner == Opener::Client(*from) {
+                *owner = Opener::Client(*to);
+                moved += 1;
+            }
+        }
+        // Record it, for a terminal `from` (or a session that forwarded to
+        // it) asked for that is not in `live` yet. `to` owns its terminals
+        // now, so it forwards nowhere.
+        let mut forwards = lock(&self.moved);
+        for dest in forwards.values_mut() {
+            if dest == from {
+                *dest = *to;
+            }
+        }
+        forwards.insert(*from, *to);
+        forwards.remove(to);
+        drop(forwards);
+        if moved > 0 {
+            tracing::info!(
+                count = moved,
+                "terminals moved to the session that took the seat"
+            );
+        }
+        moved
     }
 
     /// Forget sessions that exited before `cutoff` (unix seconds).

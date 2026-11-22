@@ -1571,6 +1571,13 @@ pub struct Request {
     pub issuer: Issuer,
     pub target: Option<NodeId>,
     pub confirmed: bool,
+    /// The shell socket this request arrived on, as the transport numbered
+    /// it. Server-assigned, never read from a frame, and `None` for every
+    /// path that is not a browser's socket: the CLI, an agent, an approval
+    /// released from the Inbox. Carried so a command about *this connection*
+    /// (the single seat, `crate::seat`) can tell which one asked; nothing
+    /// else should decide anything by it.
+    pub connection: Option<u64>,
 }
 
 impl Request {
@@ -1581,6 +1588,7 @@ impl Request {
             issuer,
             target: s.target,
             confirmed: s.confirmed,
+            connection: None,
         })
     }
 
@@ -1593,11 +1601,19 @@ impl Request {
             issuer,
             target: None,
             confirmed: false,
+            connection: None,
         }
     }
 
     pub fn confirmed(mut self) -> Request {
         self.confirmed = true;
+        self
+    }
+
+    /// Mark the request as arriving on one shell socket. See
+    /// [`Request::connection`].
+    pub fn via_connection(mut self, connection: u64) -> Request {
+        self.connection = Some(connection);
         self
     }
 
@@ -1692,6 +1708,8 @@ pub struct Context {
     pub node: NodeId,
     pub started: SystemTime,
     pub progress: ProgressSink,
+    /// The shell socket the request arrived on; see [`Request::connection`].
+    pub connection: Option<u64>,
 }
 
 impl Context {
@@ -2860,6 +2878,7 @@ impl Bus {
                 dispatch: dispatch.clone(),
                 tx,
             },
+            connection: request.connection,
         };
 
         let future = entry.call(request.params, cx);

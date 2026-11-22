@@ -291,13 +291,23 @@ async fn start_with(auto: lockdown::AutoPolicy) -> Node {
     app_host.start().await;
 
     let ticket_clock = ManualClock::new();
+    // The seat as main.rs builds it, with the terminals and the windows.
+    let hub = ws::Hub::new(Arc::new(ws::SystemClock));
+    let seat = deckjack_core::seat::Seat::new(
+        Arc::clone(&hub),
+        Arc::new(ws::SystemClock),
+        vec![Arc::clone(&terminals) as _, Arc::clone(&windows) as _],
+    );
+    deckjack_core::seat::register(&registry, &seat).expect("the seat commands register");
     let ws_ctx = ws::WsCtx::new(
         Arc::clone(&ctx),
         BusDispatch::new(
             Arc::clone(&bus),
             deckjack_core::ticket::Tickets::new(Arc::clone(&ticket_clock) as Arc<dyn ws::Clock>),
+            Arc::clone(&seat),
         ),
-        ws::Hub::new(Arc::new(ws::SystemClock)),
+        seat,
+        hub,
         Arc::new(ws::SystemClock),
         node_id,
         node::host_name(),

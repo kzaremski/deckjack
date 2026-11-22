@@ -1,0 +1,44 @@
+[package]
+name = "deckjack-office"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Deckjack app: read, comment on and export office documents"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "deckjack-office"
+path = "src/main.rs"
+
+[dependencies]
+deckjack-app.workspace = true
+deckjack-protocol.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+libc.workspace = true
+rust-embed.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+# Crate-local rather than workspace dependencies: nothing else in the
+# workspace reads OOXML, and keeping them here keeps the root manifest's
+# merge surface to the members line.
+#
+# zip: deflate through flate2's pure-Rust backend only. No bzip2, zstd, lzma
+# or AES: an OOXML package is stored or deflated, and an entry in any other
+# method is refused rather than decoded.
+zip = { version = "9.8.1", default-features = false, features = ["deflate-flate2"] }
+# zip turns flate2's default backend off; this turns the pure-Rust one back on.
+flate2.workspace = true
+quick-xml = "0.41.0"
+
+[dev-dependencies]
+deckjack-core = { path = "../deckjack-core" }
+tempfile.workspace = true

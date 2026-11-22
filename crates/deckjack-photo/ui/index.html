@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Photos</title>
+    <link rel="stylesheet" href="/kit/kit.css" />
+    <link rel="stylesheet" href="photo.css" />
+  </head>
+  <body>
+    <div class="dj-bar">
+      <button class="dj-button" id="open">Photos</button>
+      <h1 class="dj-title" id="name">No photo open</h1>
+      <span class="dj-spacer"></span>
+      <button class="dj-button" id="undo" disabled title="Undo (Ctrl+Z)">Undo</button>
+      <button class="dj-button" id="redo" disabled title="Redo (Ctrl+Shift+Z)">Redo</button>
+      <button class="dj-button" id="before" title="Hold to see the original (\)">Before</button>
+      <button class="dj-button" id="export" disabled>Export</button>
+    </div>
+
+    <div class="layout">
+      <div class="view" id="view">
+        <canvas id="canvas"></canvas>
+        <div class="overlay" id="overlay"></div>
+      </div>
+      <div class="sheet">
+        <nav class="tabs" role="tablist">
+          <button class="tab" role="tab" data-tab="light">Light</button>
+          <button class="tab" role="tab" data-tab="levels">Levels</button>
+          <button class="tab" role="tab" data-tab="curves">Curves</button>
+          <button class="tab" role="tab" data-tab="crop">Crop</button>
+          <button class="tab" role="tab" data-tab="local">Local</button>
+          <button class="tab" role="tab" data-tab="export">Export</button>
+        </nav>
+        <div class="panel" id="panel"></div>
+      </div>
+    </div>
+
+    <div class="picker" id="picker" hidden>
+      <div class="dj-bar">
+        <h2 class="dj-title">Open a photo</h2>
+        <span class="dj-spacer"></span>
+        <button class="dj-button" id="picker-close">Close</button>
+      </div>
+      <div class="picker-list" id="picker-list"></div>
+    </div>
+
+    <p class="dj-status" id="status" role="status">Loading…</p>
+
+    <script type="module" src="main.js"></script>
+  </body>
+</html>

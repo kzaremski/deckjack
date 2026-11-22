@@ -199,6 +199,16 @@ async fn start() -> Harness {
     deckjack_core::approvals::register_approvals(&registry, &approvals, &bus)
         .expect("the grant and Inbox commands register");
 
+    // The single seat, with the terminals and the windows following it, as
+    // main.rs builds it: before the sign-in context, which frees it when a
+    // session ends.
+    let hub = ws::Hub::new(Arc::new(ws::SystemClock));
+    let seat = deckjack_core::seat::Seat::new(
+        Arc::clone(&hub),
+        Arc::new(ws::SystemClock),
+        vec![Arc::clone(&terminals) as _, Arc::clone(&windows) as _],
+    );
+    let seat_reaper = Arc::clone(&seat);
     let reaper = Arc::clone(&terminals);
     let sign_in_store = Arc::clone(&store);
     let sign_in_watchdog = Arc::clone(&watchdog);
@@ -215,6 +225,7 @@ async fn start() -> Harness {
             node_id.clone(),
         )
         .on_session_end(move |hash| reaper.close_for_session(hash))
+        .on_session_end(move |hash| seat_reaper.session_ended(hash))
         .on_sign_in(move |ip| {
             let now = std::time::SystemTime::now();
             let known = {
@@ -267,13 +278,16 @@ async fn start() -> Harness {
     wiring::register_apps(&registry, Arc::clone(&app_host)).expect("the app commands register");
     app_host.start().await;
 
+    deckjack_core::seat::register(&registry, &seat).expect("the seat commands register");
     let ws_ctx = ws::WsCtx::new(
         Arc::clone(&ctx),
         BusDispatch::new(
             Arc::clone(&bus),
             deckjack_core::ticket::Tickets::new(Arc::new(ws::SystemClock)),
+            Arc::clone(&seat),
         ),
-        ws::Hub::new(Arc::new(ws::SystemClock)),
+        seat,
+        hub,
         Arc::new(ws::SystemClock),
         node_id,
         node::host_name(),

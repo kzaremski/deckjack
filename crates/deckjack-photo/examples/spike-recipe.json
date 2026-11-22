@@ -1,0 +1,11 @@
+{
+  "exposure_ev": 0.7,
+  "white_balance": { "temperature": 30, "tint": -10 },
+  "curves": { "master": [[0, 0], [0.25, 0.17], [0.75, 0.86], [1, 1]] },
+  "masks": [
+    {
+      "mask": { "kind": "radial", "cx": 0.45, "cy": 0.55, "rx": 0.22, "ry": 0.3, "angle_deg": 20, "feather": 0.6 },
+      "exposure_ev": 0.7
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+[package]
+name = "deckjack-video"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Deckjack app: a cuts-and-audio video editor over FilmCraft's engine"
+
+[[bin]]
+name = "deckjack-video"
+path = "src/main.rs"
+
+[dependencies]
+deckjack-app.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+image.workspace = true
+rust-embed.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+libc.workspace = true
+# FilmCraft's engine, linked in-process (docs/lanes/5d-video.md, spike S2).
+# Pinned to one commit: it is alpha and moves daily, and a re-sync is a
+# deliberate act with the S3 corpus as its gate (R11). Only the engine and
+# the crates below it are linked: no egui front end, no TCP control server,
+# no MCP server, no GPU crate, and nothing that touches the network.
+filmcraft-engine = { git = "https://github.com/storytold/filmcraft", rev = "a378140d8e665674fd0a037784ed5112cc9fe98d" }
+
+[dev-dependencies]
+deckjack-protocol.workspace = true
+tempfile.workspace = true

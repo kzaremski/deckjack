@@ -27,6 +27,12 @@ export interface Hello {
   type: "hello";
   protocol: number;
   client?: string;
+  /**
+   * What the operator calls this device ("Chrome on Pixel"). Shown to the
+   * other devices while this connection holds the seat; the node sanitizes
+   * it and decides nothing by it.
+   */
+  device?: string;
 }
 
 /**
@@ -221,7 +227,8 @@ export interface WireWindow {
 /** A command's result, flattened for callers. */
 export type CommandOutcome =
   | { id: CorrelationId; status: "ok"; value?: unknown }
-  | { id: CorrelationId; status: "error"; message: string }
+  /** `code` is the node's stable error code, when it sent one. */
+  | { id: CorrelationId; status: "error"; message: string; code?: string }
   /** Above the risk threshold for its issuer: waiting in the Inbox. */
   | { id: CorrelationId; status: "queued"; inboxId: string }
   /** Outside the session's grant. Refused, not queued. */
@@ -250,6 +257,26 @@ export type CommandOutcome =
  */
 export type CallResult = Exclude<CommandOutcome, { status: "confirm" }>;
 
+/**
+ * The single seat, as the node describes it to one connection: the payload
+ * of the `seat` event and the answer to every `seat.*` command. Mirrors
+ * `seat::Status::to_json` in `crates/deckjack-core/src/seat.rs`.
+ */
+export interface SeatStatus {
+  /** This connection holds the seat. */
+  held: boolean;
+  /** This connection would get it without taking it from anyone. */
+  claimable: boolean;
+  /** Who has it, or null when it is vacant. */
+  holder: {
+    device: string;
+    /** When they took it, milliseconds since the epoch. */
+    since_ms: number;
+    /** False while it is held for a device whose connection dropped. */
+    connected: boolean;
+  } | null;
+}
+
 /** Server pushes, normalized by topic into something the stores switch on. */
 export type ServerEvent =
   | { kind: "windows"; windows: WireWindow[] }
@@ -257,5 +284,6 @@ export type ServerEvent =
   | { kind: "inbox"; pending: number }
   | { kind: "node"; name: string; generation: number }
   | { kind: "lockdown"; active: boolean }
+  | { kind: "seat"; seat: SeatStatus }
   /** Anything the shell does not yet model, kept so nothing is silently lost. */
   | { kind: "other"; topic: string; payload: unknown };

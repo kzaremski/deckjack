@@ -1,6 +1,226 @@
 # Lane 5d: Video editor (scoping brief)
 
-Status: research brief, nothing built. Written 2026-11-16 against the tree at
+Status: **first pass built** (2026-11-21), on the brief below. The brief was
+written 2026-11-16 and is kept as it was; what the spike measured and what was
+built or deferred is in the next section, which wins where they differ.
+
+## First pass, 2026-11-21: spike S2 and what was built
+
+### Spike S2: FilmCraft embeds. Engine A is taken.
+
+Run first, before any app code, on the operator's laptop (24 threads, Linux
+7.2, rustc 1.99.0).
+
+| Question | Measured |
+|---|---|
+| Does it exist? | Yes: `github.com/storytold/filmcraft`, version 0.20.1, edition 2024, `rust-version = 1.95`. Pinned at `a378140d8e665674fd0a037784ed5112cc9fe98d` (main, 2026-11-21). |
+| Does it build here? | Yes, as a git dependency, with no patches. Its own git dependencies (`storytold/craft-libs` at five pinned commits) come along; nothing from crates.io is missing. |
+| Compile time | `filmcraft-engine` and everything below it, release, cold, including the git fetch: **103 s**. `deckjack-video` debug, cold: **41 s**. Incremental rebuilds of the app: about 3 s. |
+| Binary size | Spike probe (engine plus a `main`), release: **50.8 MB**, **39.9 MB stripped**. `deckjack-video` release, unstripped: **54.6 MB** (the core is 25.9 MB). R12: an install stages a full copy. |
+| Dependency tree | **261 crates**, all Rust. No `wgpu`, no TLS, no HTTP client, no tokio, no egui or winit, no C library (the only `-sys` crate is `linux-raw-sys`). The GPU crate, the UI, the TCP control server and the MCP server are not linked at all. |
+| Embedding surface | Exists, though undocumented: `Session::default()`, `Session::start_autosave(AutosaveConfig)`, `Session::execute(id, json)` (the same entry point FilmCraft's UI, CLI and MCP use), and `Session::try_render_program_with_offline_at(scale, tick)`. `Session` is `Send`. |
+| Edit, undo, render, save | Import a clip, make a sequence from it, razor, undo, render a frame on the CPU path, save `.fcproj`: all worked from a 60-line program. |
+| Scrub still (CPU) | 640×360 from 720p30 H.264 at 1 s: **35 ms**. 960×540 from 1080p30 at 1 s (seek into a GOP, first decode): **349 ms**. No proxies (see Deferred). |
+| Export (FilmCraft's own H.264/AAC encoder, software) | 30 s of 1080p30: **12.3 s** (73 fps). Its default bitrate is about 20 Mbit/s, so exports here use CRF 20. |
+| Peak memory | **Not measured**: `/usr/bin/time` is not installed and nothing else was set up for it. R10 stays open. |
+| Confined | See "Confined run" below. |
+
+Decision: **engine A (FilmCraft in-process)**. The fallback (our own OTIO model
+plus the ffmpeg binary) was not started.
+
+### Built
+
+Crate `crates/deckjack-video`, app id `video`, 28 commands, all `read` or
+`write`, all in its own scope. Manifest: `Videos/` read-write and nothing else.
+
+- **No GPU in the manifest.** The brief asked for `gpu = true`. The CPU
+  renderer is the only path this build links (FilmCraft's `gpu` crate is not a
+  dependency), so asking for `/dev/dri` would ask for something unused.
+- **Projects:** `video.project.new/open/save/list/describe/wait/recover`. One
+  FilmCraft session per project file, shared by every window and agent. A new
+  project has V1–V2 and A1–A2; the first clip inserted sets its size and rate.
+  Save writes `<name>.fcproj` and rewrites `<name>.otio` through a hidden
+  staging file. **Autosave** is FilmCraft's rolling `Videos/Auto-Save/` copies
+  (every 5 min, 20 kept). **Crash recovery** is FilmCraft's journal in the
+  app's private `HOME`: after a crash, `open` reports the unsaved edits and
+  `recover` applies them; nothing is applied silently. Only a journal written
+  after the project file was last saved is offered, so saving after a crash
+  retires the offer for good. FilmCraft's recover replaces the project and
+  clears undo, so when the open state has unsaved edits `recover` first saves
+  them as `<name> (before recovery).fcproj` (a project of its own) and names
+  it in the answer. An unreadable `.fcproj` with a sidecar opens from the
+  `.otio` and says what OTIO does not keep; every later opener is told too,
+  and the first save copies the file that would not open to
+  `<name>.fcproj.unopened` before replacing it (it may be from a newer
+  FilmCraft, or only briefly unreadable). Opens and creates are serialized,
+  so concurrent first uses of a project share one session.
+- **Media:** `video.media.list` (recursive, under `Videos/`) and
+  `video.media.import`, with FilmCraft's probe (size, rate, codec, channels,
+  duration) in `describe`.
+- **Edits, each one FilmCraft command and so one undo step, each naming its
+  targets:** `insert`, `overwrite` (with source in and duration), `move`
+  (across tracks of a kind, optionally inserting), `trim` (either edge, ripple
+  on or off, linked or not), `split` (one clip and its partners, or all
+  tracks), `lift`, `ripple_delete`, `link`, `unlink`, `gain`; markers
+  `add/move/remove`; `undo`, `redo`. FilmCraft's Link is a toggle, so link and
+  unlink check the outcome rather than trusting it.
+- **Monitor:** `video.frame.render` returns a base64 JPEG and its size; the
+  window shows it from a `blob:` URL. One request in flight; scrubs meanwhile
+  collapse into one follow-up.
+- **Export:** `video.export.start/cancel/list`, H.264/AAC MP4 at source, 1080p
+  or 720p (aspect kept, never upscaled). Written under a hidden
+  `.<name>.<job>.partial.mp4` and published by hard link, which fails rather
+  than replaces, so a taken name becomes `name 2.mp4` (a dangling symlink
+  counts as taken). On a filesystem without hard links (vfat and exFAT
+  return `EPERM`) it falls back to an exclusive create and a copy; `EACCES`
+  is reported, not worked around. A cancelled or failed export removes its
+  own partial file and nothing else; one left by a crash is swept at startup.
+  An export asks FilmCraft for `maxThreads = cores/2` and runs at nice 10 or
+  lower priority (see "Review fixes" for what that does and does not cover).
+  The window starts exports with `wait: true` and does not await the answer:
+  the progress frames are what keep the core from stopping the app for
+  idleness once the window is closed.
+  Cancellation is in-process (FilmCraft's job cancel flag), not the SDK.
+  Optional `loudness_lufs` passes FilmCraft's render-time loudness
+  normalization through (**untested** against a meter; see Deferred).
+- **Agents:** `video.project.describe` returns tracks (`V1`, `A1`…), clips
+  (frames, source in, link group, gain), markers, media and revision.
+  `video.project.wait {since}` long-polls for changes.
+- **UI** (no build, plain ES modules, `/kit/` only): `model.js` (time and
+  pixels, pinch, snapping, layout, hit testing, timecode), `timeline.js`
+  (canvas and gestures), `video.js` (the app), `video.css`. Tap selects,
+  long-press drags (a mouse drags at once), handles only on the selected clip
+  and reaching outside it, one finger on the ruler scrubs, one finger on empty
+  track pans, two fingers pinch and pan, nudge buttons (−10, −1, +1, +10) and a
+  timecode field for frame accuracy, Ripple and Snap toggles, Undo and Redo
+  always visible, the keyboard keys from the brief (except J/K/L, Space and
+  I/O, which need playback or a source monitor). Bin as a sheet below 600 px
+  and docked beside the monitor from 600 px; a message below 360 px. No inline
+  script, no content route, no storage, no network.
+
+Time on the wire is whole frames at the sequence's rate; FilmCraft's ticks
+stay inside the backend.
+
+### Deferred, and why
+
+- **Playback / render-ahead preview segments** (`video.preview.segment`, MSE):
+  the monitor is stills only. The largest missing piece.
+- **Proxies**: none built. Scrubbing decodes the source; fine at 720p, slow on
+  1080p+ seeks (349 ms above) and certainly on 4K HEVC.
+- **Loudness measurement** (`video.loudness.measure`): not built. Export's
+  `loudness_lufs` is wired to FilmCraft's normalizer but no test measures the
+  result, so treat −14 LUFS as unverified.
+- **Cross-dissolves, fades, transitions**: not exposed (FilmCraft has them:
+  `sequence.applyVideoTransition`, `applyAudioTransition`).
+- **Waveforms and filmstrip thumbnails**, `video.prefs.*`, interchange export
+  to FCPXML/EDL, `video.proxy.*`: not built.
+- **Spikes S1, S3–S7**: not run. S3 (real phone footage: VFR, HEVC HDR,
+  rotation) is the one most likely to change a decision.
+
+### Confined run
+
+Done on this laptop with the release core and app, a throwaway
+`DECKJACK_HOME` and working directory under `/tmp`, `--debug` on
+127.0.0.1:7951 (not the live server), driven over `/ws` with the debug
+session cookie: approve (`gpu: false`, `Videos/` read-write, nothing else),
+open a window (which launches the app; the log says "launching app
+confined"), then every command below.
+
+| Step | Measured |
+|---|---|
+| `video.project.new` | 6 ms |
+| `video.media.import` (30 s 1080p30 H.264, 21.7 MB) | 4 ms; probe correct (1920×1080, 30/1, H.264 High, mono AAC, 900 frames) |
+| insert, split, marker, describe | correct state |
+| `video.frame.render` at 640 px, 1080p source | 122 ms first, 12–13 ms for the next frames, 265–310 ms on a seek into another GOP, 28 ms after it; 34–36 KB base64 |
+| `video.project.save` (`.fcproj` and `.otio`) | 4 ms |
+| `video.export.start` 720p, `wait` | 14.6 s for 30 s; `ffprobe`: H.264 1280×720 30.0 s, AAC 30.0 s |
+| `video.export.start` 1080p, cancelled after 1.5 s | `cancelled` at 11%; no file left |
+
+On disk afterwards: `Videos/` holds the source, `Confined.fcproj`,
+`Confined.otio` and `Confined.mp4`, and nothing else; FilmCraft's
+preferences, presets and recovery journal are in the app's private
+`cache/apps/video/home/filmcraft/`. Nothing else in the working directory
+changed. Not yet seen: an `Auto-Save/` folder (its first copy comes after five
+minutes), and **the UI in a real browser**: the window's JavaScript is tested
+in happy-dom only, so layout at 360 px, canvas drawing and touch on a phone
+are unverified (that is S6).
+
+### Tests
+
+`cargo test -p deckjack-video`: 40 tests after the review fixes (30 in the first pass), most end to end against FilmCraft's
+real engine and a committed 2-second fixture (`tests/fixtures/clip.mp4`, 24 KB,
+192×108 H.264/AAC): insert/overwrite, split, trim with and without ripple,
+lift versus ripple delete, linked moves, one-sided trims and moves, unlink and relink, undo/redo, markers,
+save and reopen in a fresh process, sidecar fallback, crash recovery, stills,
+export (read back by FilmCraft's demuxer), cancel, long poll, and the
+manifest/handler/UI contract, plus recovery after a save, recovery over unsaved
+edits, the sidecar copy, concurrent opens and creates, first-clip placement at
+another rate, dangling symlinks, the no-hard-link copy, partial-file cleanup,
+the thread cap and the nice value. `web/src/apps/video.test.js`: 29 tests of the
+timeline math and the mounted UI with a fake bus. Every test was
+mutation-checked: the guarded code broken, the test seen failing, restored.
+
+### Review fixes, 2026-11-21
+
+A review of the first pass found nine problems. All nine were real; each is
+fixed with a test that was seen failing with the fix taken out.
+
+- **Recovery was offered forever, and applying it could drop live edits.**
+  Fixed as described under Built: a save after the journal retires it, and a
+  recover over unsaved edits saves them as a copy first. The banner no
+  longer says the changes "were recovered" before anything is applied.
+  `file.discardRecovery` is still not exposed: a journal superseded by a save
+  stays in the app's private `HOME` until FilmCraft prunes it, but it is never
+  offered again.
+- **The sidecar fallback could replace the original `.fcproj` with no copy.**
+  Fixed: the copy to `<name>.fcproj.unopened` comes first.
+- **Concurrent first opens built two sessions.** Fixed: one lock covers open
+  and create.
+- **`publish` spun forever on a dangling symlink.** Fixed (`symlink_metadata`).
+- **No hard links meant a failed export.** Fixed (copy fallback).
+- **Cleanup by prefix could delete another job's partial file.** Fixed: only
+  the job's own file is removed. FilmCraft writes an MP4 export to that one
+  path and nothing beside it (`export/src/output.rs`).
+- **The first clip into an empty sequence landed on the wrong frame when its
+  rate differed from the placeholder's** (frame 100 at 30 fps became 120
+  after a 25 fps placeholder). Fixed: the start frame and duration go to
+  FilmCraft as frames, which it reads after `matchSequence`. **Not fixed:**
+  `source_in` on that same first clip is still converted at the old rate; no
+  caller sends it on a first clip today.
+- **A background export was killed by the idle sweep.** The core noted
+  activity when a command was dispatched, never while it ran, so an
+  on-demand app with no window was stopped 300 s into a long export.
+  Fixed in two parts. The core's frame pump now counts progress on a live
+  call as activity (`deckjack-core/src/apphost.rs`, a core change; test in
+  `deckjack-core/tests/apphost.rs`). The window uses `wait: true`, so its
+  export reports progress for its whole length. **Still true:** an agent's
+  `wait: false` export survives only while something calls the app at least
+  every five minutes; the parameter's description says so. A real fix is a
+  protocol-level "busy" signal from app to core, which is not built.
+- **Resource limits the sandbox section requires were missing.** Partly
+  fixed. An export now passes `maxThreads = cores/2`, and the call that
+  starts it runs on a thread at nice 10. Linux nice is per thread and
+  inherited, so every thread the export starts runs niced. Measured with a
+  thread census of the test process during an export, on this 24-thread
+  laptop: every export-time thread was at nice 10. That covers FilmCraft's
+  `filmcraft-export*` threads (61 of them, not 12), 16 `h264-*` encoder
+  threads and 24 `decode-*` threads. **The thread cap does not hold**:
+  `maxThreads` sizes only FilmCraft's export render pool. Its decode pool
+  (`codecs/src/gop.rs`, `decode_pool`) is a process-wide static sized to
+  every core, and its H.264 encoder keeps a pool of its own. The decode pool
+  is also built by whatever decodes first. In the app that is usually a scrub
+  at normal priority, so decoding during a later export runs at nice 0 on 24
+  threads. Capping that takes a FilmCraft change, or nicing the whole app
+  process, which has not been decided. **No decode memory budget** was built
+  either. FilmCraft caps each source's frame cache at 384 MB
+  (`FRAME_CACHE_CEILING`, from reading the source; not measured). R10, peak
+  memory, is still unmeasured.
+
+---
+
+The original brief follows.
+
+Written 2026-11-16 against the tree at
 `179119c` plus the uncommitted working tree, `docs/APP-SUITE.md` §2, §3, §11, §12
 and Lanes 5 to 7, `docs/DESIGN.md`, `docs/APP-UI-ISOLATION.md`, and
 `crates/deckjack-core/src/{sandbox.rs,apps.rs}`. Facts about FilmCraft come from
