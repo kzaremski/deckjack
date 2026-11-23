@@ -15,6 +15,9 @@ pub struct Rig {
     /// The plan's private HOME and TMPDIR.
     pub home: PathBuf,
     pub tmp: PathBuf,
+    /// Where the core's end of each launch's link arrives, as it would at
+    /// the core's attendant for this app.
+    pub links: std::sync::Mutex<apps::LinkReceiver>,
     installed: apps::Installed,
     _dir: tempfile::TempDir,
 }
@@ -61,6 +64,7 @@ impl Rig {
         .unwrap();
 
         let env = OsEnv::new();
+        let links = std::sync::Mutex::new(env.links().attend("office"));
         let found = apps::discover(&install, &env);
         let installed = found
             .apps
@@ -87,6 +91,7 @@ impl Rig {
             work,
             home,
             tmp,
+            links,
             installed,
             _dir: dir,
         })

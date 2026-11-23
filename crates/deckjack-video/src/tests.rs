@@ -955,19 +955,19 @@ fn the_manifest_asks_for_videos_and_nothing_else() {
 
 #[test]
 fn every_declared_command_has_a_handler_and_no_handler_is_undeclared() {
-    // `App::run` checks the registration before it looks for the core's
-    // socket, so with no socket a consistent app fails on the socket and an
+    // `App::run` checks the registration before it looks for its link to
+    // the core, so with no link a consistent app fails on the link and an
     // inconsistent one fails on the command.
     assert!(
-        std::env::var_os(deckjack_app::SOCKET_ENV).is_none(),
-        "the test environment has a core socket set"
+        std::env::var_os(deckjack_app::LINK_ENV).is_none(),
+        "the test environment has a core link set"
     );
     let r = rig();
     let exports = Arc::new(Exports::new(r.root.clone()));
     let studio = Arc::new(Studio::new(r.root.clone(), r.data.clone()).unwrap());
     let error = crate::build(&studio, &exports).unwrap().run().unwrap_err();
     let error = error.to_string();
-    assert!(error.contains(deckjack_app::SOCKET_ENV), "{error}");
+    assert!(error.contains(deckjack_app::LINK_ENV), "{error}");
 }
 
 /// Every `"video.…"` string literal in a script.

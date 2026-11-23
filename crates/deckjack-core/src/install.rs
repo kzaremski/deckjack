@@ -858,6 +858,22 @@ pub fn uninstall(install_dir: &Path, name: &str) -> Result<PathBuf, InstallError
 
 /// What `deckjack apps` prints: every app discovery finds, and every
 /// directory it will not run with the reason.
+/// The line `deckjack apps` adds under its listing when no app can launch on
+/// a node with this sandbox, or nothing. Asked with confinement enforced,
+/// which is how a node runs unless it was started in developer mode, and
+/// said only when there is something listed that will not launch.
+pub fn render_node_refusal(
+    found: &Discovery,
+    availability: &crate::sandbox::Availability,
+) -> String {
+    match apps::launch_refusal(availability, apps::Confinement::default()) {
+        Some(why) if !found.apps.is_empty() => {
+            format!("\nNONE OF THESE WILL LAUNCH ON THIS NODE: {why}.\n")
+        }
+        _ => String::new(),
+    }
+}
+
 pub fn render_listing(found: &Discovery) -> String {
     let mut out = String::new();
     if found.apps.is_empty() && found.problems.is_empty() {

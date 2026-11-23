@@ -1,0 +1,27 @@
+[package]
+name = "deckjack-convert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Deckjack app: convert and compress video and audio with the system's ffmpeg"
+
+[[bin]]
+name = "deckjack-convert"
+path = "src/main.rs"
+
+[dependencies]
+deckjack-app.workspace = true
+deckjack-protocol.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+libc.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

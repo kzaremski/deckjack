@@ -710,7 +710,7 @@ async fn no_session_cookie_reaches_the_state_file_after_a_passkey_sign_in() {
     // a sync target, another local account reading the file — must not hand
     // over anything that can be presented as a cookie.
     let h = Harness::start(&[row(b"pocket-4", "Pocket 4", 1)]).await;
-    let ip: IpAddr = "100.69.236.100".parse().unwrap();
+    let ip: IpAddr = "100.64.0.20".parse().unwrap();
     let id = SessionId::generate().expect("a session id");
 
     h.passkeys
@@ -742,7 +742,7 @@ async fn a_passkey_sign_in_on_a_full_node_evicts_instead_of_refusing_and_deletes
     // through `http::Ctx::apply`, which is the one place that knows a revoked
     // session owes a deleted row, a reaped pty and an audit entry.
     let h = Harness::start(&[row(b"pocket-4", "Pocket 4", 1)]).await;
-    let ip: IpAddr = "100.69.236.100".parse().unwrap();
+    let ip: IpAddr = "100.64.0.20".parse().unwrap();
 
     let stale: Vec<SessionId> = (0..limits().max_sessions)
         .map(|_| h.tether_session(ip))
@@ -824,7 +824,7 @@ async fn a_passkey_sign_in_from_a_blocked_address_is_refused_without_evicting() 
     // eviction: without it, an address blocked during the ceremony would
     // destroy a live session on its way in.
     let h = Harness::start(&[row(b"pocket-4", "Pocket 4", 1)]).await;
-    let operator: IpAddr = "100.69.236.100".parse().unwrap();
+    let operator: IpAddr = "100.64.0.20".parse().unwrap();
     let hostile: IpAddr = "100.69.236.200".parse().unwrap();
 
     // The node is full, and every slot belongs to the operator's own
@@ -868,7 +868,7 @@ async fn a_passkey_session_is_recorded_as_the_stronger_kind() {
     // every passkey session reads as tether and step-up refuses the one
     // thing it exists to allow.
     let h = Harness::start(&[row(b"pocket-4", "Pocket 4", 1)]).await;
-    let ip: IpAddr = "100.69.236.100".parse().unwrap();
+    let ip: IpAddr = "100.64.0.20".parse().unwrap();
     let id = SessionId::generate().expect("a session id");
     h.passkeys.admit(ip, &id).expect("the session is admitted");
 

@@ -1007,7 +1007,7 @@ mod tests {
     #[test]
     fn sessions_round_trip() {
         let s = Store::in_memory().unwrap();
-        let sess = session("100.69.236.100", 3600);
+        let sess = session("100.64.0.20", 3600);
         s.insert_session(&id(1), &sess).unwrap();
 
         let live = s.live_sessions(SystemTime::now()).unwrap();
@@ -1054,7 +1054,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let s = Store::open(dir.path()).unwrap();
-            s.insert_session(&id(7), &session("100.69.236.100", 3600))
+            s.insert_session(&id(7), &session("100.64.0.20", 3600))
                 .unwrap();
             s.checkpoint().unwrap();
         }

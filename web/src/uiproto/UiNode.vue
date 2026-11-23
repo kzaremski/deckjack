@@ -12,7 +12,7 @@ import type { Choice, UiNode as Node } from "./tree.ts";
  * Every string an app sends is rendered with text interpolation, which Vue
  * escapes; there is no `v-html` anywhere in this renderer, and nothing here
  * reads a URL, a style or a class name from the tree. An app chooses which
- * of twelve widgets to show and what they say, never how they are built.
+ * of thirteen widgets to show and what they say, never how they are built.
  *
  * `path` is a string (see `childPath`) so an unchanged child receives an
  * unchanged prop and is skipped when its parent re-renders.
@@ -113,6 +113,17 @@ function chose(event: Event) {
   ui.win.fields.set(widget.name, option.value);
   ui.channel.event(ui.win, at(), "changed", option.value);
 }
+
+// --- progress ------------------------------------------------------------------
+
+/** Clamped to the bar's range; absent (or not a number) is the indeterminate bar. */
+const progressValue = computed(() => {
+  const widget = w.value;
+  if (widget.kind !== "progress" || typeof widget.value !== "number" || !Number.isFinite(widget.value)) {
+    return undefined;
+  }
+  return Math.min(1, Math.max(0, widget.value));
+});
 
 // --- dates ---------------------------------------------------------------------
 
@@ -223,6 +234,14 @@ const date = computed(() => {
     <p class="ui-empty-title">{{ w.title ?? "" }}</p>
     <p v-if="w.detail" class="ui-empty-detail">{{ w.detail }}</p>
   </div>
+
+  <progress
+    v-else-if="w.kind === 'progress'"
+    class="ui-progress"
+    max="1"
+    :value="progressValue"
+    :aria-label="w.label || undefined"
+  ></progress>
 
   <time
     v-else-if="w.kind === 'date' && date"
@@ -394,6 +413,18 @@ const date = computed(() => {
 }
 .ui-empty-detail {
   font-size: var(--dj-type-small-size);
+}
+
+/* Full width in a stack, shrinking beside its siblings in a row; never
+ * grown along a stack's axis (flex: 1 there made it zero tall). */
+.ui-progress {
+  flex: 0 1 auto;
+  align-self: stretch;
+  min-width: 0;
+  width: 100%;
+  height: var(--dj-space-2);
+  min-height: var(--dj-space-2);
+  accent-color: var(--dj-color-accent);
 }
 
 .ui-date {

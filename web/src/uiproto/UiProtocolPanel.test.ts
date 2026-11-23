@@ -444,3 +444,30 @@ describe("the palette", () => {
     ]);
   });
 });
+
+describe("progress", () => {
+  const bar = (value?: number | null, label = "Encoding a.mov"): UiNode => ({
+    key: "root",
+    widget: { kind: "stack" },
+    children: [{ key: "bar", widget: { kind: "progress", label, ...(value === undefined ? {} : { value }) } }],
+  });
+
+  it("draws a native bar named for what is progressing, clamped to its range", async () => {
+    const m = mounted();
+    await m.draw(bar(0.25));
+    const el = m.wrapper.find("progress");
+    expect(el.attributes("aria-label")).toBe("Encoding a.mov");
+    expect((el.element as HTMLProgressElement).value).toBe(0.25);
+    m.frame({ rev: 2, patches: [{ op: "props", path: ["bar"], widget: { kind: "progress", value: 7, label: "x" } }] });
+    await nextTick();
+    expect((m.wrapper.find("progress").element as HTMLProgressElement).value).toBe(1);
+  });
+
+  it("is indeterminate while nobody knows how far, which is not the same as not started", async () => {
+    const m = mounted();
+    await m.draw(bar());
+    expect(m.wrapper.find("progress").attributes("value")).toBeUndefined();
+    await m.draw(bar(0), 2);
+    expect(m.wrapper.find("progress").attributes("value")).toBe("0");
+  });
+});

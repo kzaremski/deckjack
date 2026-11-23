@@ -563,10 +563,10 @@ mod tests {
         // on the document, an `<img>` or a `fetch`. These are the shapes the
         // real shell sends there.
         let insecure: [(&str, &[(&str, &str)]); 4] = [
-            ("100.70.30.57:7878", &[]),
+            ("100.64.0.10:7878", &[]),
             (
-                "100.70.30.57:7878",
-                &[("referer", "http://100.70.30.57:7878/")],
+                "100.64.0.10:7878",
+                &[("referer", "http://100.64.0.10:7878/")],
             ),
             ("node.example", &[("origin", "http://node.example")]),
             ("node.example", &[("x-forwarded-proto", "http")]),
@@ -590,13 +590,13 @@ mod tests {
             }
             // A POST with no `Origin` is not a browser, insecure or not.
             assert_eq!(
-                verdict(&Method::POST, path, &at("100.70.30.57:7878", &[])),
+                verdict(&Method::POST, path, &at("100.64.0.10:7878", &[])),
                 Err(Refusal::NoFetchMetadata),
                 "POST {path} without Origin"
             );
             // Rule 1 still holds there: a sandboxed frame's fetch says null.
             assert_eq!(
-                v(path, &at("100.70.30.57:7878", &[("origin", "null")])),
+                v(path, &at("100.64.0.10:7878", &[("origin", "null")])),
                 Err(Refusal::NullOrigin)
             );
         }

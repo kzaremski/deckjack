@@ -207,6 +207,13 @@ export interface InstalledApp {
   /** What it asks for, in the core's words, for the approval entry. */
   asks?: string;
   /**
+   * Why no app can launch on this node at all, in the core's words: a
+   * kernel whose sandbox cannot hold an app, say. Absent when apps can.
+   * Shown where the app is offered, so the operator reads the reason
+   * before a window fails to open.
+   */
+  refusal?: string;
+  /**
    * How its window is drawn: absent, the app's own page in a frame; 1, a
    * tree the app describes over the UI protocol, drawn by the shell.
    */
@@ -251,6 +258,7 @@ export function parseInstalled(result: unknown): InstalledApp[] {
       // the operator for a state the core never reported.
       approval: APPROVALS.find((x) => x === a.approval) ?? "unknown",
       asks: str(a.asks),
+      refusal: str(a.refusal),
       tier: num(a.tier),
     }))
     .filter((a) => a.name !== "");
@@ -272,7 +280,9 @@ function fromManifest(app: InstalledApp, base: AppContract | undefined): AppCont
     id: app.name,
     title,
     tag: app.tag ?? base?.tag ?? tagFrom(title),
-    summary: app.summary ?? base?.summary ?? `${title} ${app.version}`.trim(),
+    summary: app.refusal
+      ? `Cannot run on this node: ${app.refusal}`
+      : (app.summary ?? base?.summary ?? `${title} ${app.version}`.trim()),
     minSize: { w: minW, h: minH },
     defaultSize: {
       // Never open narrower than the app says it can work at.

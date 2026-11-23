@@ -11,7 +11,8 @@
 //! 2. **Launch.** [`Host::start_services`] starts long-running apps;
 //!    [`Host::open_window`] starts an on-demand app when a window asks for
 //!    it, and [`Host::poll`] stops it again once it has been idle.
-//! 3. **Handshake.** [`accept_handshake`] over a Unix socket: the core sends
+//! 3. **Handshake.** [`handshake`] over the app's link ([`Links`]): one end
+//!    of a Unix socket pair the app inherits at launch. The core sends
 //!    [`Hello`], the app answers [`Registration`] with its commands as JSON
 //!    Schema, and [`accept_registration`] decides whether to believe it.
 //! 4. **UI routing.** [`ui_router`], nested at [`UI_MOUNT`], serves each
@@ -54,7 +55,7 @@
 //!
 //! [needs]
 //! gpu = false
-//! network = ["cloud.zaremski.net"]
+//! network = ["cloud.example.net"]
 //! connect_tcp = [443]           # without ports, hosts open the whole network
 //! working_dir = [{ path = "Calendars", write = true }]
 //!
@@ -87,9 +88,11 @@ use crate::sandbox;
 /// directory: binaries are built for one machine and must not travel).
 pub const APPS_SUBDIR: &str = "apps";
 
-/// Runtime sockets live here, relative to the install directory. Also not the
-/// working directory — a socket that got synced to another machine would be a
-/// door to a process that was never there.
+/// The core's own runtime sockets (the MCP sessions') live here, relative to
+/// the install directory. Also not the working directory — a socket that got
+/// synced to another machine would be a door to a process that was never
+/// there. No app socket lives here any more, and no app is granted it: an app
+/// reaches the core over the socket pair in [`Links`].
 pub const RUN_SUBDIR: &str = "run";
 
 /// Per-app scratch space lives here, relative to the install directory.
@@ -125,10 +128,10 @@ use deckjack_protocol::HIDDEN_DIR;
 // phone.
 
 pub use deckjack_protocol::{
-    AppFrame, AppInfo, BINARY_PREFIX, CommandDecl, CoreFrame, DirNeed, Hello, Lifecycle,
-    MANIFEST_FILE, MAX_FRAME_BYTES, MIN_PROTOCOL_VERSION, Manifest, ManifestError, Needs,
-    PROTOCOL_VERSION, ProtocolError, RegisteredCommand, Registration, Risk, UI_INDEX, UiAsset,
-    UiNeeds, WireAsset, check_protocol, decode_frame, encode_frame, valid_name,
+    AppFrame, AppInfo, BINARY_PREFIX, CommandDecl, CoreFrame, DirNeed, Hello, LINK_FD, LINK_FD_ENV,
+    Lifecycle, MANIFEST_FILE, MAX_FRAME_BYTES, MIN_PROTOCOL_VERSION, Manifest, ManifestError,
+    Needs, PROTOCOL_VERSION, ProtocolError, RegisteredCommand, Registration, Risk, UI_INDEX,
+    UiAsset, UiNeeds, WireAsset, check_protocol, decode_frame, encode_frame, valid_name,
 };
 
 /// Read and validate one `app.toml`.
@@ -263,13 +266,14 @@ pub fn accept_registration(
 // Transport
 // ---------------------------------------------------------------------------
 
-/// One app's connection to the core: newline-delimited JSON over a Unix
-/// socket in the install directory.
+/// One app's connection to the core: newline-delimited JSON over the core's
+/// end of the socket pair the app inherited ([`Links`]).
 ///
 /// Stdio is the documented alternative in the design, and the frames above
-/// are identical over it. Only the socket is implemented here because it is
-/// the one that survives the app being restarted while the core keeps
-/// running.
+/// are identical over it. A socket pair is used because it leaves the app's
+/// stdout and stderr for its logs, and because the app needs no path to
+/// connect to: the sandbox can then refuse every pathname Unix socket made
+/// outside it (docs/lanes/10-sandbox-all-apps.md).
 pub struct Connection {
     app: String,
     stream: tokio::io::BufReader<tokio::net::UnixStream>,
@@ -299,23 +303,81 @@ impl Connection {
     }
 }
 
-/// Where an app's socket lives.
-pub fn socket_path(install_dir: &Path, app: &str) -> PathBuf {
-    install_dir.join(RUN_SUBDIR).join(format!("{app}.sock"))
+/// The core's end of one app's link, as an attendant receives it.
+pub type LinkEnd = std::os::unix::net::UnixStream;
+
+/// Where an attendant receives its app's links. See [`Links::attend`].
+pub type LinkReceiver = tokio::sync::mpsc::UnboundedReceiver<LinkEnd>;
+
+type Attendants = BTreeMap<String, tokio::sync::mpsc::UnboundedSender<LinkEnd>>;
+
+/// Where each app's link to the core is made and delivered.
+///
+/// One attendant per installed app ([`crate::apphost`]) calls
+/// [`Links::attend`] and waits on what it returns. A launch calls
+/// [`Links::open`], which makes a socket pair, hands the core's end to that
+/// attendant and returns the app's end for the child to inherit at
+/// [`LINK_FD`]. So the link exists before the process does, nothing else on
+/// the machine can race for it, and no app needs to be able to connect to a
+/// pathname socket at all.
+///
+/// Cloning shares the table: [`OsEnv`] holds one, and the app host takes a
+/// clone of it.
+#[derive(Clone, Default)]
+pub struct Links {
+    attendants: Arc<std::sync::Mutex<Attendants>>,
 }
 
-/// Bind the socket an app will connect back on.
+impl Links {
+    /// Wait for `app`'s links here from now on. A second call for the same
+    /// app replaces the first, whose receiver then sees no more links.
+    pub fn attend(&self, app: &str) -> LinkReceiver {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.attendants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(app.to_string(), tx);
+        rx
+    }
+
+    /// Make a link for `app`: the core's end goes to its attendant, the
+    /// app's end is returned. Both are close-on-exec.
+    ///
+    /// Refused when nothing attends `app` (an app installed after the core
+    /// started, say), because a link nobody reads is an app that hangs at
+    /// its handshake and is then blamed for it.
+    pub fn open(&self, app: &str) -> io::Result<std::os::unix::net::UnixStream> {
+        let attendants = self
+            .attendants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(attendant) = attendants.get(app) else {
+            return Err(io::Error::other(format!(
+                "nothing in this core is waiting for {app}'s link, so it would never be \
+                 answered; restart the core to pick up an app installed while it was running"
+            )));
+        };
+        let (core, app_end) = std::os::unix::net::UnixStream::pair()?;
+        attendant
+            .send(core)
+            .map_err(|_| io::Error::other(format!("{app}'s attendant has stopped")))?;
+        Ok(app_end)
+    }
+}
+
+/// Bind one of the core's own runtime sockets (an MCP session's). Apps have
+/// none: they inherit their link ([`Links`]).
 ///
 /// The run directory is set to owner-only, and a leftover socket from a
 /// crash is removed first: `bind` fails on an existing path, so without that
-/// an unclean shutdown would make the app permanently unlaunchable. Removing
+/// an unclean shutdown would make the path permanently unusable. Removing
 /// it is safe because the lock file has already established that no other
 /// server is serving this directory.
 pub async fn bind_socket(path: &Path) -> io::Result<tokio::net::UnixListener> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
-        // The socket is an app's door to the command bus. Any local user who
-        // could connect to it would be an unauthenticated client.
+        // The socket is a door to the command bus. Any local user who could
+        // connect to it would be an unauthenticated client.
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     }
@@ -327,14 +389,14 @@ pub async fn bind_socket(path: &Path) -> io::Result<tokio::net::UnixListener> {
     tokio::net::UnixListener::bind(path)
 }
 
-/// Accept one app's connection and complete the handshake.
+/// Complete the handshake on one app's link.
 ///
-/// The timeout is the whole exchange, not each read: an app that connects and
-/// then says nothing is exactly as broken as one that never connects, and
+/// The timeout is the whole exchange, not each read: an app that starts and
+/// then says nothing is exactly as broken as one that never starts, and
 /// [`Host`] treats both as a crash so the backoff and crash-loop rules apply
 /// to a hung app too.
-pub async fn accept_handshake(
-    listener: &tokio::net::UnixListener,
+pub async fn handshake(
+    stream: tokio::net::UnixStream,
     manifest: &Manifest,
     timeout: std::time::Duration,
 ) -> Result<(Connection, Vec<RegisteredCommand>), HandshakeError> {
@@ -342,7 +404,6 @@ pub async fn accept_handshake(
     let seconds = timeout.as_secs();
 
     let exchange = async {
-        let (stream, _addr) = listener.accept().await.map_err(ProtocolError::Io)?;
         let mut conn = Connection {
             app: app.clone(),
             stream: tokio::io::BufReader::new(stream),
@@ -478,6 +539,8 @@ pub struct OsEnv {
     /// probe builds a real Landlock ruleset, so asking per launch would spend
     /// syscalls to learn the same answer.
     sandbox: std::sync::OnceLock<sandbox::Availability>,
+    /// Where each launched app's link to the core goes. See [`Links`].
+    links: Links,
 }
 
 impl Default for OsEnv {
@@ -491,7 +554,26 @@ impl OsEnv {
         OsEnv {
             children: std::sync::Mutex::new(BTreeMap::new()),
             sandbox: std::sync::OnceLock::new(),
+            links: Links::default(),
         }
+    }
+
+    /// An `OsEnv` whose [`Env::sandbox_availability`] answers
+    /// `availability` instead of probing this kernel, so what an operator is
+    /// told on a kernel this machine is not can be tested through the real
+    /// host and wiring. It cannot launch anything less confined than the
+    /// kernel allows: [`sandbox::command`] probes the real kernel again
+    /// before every confined spawn.
+    pub fn assuming_sandbox(availability: sandbox::Availability) -> OsEnv {
+        let env = OsEnv::new();
+        let _ = env.sandbox.set(availability);
+        env
+    }
+
+    /// The links this environment hands the apps it launches. The app host
+    /// attends each installed app's here.
+    pub fn links(&self) -> Links {
+        self.links.clone()
     }
 }
 
@@ -584,6 +666,76 @@ impl Env for OsEnv {
             command.env(key, value);
         }
         command.current_dir(&plan.cwd);
+        // The app's end of its link to the core, moved to [`LINK_FD`] in the
+        // child. Made before the spawn so the core's end is already with the
+        // attendant when the app starts reading; if the spawn fails, the
+        // attendant sees the link close and goes back to waiting.
+        let link = if plan.core_link {
+            if plan.pass_fds.contains(&LINK_FD) {
+                return Err(io::Error::other(format!(
+                    "{}'s plan passes descriptor {LINK_FD}, which is where its link to the core \
+                     goes",
+                    plan.app
+                )));
+            }
+            Some(self.links.open(&plan.app)?)
+        } else {
+            None
+        };
+        if let Some(link) = &link {
+            use std::os::fd::AsRawFd as _;
+            let from = link.as_raw_fd();
+            // SAFETY: runs in the forked child before exec, after the
+            // sandbox's own hook. dup2 and fcntl are async-signal-safe and
+            // touch only this process's descriptor table. dup2 clears
+            // close-on-exec on the copy; when the pair already sits at
+            // LINK_FD there is no copy, so the flag is cleared by hand.
+            unsafe {
+                use std::os::unix::process::CommandExt as _;
+                command.pre_exec(move || {
+                    if from == LINK_FD {
+                        let flags = libc::fcntl(from, libc::F_GETFD);
+                        if flags < 0
+                            || libc::fcntl(from, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                        {
+                            return Err(io::Error::last_os_error());
+                        }
+                    } else if libc::dup2(from, LINK_FD) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        // Every other descriptor is marked close-on-exec in the child, so an
+        // app inherits stdin, stdout, stderr, its link and its declared
+        // `pass_fds`, and nothing else, whatever a library in the core left
+        // inheritable. A pty opened by the terminal on another thread is the
+        // case in point: portable-pty sets FD_CLOEXEC on the master and
+        // slave only after `openpty` returns, so a fork in between would
+        // otherwise hand the operator's shell's pty to the app, and Landlock
+        // does not mediate a descriptor already held. CLOEXEC rather than a
+        // close, so std's own exec-error pipe keeps working; the `pass_fds`
+        // hook below runs after this one and clears the flag on exactly the
+        // plan's descriptors.
+        let first_stray = if link.is_some() { LINK_FD + 1 } else { 3 };
+        // SAFETY: runs in the forked child before exec. close_range is a
+        // single syscall touching only this process's descriptor table.
+        unsafe {
+            use std::os::unix::process::CommandExt as _;
+            command.pre_exec(move || {
+                if libc::syscall(
+                    libc::SYS_close_range,
+                    first_stray as libc::c_uint,
+                    libc::c_uint::MAX,
+                    libc::CLOSE_RANGE_CLOEXEC,
+                ) < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         if !plan.pass_fds.is_empty() {
             let fds = plan.pass_fds.clone();
             // SAFETY: runs in the forked child before exec, after the
@@ -610,6 +762,9 @@ impl Env for OsEnv {
         command.stdin(Stdio::null());
 
         let child = command.spawn()?;
+        // The child has its copy; the core keeps only its own end, with the
+        // attendant.
+        drop(link);
         let pid = child.id();
         self.children
             .lock()
@@ -662,6 +817,42 @@ impl Env for OsEnv {
 // ---------------------------------------------------------------------------
 // Launching
 // ---------------------------------------------------------------------------
+
+/// The oldest Linux release whose Landlock can hold an app: ABI 9, for
+/// `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` (docs/lanes/10-sandbox-all-apps.md).
+pub const MIN_KERNEL: &str = "7.1";
+
+/// Why no app at all can launch on a node with this sandbox, or `None` when
+/// apps can. The same refusal [`LaunchPlan::build`] makes per app, said once
+/// for the node, for `deckjack apps`, `system.apps` and a refused window.
+///
+/// A node in developer mode launches apps unconfined and so refuses none;
+/// that is said at every launch instead (see [`Confinement::Unconfined`]).
+pub fn launch_refusal(
+    availability: &sandbox::Availability,
+    confinement: Confinement,
+) -> Option<String> {
+    if !confinement.is_enforced() {
+        return None;
+    }
+    match availability {
+        sandbox::Availability::Unavailable { reason } => Some(format!(
+            "this node cannot confine a process ({reason}), so it launches no app. Apps need \
+             Landlock and seccomp, Linux {MIN_KERNEL} or newer with CONFIG_SECURITY_LANDLOCK=y"
+        )),
+        sandbox::Availability::Enforcing {
+            landlock_abi,
+            ipc_scoping: false,
+            ..
+        } => Some(format!(
+            "this node's kernel has Landlock ABI {landlock_abi}, and every app is held to ABI 9 \
+             (Linux {MIN_KERNEL} or newer) so it cannot reach the session bus, the display \
+             server or other apps' sockets. No app is launched here rather than launched less \
+             confined"
+        )),
+        sandbox::Availability::Enforcing { .. } => None,
+    }
+}
 
 /// Whether this node enforces what a manifest asked for, or deliberately does
 /// not.
@@ -800,7 +991,10 @@ pub struct LaunchPlan {
     /// The working directory, which is also the only tree the app may be
     /// granted paths in.
     pub cwd: PathBuf,
-    pub socket: PathBuf,
+    /// Whether the child is handed a link to the core at [`LINK_FD`] (see
+    /// [`Links`]). Every app is; a streamed native app's compositor has a
+    /// link of its own in `pass_fds` instead.
+    pub core_link: bool,
     /// Descriptors the child keeps across `exec`, at the same numbers. Each
     /// is close-on-exec in this process (so no other child spawned at the
     /// same time inherits it) and is opened up only in this child, after
@@ -883,6 +1077,17 @@ pub enum ConfinementError {
          not a downgrade Deckjack makes: run {app} on a node with Linux 6.7 or newer"
     )]
     NoNetworkRules { app: String, abi: i32 },
+
+    #[error(
+        "{app} cannot be launched on this node: its kernel's Landlock is ABI {abi}, and every \
+         app is held to ABI 9 (Linux {MIN_KERNEL} or newer), which keeps it from connecting to \
+         Unix sockets and signaling processes outside its sandbox. Without that an app reaches \
+         the session bus and the display server, and can leave its sandbox through \
+         `systemd-run --user`, so Deckjack refuses rather than run it less confined. Run {app} \
+         on a node with Linux {MIN_KERNEL} or newer, or start this node in developer mode if \
+         you accept that apps run with your full access"
+    )]
+    NoIpcScoping { app: String, abi: i32 },
 
     #[error(
         "{app} asks to read {path}, which does not exist. Create it, or drop it from the app's \
@@ -985,7 +1190,6 @@ impl LaunchPlan {
     ) -> Result<LaunchPlan, ConfinementError> {
         let app = installed.manifest.app.name.clone();
         let needs = &installed.manifest.needs;
-        let socket = socket_path(install_dir, &app);
 
         let network = network_policy(needs);
 
@@ -1008,8 +1212,22 @@ impl LaunchPlan {
                 sandbox::Availability::Enforcing {
                     landlock_abi,
                     network_rules: false,
+                    ..
                 } if !network.is_whole() => {
                     return Err(ConfinementError::NoNetworkRules {
+                        app,
+                        abi: landlock_abi,
+                    });
+                }
+                // Every app, whatever its manifest asks for: without this an
+                // app reaches the session bus, and through it
+                // `systemd-run --user`, which is no sandbox at all.
+                sandbox::Availability::Enforcing {
+                    landlock_abi,
+                    ipc_scoping: false,
+                    ..
+                } => {
+                    return Err(ConfinementError::NoIpcScoping {
                         app,
                         abi: landlock_abi,
                     });
@@ -1052,7 +1270,15 @@ impl LaunchPlan {
         // for the file that names its servers.
         let resolves = network.is_whole()
             || matches!(&network, sandbox::Network::Ports { connect_tcp, .. } if !connect_tcp.is_empty());
-        let mut policy = sandbox::Policy::nothing().with_network(network);
+        // No pathname socket made outside the sandbox, no abstract socket
+        // made outside it, no signal to a process outside it. The app's link
+        // to the core is inherited ([`Links`]), so there is no path to grant.
+        let mut policy =
+            sandbox::Policy::nothing()
+                .with_network(network)
+                .with_ipc(sandbox::Ipc::Scoped {
+                    connect_unix: Vec::new(),
+                });
 
         for need in &needs.working_dir {
             let asked = working_root.join(&need.path);
@@ -1154,26 +1380,24 @@ impl LaunchPlan {
 
         // Everything from here down is the launcher's own, chosen in this file
         // rather than named by a manifest, which is why it does not go through
-        // the denial checks above: the app's own directory, the run directory
-        // and the app's private cache all live in the install directory, whose
-        // entries no manifest grant may reach, and an app has to be able to
-        // read its own assets, reach its own socket and use its own scratch
-        // space. Those paths are granted by name, narrowly; `apps/`, `run/`'s
-        // neighbors and `cache/` around them are not. With the working
+        // the denial checks above: the app's own directory and its private
+        // cache live in the install directory, whose entries no manifest grant
+        // may reach, and an app has to be able to read its own assets and use
+        // its own scratch space. Those paths are granted by name, narrowly;
+        // `apps/`, `run/` and `cache/` around them are not. With the working
         // directory at its default (the install directory) they sit beside the
         // operator's folders, and with `--dir ~` they are inside `.deckjack/`;
         // neither changes what is granted here.
         policy.read.push(installed.dir.clone());
 
-        // The run directory may not exist yet: `bind_socket` creates it, and
-        // on a cold start a service app can be launched before anything has
-        // bound. A missing path takes the whole ruleset down, so it is created
-        // here rather than hoped for.
-        let run = install_dir.join(RUN_SUBDIR);
+        // A missing path takes the whole ruleset down, so these are created
+        // here rather than hoped for. The run directory is not granted: it
+        // holds the core's MCP sockets, and the app's link to the core is
+        // inherited rather than found there.
         let private = private_root.join(&app);
         let home = private.join("home");
         let tmp = private.join("tmp");
-        for dir in [&run, &home, &tmp] {
+        for dir in [&home, &tmp] {
             env.create_private_dir(dir)
                 .map_err(|source| ConfinementError::Prepare {
                     app: app.clone(),
@@ -1181,9 +1405,6 @@ impl LaunchPlan {
                     source,
                 })?;
         }
-        // Read, not write: the app connects to a socket here, it does not get
-        // to create or remove one.
-        policy.read.push(run);
         policy.read_write.push(home.clone());
         policy.read_write.push(tmp.clone());
 
@@ -1218,14 +1439,11 @@ impl LaunchPlan {
             program: installed.binary.clone(),
             args: Vec::new(),
             cwd: working_dir.to_path_buf(),
-            socket: socket.clone(),
+            core_link: true,
             pass_fds: Vec::new(),
             env: vec![
                 ("DECKJACK_APP".to_string(), app),
-                (
-                    "DECKJACK_APP_SOCKET".to_string(),
-                    socket.to_string_lossy().into_owned(),
-                ),
+                (LINK_FD_ENV.to_string(), LINK_FD.to_string()),
                 (
                     "DECKJACK_APP_PROTOCOL".to_string(),
                     PROTOCOL_VERSION.to_string(),
@@ -1750,7 +1968,6 @@ pub struct Runtime {
     pub name: String,
     pub phase: Phase,
     pub pid: Option<u32>,
-    pub socket: PathBuf,
     /// Registered at handshake, cleared on exit: a crashed app's commands
     /// must leave the palette, or the palette offers what cannot run.
     pub commands: Vec<RegisteredCommand>,
@@ -1763,12 +1980,11 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    fn new(name: String, socket: PathBuf, now: u64) -> Runtime {
+    fn new(name: String, now: u64) -> Runtime {
         Runtime {
             name,
             phase: Phase::Stopped,
             pid: None,
-            socket,
             commands: Vec::new(),
             windows: 0,
             last_active: now,
@@ -1908,7 +2124,7 @@ pub enum HostError {
 /// The app host: discovery, launch, supervision and the state the window
 /// manager reads.
 ///
-/// It owns no sockets and no connections. [`accept_handshake`] and
+/// It owns no sockets and no connections. [`handshake`] and
 /// [`Connection`] are separate on purpose: the host decides *that* an app
 /// should run and *what* its state is, while the transport layer does the
 /// talking and reports back through [`Host::on_registered`] and
@@ -1973,9 +2189,9 @@ impl<E: Env> Host<E> {
         self.problems = found.problems;
 
         for name in self.installed.keys() {
-            self.runtimes.entry(name.clone()).or_insert_with(|| {
-                Runtime::new(name.clone(), socket_path(&self.install_dir, name), now)
-            });
+            self.runtimes
+                .entry(name.clone())
+                .or_insert_with(|| Runtime::new(name.clone(), now));
         }
 
         self.problems
@@ -2016,6 +2232,18 @@ impl<E: Env> Host<E> {
     /// [`Host::open_window`] will act on rather than a second opinion.
     pub fn sandbox_availability(&self) -> sandbox::Availability {
         self.env.sandbox_availability()
+    }
+
+    /// Why no app at all can launch on this node, or `None` when apps can.
+    /// For `system.apps` and a refused window, so the operator reads the
+    /// reason rather than being sent to the log.
+    pub fn launch_refusal(&self) -> Option<String> {
+        launch_refusal(&self.env.sandbox_availability(), self.policy.confinement)
+    }
+
+    /// The environment this host launches through.
+    pub fn env(&self) -> &E {
+        &self.env
     }
 
     pub fn window_status(&self, app: &str) -> WindowStatus {
@@ -2442,7 +2670,6 @@ impl<E: Env> Host<E> {
                 tracing::info!(
                     app,
                     program = %plan.program.display(),
-                    socket = %plan.socket.display(),
                     gpu = plan.sandbox.gpu,
                     network = ?plan.sandbox.policy.network,
                     read = plan.sandbox.policy.read.len(),

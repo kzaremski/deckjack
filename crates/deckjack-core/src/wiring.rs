@@ -1081,6 +1081,11 @@ impl Windows {
                     crate::install::how_to_approve(&title)
                 )));
             }
+            // A node that launches no app at all says why in words: the
+            // operator can do nothing from a log line they cannot see.
+            if let Some(why) = self.host.get().and_then(|host| host.launch_refusal()) {
+                return Err(failed(format!("{} cannot run: {why}", p.app)));
+            }
             return Err(failed(format!(
                 "{} is installed but cannot run on this node; see the log for why",
                 p.app
@@ -2263,6 +2268,10 @@ impl Command for ListApps {
     }
 
     async fn run(&self, _p: NoParams, _cx: Context) -> Result<Value, CommandError> {
+        // Why no app can launch on this node at all (a kernel whose Landlock
+        // cannot scope Unix sockets, say), or null. On every entry, so the
+        // shell can say it where the app is offered.
+        let refusal = self.host.launch_refusal();
         let apps: Vec<Value> = self
             .host
             .installed()
@@ -2308,6 +2317,7 @@ impl Command for ListApps {
                     },
                     "approval": approval,
                     "asks": asks,
+                    "refusal": refusal,
                 })
             })
             .collect();

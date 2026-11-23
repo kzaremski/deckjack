@@ -103,8 +103,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 
-/// The socket to connect back on, set by the core.
-pub const SOCKET_ENV: &str = "DECKJACK_APP_SOCKET";
+/// The environment variable naming the descriptor this app's link to the
+/// core is on, set by the core. The app inherits the link: there is no path
+/// to connect to, which is what lets the sandbox refuse every Unix socket
+/// made outside it.
+pub const LINK_ENV: &str = deckjack_protocol::LINK_FD_ENV;
 
 /// Whether the core is holding this app to its manifest. `"1"` or `"0"`.
 pub const CONFINED_ENV: &str = "DECKJACK_CONFINED";
@@ -126,6 +129,49 @@ impl<T: rust_embed::RustEmbed + Send + Sync + 'static> Assets for T {
 }
 
 type AssetFn = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
+
+/// The link to the core this process inherited, at the descriptor
+/// [`LINK_ENV`] names.
+fn inherited_link() -> Result<UnixStream, AppError> {
+    link_at(std::env::var(LINK_ENV).ok())
+}
+
+/// The link at the descriptor `value` names. Split from [`inherited_link`]
+/// so it can be tested without touching the process environment.
+fn link_at(value: Option<String>) -> Result<UnixStream, AppError> {
+    use std::os::fd::{BorrowedFd, FromRawFd as _, OwnedFd};
+    let value = value.ok_or(AppError::NoLink)?;
+    let fd: i32 = value
+        .parse()
+        .ok()
+        .filter(|fd| *fd > 2)
+        .ok_or_else(|| AppError::BadLink {
+            value: value.clone(),
+        })?;
+    let link = |source| AppError::Link { fd, source };
+    // Checked through a duplicate before the original is taken, so a
+    // descriptor that turns out not to be the link (the env said 3 but 3 is
+    // a file) is left open rather than closed out from under its owner.
+    // The duplicate is close-on-exec (F_DUPFD_CLOEXEC): the core cleared
+    // the flag so the link would survive into this process, and setting it
+    // again keeps a helper this app spawns (a converter, a renderer) from
+    // inheriting the app's link to the core.
+    // SAFETY: only borrowed for the duplicate; `try_clone_to_owned` fails
+    // with EBADF if nothing is open at `fd`.
+    let kept = unsafe { BorrowedFd::borrow_raw(fd) }
+        .try_clone_to_owned()
+        .map_err(link)?;
+    let kept = std::os::unix::net::UnixStream::from(kept);
+    // ENOTSOCK on anything that is not a socket, which turns a wrong
+    // descriptor into a sentence instead of a hang at the handshake.
+    kept.local_addr().map_err(link)?;
+    // The original is the core's gift to this process alone, and is taken
+    // once, here, before anything else could have claimed the number.
+    // SAFETY: owned by nobody else in this process; closed on drop.
+    drop(unsafe { OwnedFd::from_raw_fd(fd) });
+    kept.set_nonblocking(true).map_err(link)?;
+    UnixStream::from_std(kept).map_err(link)
+}
 
 /// What a running command is given.
 #[derive(Clone)]
@@ -424,14 +470,17 @@ pub enum AppError {
     Undeclared { command: String },
 
     #[error(
-        "{SOCKET_ENV} is not set: an app is started by the Deckjack core, which passes the \
-         socket to connect back on. Run `deckjack` and let it launch this."
+        "{LINK_ENV} is not set: an app is started by the Deckjack core, which hands it a link \
+         to the core. Run `deckjack` and let it launch this."
     )]
-    NoSocket,
+    NoLink,
 
-    #[error("cannot reach the core on {path}: {source}")]
-    Connect {
-        path: String,
+    #[error("{LINK_ENV} is {value:?}, which is not a descriptor number")]
+    BadLink { value: String },
+
+    #[error("descriptor {fd} ({LINK_ENV}) is not a usable link to the core: {source}")]
+    Link {
+        fd: i32,
         #[source]
         source: std::io::Error,
     },
@@ -461,6 +510,7 @@ pub struct App {
     handlers: BTreeMap<String, (Handler, schemars::Schema)>,
     assets: Option<AssetFn>,
     view: Option<ui::Factory>,
+    notifier: ui::Notifier,
 }
 
 impl App {
@@ -475,6 +525,7 @@ impl App {
             handlers: BTreeMap::new(),
             assets: None,
             view: None,
+            notifier: ui::Notifier::default(),
         })
     }
 
@@ -510,6 +561,15 @@ impl App {
     {
         self.view = Some(ui::factory(init));
         self
+    }
+
+    /// A handle the app's own background work uses to re-render its
+    /// windows when what they show changes with no event or command behind
+    /// it (a job advancing). Take it before [`App::run`] and move it into
+    /// whatever does the work. See [`ui::Notifier`] and
+    /// [`ui::Program::notified`].
+    pub fn notifier(&self) -> ui::Notifier {
+        self.notifier.clone()
     }
 
     /// Handle one of the commands the manifest declares.
@@ -586,14 +646,18 @@ impl App {
         Ok(())
     }
 
+    /// Register and serve on a socket the caller already holds, until the
+    /// other end closes or says stop. For an app's own tests, which stand in
+    /// for the core on the other end of a socket pair; an app's `main` uses
+    /// [`App::run`].
+    #[doc(hidden)]
+    pub async fn serve_connected(self, stream: UnixStream) -> Result<(), AppError> {
+        let commands = self.registration()?;
+        self.serve_on(stream, commands).await
+    }
+
     async fn serve(self, commands: Vec<RegisteredCommand>) -> Result<(), AppError> {
-        let path = std::env::var(SOCKET_ENV).map_err(|_| AppError::NoSocket)?;
-        let stream = UnixStream::connect(&path)
-            .await
-            .map_err(|source| AppError::Connect {
-                path: path.clone(),
-                source,
-            })?;
+        let stream = inherited_link()?;
         self.serve_on(stream, commands).await
     }
 
@@ -668,6 +732,11 @@ impl App {
         // The UI loop, for an app that describes its window. Its sender is
         // dropped with this function, which ends the loop's thread.
         let ui_jobs = self.view.clone().map(|f| ui::spawn(f, out.clone()));
+        // The app's notifier points at this loop until the loop ends, and at
+        // nothing after, so the loop's thread ends with this function as it
+        // did before a notifier could hold its sender.
+        self.notifier.attach(ui_jobs.clone());
+        let _detach = Detach(self.notifier.clone());
 
         let bus = Bus {
             out: out.clone(),
@@ -806,6 +875,15 @@ impl App {
     }
 }
 
+/// Points the notifier at no UI loop once the frame loop ends.
+struct Detach(ui::Notifier);
+
+impl Drop for Detach {
+    fn drop(&mut self) {
+        self.0.attach(None);
+    }
+}
+
 /// Hand a job to the UI loop, or say plainly that there is none.
 fn ui_job(
     jobs: &Option<std::sync::mpsc::Sender<ui::Job>>,
@@ -885,6 +963,78 @@ fn ui_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_or_malformed_link_is_said_in_words() {
+        assert!(matches!(link_at(None), Err(AppError::NoLink)));
+        for bad in ["", "three", "-1", "0", "2"] {
+            assert!(
+                matches!(link_at(Some(bad.into())), Err(AppError::BadLink { .. })),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_descriptor_that_is_not_a_socket_is_refused_and_left_open() {
+        use std::os::fd::IntoRawFd as _;
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let fd = file.into_raw_fd();
+        let got = link_at(Some(fd.to_string()));
+        assert!(matches!(got, Err(AppError::Link { .. })), "{:?}", got.err());
+        // Still open: it was not ours to close.
+        // SAFETY: fcntl F_GETFD on a plain integer.
+        assert!(
+            unsafe { libc_fcntl_getfd(fd) } >= 0,
+            "the descriptor was closed"
+        );
+        // SAFETY: the test opened it and closes it once.
+        drop(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) });
+    }
+
+    #[tokio::test]
+    async fn an_inherited_link_is_taken_and_kept_close_on_exec() {
+        use std::os::fd::{AsRawFd as _, IntoRawFd as _};
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd = theirs.into_raw_fd();
+        let mut link = link_at(Some(fd.to_string())).expect("a socket pair end is a link");
+        // The link lives on a duplicate that a spawned helper would not
+        // inherit.
+        // SAFETY: fcntl F_GETFD on a plain integer.
+        let flags = unsafe { libc_fcntl_getfd(link.as_raw_fd()) };
+        assert!(
+            flags >= 0 && flags & 1 == 1,
+            "the link is not close-on-exec"
+        );
+        use std::io::Read as _;
+        use tokio::io::AsyncWriteExt as _;
+        link.write_all(b"hi").await.unwrap();
+        let mut got = [0u8; 2];
+        (&ours).read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"hi");
+        // Dropping the link ends it for the core: the original number was
+        // closed too, not left holding the other end open. (Asked of the
+        // core's end rather than of the number, which a parallel test may
+        // already have been handed again.)
+        drop(link);
+        ours.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut rest = Vec::new();
+        assert_eq!(
+            (&ours).read_to_end(&mut rest).unwrap(),
+            0,
+            "the original descriptor was left open"
+        );
+    }
+
+    /// `fcntl(fd, F_GETFD)`, without a libc dependency for one call.
+    unsafe fn libc_fcntl_getfd(fd: i32) -> i32 {
+        unsafe extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        // F_GETFD is 1 on Linux.
+        unsafe { fcntl(fd, 1) }
+    }
 
     /// A bus handle plus the frames it writes.
     fn handle() -> (Bus, mpsc::UnboundedReceiver<String>) {
@@ -1234,6 +1384,9 @@ risk = "write"
             // what a test here checks.
             command.starts_with("demo.").then_some(())
         }
+        fn notified(&self) -> Option<()> {
+            Some(())
+        }
     }
 
     fn described_app() -> App {
@@ -1272,6 +1425,84 @@ risk = "write"
             no_tier.registration(),
             Err(AppError::ViewWithoutTier)
         ));
+    }
+
+    #[tokio::test]
+    async fn the_apps_notifier_lets_go_of_its_windows_when_the_core_goes() {
+        // Attached while the frame loop runs, detached when it ends: a
+        // notifier that kept the UI loop's sender would keep that thread
+        // alive after `run` returned.
+        let app = described_app();
+        let notifier = app.notifier();
+        let commands = app.registration().unwrap();
+        let (core, app_end) = UnixStream::pair().unwrap();
+        let serving = tokio::spawn(app.serve_on(app_end, commands));
+        let (read, writer) = core.into_split();
+        let mut core = FakeCore {
+            reader: BufReader::new(read),
+            writer,
+        };
+        core.send(&CoreFrame::Hello(deckjack_protocol::Hello {
+            protocol: PROTOCOL_VERSION,
+            core_version: "test".to_string(),
+            app: "demo".to_string(),
+        }))
+        .await;
+        assert!(matches!(core.recv().await, AppFrame::Register(_)));
+        assert!(notifier.is_attached(), "attached while the loop runs");
+        drop(core);
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), serving)
+            .await
+            .expect("the frame loop did not end when the core went")
+            .unwrap();
+        assert!(ended.is_ok(), "a closed socket is an ordinary end");
+        assert!(
+            !notifier.is_attached(),
+            "still attached after the loop ended"
+        );
+        // And a notify after that reaches nothing and does not stick.
+        notifier.notify();
+        assert!(!notifier.is_attached());
+    }
+
+    #[tokio::test]
+    async fn the_apps_notifier_reaches_its_running_windows() {
+        // Taken before `run`, as an app's background work takes it: the
+        // notifier must reach the UI loop the frame loop starts later.
+        let app = described_app();
+        let notifier = app.notifier();
+        let commands = app.registration().unwrap();
+        let (core, app_end) = UnixStream::pair().unwrap();
+        tokio::spawn(app.serve_on(app_end, commands));
+        let (read, writer) = core.into_split();
+        let mut core = FakeCore {
+            reader: BufReader::new(read),
+            writer,
+        };
+        core.send(&CoreFrame::Hello(deckjack_protocol::Hello {
+            protocol: PROTOCOL_VERSION,
+            core_version: "test".to_string(),
+            app: "demo".to_string(),
+        }))
+        .await;
+        assert!(matches!(core.recv().await, AppFrame::Register(_)));
+        core.send(&CoreFrame::UiOpen {
+            window: "w1".to_string(),
+        })
+        .await;
+        assert!(matches!(
+            core.recv().await,
+            AppFrame::UiPatch { rev: 1, .. }
+        ));
+        notifier.notify();
+        let AppFrame::UiPatch { rev, patches, .. } = core.recv().await else {
+            panic!("expected the window to follow the notification");
+        };
+        assert_eq!(rev, 2);
+        assert!(
+            matches!(&patches[..], [ui::Patch::Props { widget: ui::Widget::Text(t), .. }] if t.text == "1"),
+            "{patches:?}"
+        );
     }
 
     #[tokio::test]

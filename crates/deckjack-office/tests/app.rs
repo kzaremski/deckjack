@@ -1,15 +1,16 @@
 //! The office app end to end, confined: launched by the core's own launcher
-//! from a real install, and driven over its socket with the core's frames.
+//! from a real install, and driven over its link with the core's frames.
 //! Every command runs in the confined process; conversions run in the
 //! worker it spawns, which inherits the confinement.
 //!
-//! This test plays the core: it binds the app's socket, says hello, reads
-//! the registration and sends calls. Nothing in the app is faked.
+//! This test plays the core: it takes the core's end of the link the
+//! launcher handed the app, says hello, reads the registration and sends
+//! calls. Nothing in the app is faked.
 
 mod common;
 
 use std::io::{BufRead as _, BufReader, Write as _};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -30,23 +31,14 @@ struct Core {
 impl Core {
     fn start(rig: &Rig) -> Core {
         let plan = rig.plan();
-        let _ = std::fs::remove_file(&plan.socket);
-        let listener = UnixListener::bind(&plan.socket).expect("bind the app socket");
         let pid = rig.env.spawn(&plan).expect("the confined app starts");
-        listener.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let stream = loop {
-            match listener.accept() {
-                Ok((s, _)) => break s,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(rig.env.is_running(pid), "the app exited before connecting");
-                    assert!(Instant::now() < deadline, "the app never connected");
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => panic!("accept: {e}"),
-            }
-        };
-        stream.set_nonblocking(false).unwrap();
+        // Made by the launcher before the spawn, so it is already here.
+        let stream = rig
+            .links
+            .lock()
+            .unwrap()
+            .try_recv()
+            .expect("the launcher handed the core its end of the app's link");
         stream
             .set_read_timeout(Some(Duration::from_secs(180)))
             .unwrap();

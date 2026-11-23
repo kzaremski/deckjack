@@ -19,32 +19,29 @@ The design is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Status
 
-Early. The workspace builds and the harvested modules are tested; nothing
-serves anything yet.
-
-| Piece | State |
-|---|---|
-| Sign-in: one-time code, lockout, sessions | harvested from pocketdock, tested |
-| System and privilege wrapper | harvested from pocketdock, tested |
-| Node identity | written, tested |
-| Lock file and single-server rule | written, tested |
-| Config | not started |
-| SQLite state | not started |
-| Command bus | not started |
-| Web shell | not started |
-| Passkey sign-in | not started |
-
-`cargo test` is 50 tests; `cargo clippy --all-targets -- -D warnings` and
-`cargo fmt --check` are clean.
+Single node. One binary serves the web shell and runs the command bus, sign-in
+(one-time code and passkeys), terminals, the single seat, lockdown, the audit
+log, confined apps and the agent door (MCP over a per-session socket). What the
+platform does today, lane by lane, is in
+[docs/APP-SUITE.md](docs/APP-SUITE.md); unfinished work is in
+[docs/OPEN-THREADS.md](docs/OPEN-THREADS.md). `make check` must pass before a
+commit.
 
 ## Layout
 
 ```
-crates/deckjack-core/     server, command bus, window manager
-docs/DESIGN.md            the design of record
+crates/deckjack-core/      server, command bus, window manager, embedded shell
+crates/deckjack-protocol/  app protocol: manifest, frames, versions (MIT OR Apache-2.0)
+crates/deckjack-app/       SDK for writing an app (MIT OR Apache-2.0)
+crates/deckjack-<app>/     apps: files, editor, notes, tasks, photo, office, video
+crates/deckjack-stream/    headless Wayland compositor for streamed native apps
+web/                       the browser shell (Vue, Vite)
+xtask/                     build, install and dev tasks behind make
+docs/DESIGN.md             the design of record
+docs/notes/                invariants, gotchas and decisions the code does not show
 ```
 
-Apps will install as separate `deckjack-<name>` binaries, each carrying its own
+Apps install as separate `deckjack-<name>` binaries, each carrying its own
 backend, embedded web UI and manifest.
 
 ## Build

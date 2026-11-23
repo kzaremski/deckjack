@@ -288,7 +288,6 @@ async fn start() -> Harness {
             Box::new(deckjack_core::store::StoreGrants::new(Arc::clone(&store))),
         ),
         Arc::clone(&registry),
-        install,
         Duration::from_millis(50),
     );
     windows.attach_app_host(Arc::clone(&app_host));
@@ -2016,7 +2015,7 @@ async fn a_sign_in_from_an_unknown_address_can_engage_and_a_known_one_cannot() {
         new_device: lockdown::Response::Engage,
         ..lockdown::AutoPolicy::default()
     });
-    let ip: std::net::IpAddr = "100.69.236.100".parse().unwrap();
+    let ip: std::net::IpAddr = "100.64.0.20".parse().unwrap();
     let now = std::time::SystemTime::now();
 
     // A device that is known is not an incident, whatever the policy says.
@@ -2053,7 +2052,7 @@ async fn a_sign_in_from_an_unknown_address_can_engage_and_a_known_one_cannot() {
     // machine, does not keep it.
     let reason = lockdown.status().engaged.expect("an engagement").reason;
     assert!(
-        !reason.contains("100.69.236.100"),
+        !reason.contains("100.64.0.20"),
         "the journal kept the address: {reason}"
     );
 }

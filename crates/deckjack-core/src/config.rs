@@ -55,8 +55,8 @@ trusted_proxies = []
 #   unix_socket = "proxy/http.sock"
 #   sudo tailscale serve --bg unix:/home/YOU/.deckjack/proxy/http.sock
 #
-# Not under run/: that directory is the app sockets', named after the apps,
-# and a node refuses to start with its proxy socket there.
+# Not under run/: that directory is the core's runtime sockets' (the MCP
+# agent sessions'), and a node refuses to start with its proxy socket there.
 #
 # `listen` stays up beside it, on loopback, for `deckjack unlock` and for a
 # browser on this machine; nothing that arrives there is believed.
@@ -176,10 +176,13 @@ impl Server {
     /// `install_dir`, an absolute one is taken as written, an empty one means
     /// no socket.
     ///
-    /// Refused inside the app socket directory (`<install>/run`): app
-    /// sockets there are named `<app>.sock`, and launching an app binds its
-    /// socket by removing whatever is at that path, so an app named after
-    /// the proxy socket would silently take it over.
+    /// Refused inside the core's runtime directory (`<install>/run`): the
+    /// core creates and removes the MCP agent sessions' sockets there, and
+    /// keeping the proxy socket out of it means no name the core manages
+    /// can ever collide with it. The rule predates lane 10, when app sockets
+    /// lived there too and an app named after the proxy socket would have
+    /// taken it over; it is kept because the directory is still the core's
+    /// to manage.
     ///
     /// Anywhere else inside the install directory it must be under
     /// [`PROXY_SUBDIR`], the one place [`crate::node::INSTALL_LAYOUT`] keeps
@@ -199,8 +202,9 @@ impl Server {
         let run = install_dir.join(crate::apps::RUN_SUBDIR);
         if lexical.starts_with(&run) {
             return Err(format!(
-                "server.unix_socket = {:?} is inside {}, where app sockets live and an app \
-                 could replace it. Put it elsewhere, e.g. \"proxy/http.sock\"",
+                "server.unix_socket = {:?} is inside {}, the core's runtime directory, where \
+                 it creates and removes its agent sessions' sockets. Put it elsewhere, e.g. \
+                 \"proxy/http.sock\"",
                 self.unix_socket,
                 run.display()
             ));
@@ -514,15 +518,17 @@ mod tests {
     }
 
     #[test]
-    fn the_proxy_socket_is_refused_where_app_sockets_live() {
-        // An app named "proxy" binds <install>/run/proxy.sock by removing
-        // whatever is there. Relative or absolute, run/ is refused.
+    fn the_proxy_socket_is_refused_in_the_cores_runtime_directory() {
+        // The core manages the sockets under run/. Relative or absolute,
+        // run/ is refused, and the reason given is the current one: no app
+        // socket has lived there since lane 10.
         let install = Path::new("/home/someone/.deckjack");
         for spelled in ["run/proxy.sock", "/home/someone/.deckjack/run/proxy.sock"] {
             let cfg: Config =
                 toml::from_str(&format!("[server]\nunix_socket = \"{spelled}\"\n")).unwrap();
             let err = cfg.server.unix_socket_path(install).unwrap_err();
-            assert!(err.contains("app sockets"), "{spelled}: {err}");
+            assert!(err.contains("runtime directory"), "{spelled}: {err}");
+            assert!(!err.contains("app socket"), "{spelled}: {err}");
         }
         // Control: a sibling under proxy/ whose name starts with "run" is fine.
         let cfg: Config =

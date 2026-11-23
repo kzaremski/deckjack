@@ -1,6 +1,7 @@
 ## Lane 7b — Circuit (KiCad schematics: viewer and netlist-level editor)
 
-*Scoping brief, 2026-11-16. Research only; nothing here is built. Facts about
+*Scoping brief, 2026-11-16; the backend library was built on 2026-11-23 (see
+"Built" below, which supersedes the brief where they differ). Facts about
 outside projects are cited at the end; anything marked **inferred** or
 **unverified** has not been checked against a running system.*
 
@@ -27,6 +28,171 @@ two hard problems that look like one:
 2. **Writing without damage.** Every save has to round-trip unknown and
    newer constructs verbatim and keep `git diff` limited to the intended
    change.
+
+### Built (backend library, 2026-11-23)
+
+Crate `crates/deckjack-circuit`, a library only: no app manifest, no
+commands, no UI. Those wait for tier-1 phase 1 and the tier-2 surfaces
+(`docs/TIERS.md`). Plain Rust, no C dependencies; `rand` (UUIDs from the
+system generator) and `thiserror` are its only dependencies.
+
+**Modules.**
+- `sexpr`: the lossless S-expression tree. Every node keeps its leading
+  whitespace, every atom its raw token, so an unedited load and save is
+  byte-identical and an edit rewrites only the bytes it touches. Iterative
+  parser; 64 MiB and depth-256 limits; every failure is an error. A file over
+  the size limit (64 MiB for a sheet, 16 MiB for the `.kicad_pro`) is refused
+  from its size before any of it is read.
+- `project_file`: the same guarantee for the JSON `.kicad_pro`: original text
+  plus a span tree, so a setting change replaces one span (16 MiB, depth 128).
+- `model`: a typed view of one `.kicad_sch` read from the tree (symbols,
+  `lib_symbols` with `extends`, wires, buses, junctions, no-connects, labels,
+  sheets and sheet pins, bus entries, bus aliases, KiCad 6's
+  `symbol_instances`/`sheet_instances`, KiCad 7+ `instances`). The model is
+  never written back; edits change the tree. Coordinates are integers in
+  KiCad's 100 nm unit, so "pin on wire end" is exact. `placed_pins` is the one
+  place pin positions are computed (unit, body style, rotation, mirroring),
+  with each pin's outward direction; the engine and the edits both use it, and
+  a UI must.
+- `project`: a project from its `.kicad_pro` or root `.kicad_sch`, the sheet
+  files and the hierarchy. A sheet file is loaded only when it resolves,
+  lexically and through symlinks, inside the project directory; anything else
+  (`..`, absolute paths, symlinks out, missing files, a sheet containing
+  itself) is a warning and an empty sheet. At most 4,096 sheet instances and
+  64 levels (both tested). Sheet order is KiCad's (depth first, then by page
+  number).
+- `conn` and `connectivity`: the connection engine, written from a reading of
+  KiCad 10's `connection_graph.cpp`: items per sheet instance, subgraphs, driver
+  priority and tie-breaks, same-sheet merging, weak-name collisions (`_1`),
+  global labels and power symbols (global and KiCad 9's local power), hidden
+  power pins in old symbols (with KiCad's legacy power-symbol value fix for
+  pre-20230221 files), sheet pins and hierarchical labels, no-connects,
+  KiCad 10 jumper pins and stacked pin numbers, `unconnected-(...)` names, and
+  **buses**: vector buses, groups, aliases (sheet and project), bus entries,
+  bus-to-bus entries, member propagation through the hierarchy, and nets with
+  several bus parents. **Work limits on hostile input**: one label expands to
+  at most 8,192 bus members across its groups, vectors and aliases, and an
+  alias that refers to itself (directly or through another) stays a plain
+  member (KiCad itself recurses without end on one); the whole project is
+  capped at 2,000,000 pins, items and bus members counted per sheet instance,
+  which bounds a shared sheet placed thousands of times and a many-pin library
+  symbol placed many times. Past either limit the rest is left out and
+  `approximate` says so. Item joins at a point, the label and junction
+  on-line tests (an interval index over the lines) and same-sheet name
+  matching (a name index) are linear or near-linear rather than quadratic.
+- `netlist`: KiCad's S-expression netlist (format "E"): built from the engine,
+  written in KiCad 10's layout (or the compact KiCad 6–9 one), read back, and
+  compared (`compare`, the checks KiCad's own regression test makes, plus a
+  whole-net check).
+- `edit`: the v1 edits as operations on the tree, each all-or-nothing, and
+  `apply_all` for a batch: set, add or remove a field (Value and Footprint also
+  update KiCad 6's per-instance copies); set DNP, in-BOM and on-board; place a
+  symbol from the sheet's `lib_symbols` cache; copy a symbol; add wires;
+  connect two pins with a straight or single-elbow wire; **connect a pin to a
+  net by label** (a 2.54 mm stub along the pin's direction and a local or
+  global label); add a no-connect flag; annotate (first free number per
+  prefix, hierarchy order then X then Y, each sheet instance of a shared sheet
+  numbered separately; with `reset`, the units of a multi-unit part that
+  shared a number keep sharing one). A placement's rotation must be 0, 90,
+  180 or 270 (KiCad loads nothing else), and it takes the default body style.
+- `examples/netlist.rs`: the CLI helper. `cargo run -p deckjack-circuit
+  --example netlist -- PROJECT.kicad_pro` prints the netlist; `--compare
+  REF.net` prints a parity report and exits non-zero on a mismatch.
+
+**Design decisions.**
+- *New nodes are clones.* KiCad's syntax drifted across 6–10 (quoted UUIDs,
+  `(hide yes)` versus a bare `hide`, `dnp`, `exclude_from_sim`, tabs versus
+  two spaces). A new wire, label, no-connect or symbol is a copy of one already
+  in the file with its position, text and UUID changed; a new symbol's fields
+  are copied from its own `lib_symbols` entry (written in the file's syntax)
+  and re-indented. Only when the file has nothing to copy is a per-version
+  template used. The file's version token is never changed.
+- *Refusals, not upgrades.* A file newer than 20260306 (KiCad 10.0, checked
+  against `sch_file_versions.h` on the 10.0 branch) is read-only; DNP on a
+  pre-KiCad-7 file, removing a mandatory field, or setting Reference as a field
+  (it lives in the instance tables) are errors. A failed edit, or a failed op
+  in a batch, leaves every file as it was.
+- *KiCad's hashes, where names depend on them.* An unannotated symbol's
+  default net name embeds `KIID::Hash()`, which is Boost's `uuids::hash_value`;
+  `kiid_hash32` implements the Boost 1.86+ formula (Arch builds KiCad 10.0.7
+  against Boost 1.92). A KiCad built against an older Boost names those nets
+  differently.
+- *Two fixes found by parity*, both one-liners against KiCad's code: a bus
+  wire entry does not propagate into the bus it touches
+  (`SCH_BUS_WIRE_ENTRY::ConnectionPropagatesTo`), and a net with two bus
+  parents is counted per parent, not per distinct member name.
+
+**Measured parity.** KiCad 10.0.7 (`/usr/bin/kicad-cli`, installed on this
+machine on 2026-11-22, so the parity test ran live) and the 34 projects in the
+fixture corpus (`tests/fixtures/README.md`: KiCad's own
+`qa/data/eeschema/netlists`, byte-identical to upstream, GPL-3.0-or-later).
+
+| check | result |
+| --- | --- |
+| Unedited load and save, every `.kicad_sch` (68 files) and `.kicad_pro` (33) | byte-identical, all |
+| Against `kicad-cli sch export netlist`, per pin: net name, pin function, pin type | **34 of 34 projects identical** |
+| Against `kicad-cli`, every net by name and members | 34 of 34 |
+| Against `kicad-cli`, components: reference, value, footprint, sheet path, UUID set, primary UUID | 34 of 34 |
+| Against `kicad-cli`, component properties (Sheetname, Sheetfile, the placing sheet's fields, user fields, dnp, exclude_from_bom, ki_keywords, ki_fp_filters) | 211 of 211 components identical. The root sheet's name (a root-sheet component's Sheetname) follows a rule **inferred** from these fixtures, not read from KiCad's code: the project's name for files older than 20251012, the root's entry in the project file's `sheets` table for newer ones, "Root" without either |
+| Against the 22 reference netlists KiCad's repository ships | 21 of 21 that KiCad's own test uses, identical; `legacy_power` (written by KiCad 6.0.10, not used by KiCad's test) identical in pin partition, differing only by KiCad 7's pin-name net naming |
+| Edits on one project per format era (20200512, 20211123, 20230121, 20231120, 20240716, 20250227, 20260306), then exported by `kicad-cli` | KiCad parses the edited file and its netlist equals ours after each of: set Value, set Footprint, add a field, DNP, in-BOM off, on-board off, place and connect, copy and wire, annotate. Remove-field is checked as a byte-for-byte undo of add-field, not exported. Only KiCad 10 parses them here: whether KiCad 8 opens a 20231120/20240716 file after an edit is **unverified** (no KiCad 8 is installed) |
+| Randomized corruption, seeded (`tests/hostile.rs`) | no panic. Release, two distinct seeds at 300 rounds: about 36,000 tree-level corruptions taken through model, engine and netlist writer, and about 74,000 byte-level ones through the parsers (about 1,400 of which still parsed and ran the whole pipeline). Debug (overflow checks on), one seed at 120 rounds: 7,168 tree-level and 279 byte-level full-pipeline runs. The gate runs 24 rounds |
+| Speed | `complex_hierarchy` (two 46 KB files, 74 symbols, 120 symbol instances across 3 sheet instances) opens, resolves and writes its netlist in about 5 ms including process start (release build) |
+
+The live comparison is `tests/kicad_cli.rs`; without KiCad it passes with a
+"SKIPPED" line. **To run it elsewhere: `pacman -S kicad`.**
+
+**Gaps, plainly.**
+- **Net classes**: every net is written as class `Default`. KiCad resolves
+  classes from project patterns, directive labels and label fields, with
+  composite names (`CLASS1,CLASS3,Default`). 31 nets in 4 of 34 projects
+  differ (`issue14494`, `issue16915`, `issue24220`, `multinetclasses`).
+- **Net codes** differ from KiCad's on 21 nets: KiCad numbers over its
+  internal net map, which holds entries this engine does not reproduce. Names,
+  members and order match; codes are positional and nothing downstream should
+  key on them, but a byte diff shows them.
+- **The rest of the netlist file**: no `fields` block, `libraries` section,
+  title blocks, per-unit `units` blocks, component classes or variants, and
+  the order of a multi-unit symbol's secondary UUIDs follows KiCad's R-tree,
+  which is not reproduced (the set and the primary UUID match). So the file is
+  not byte-identical to KiCad's. The nets, and each component's reference,
+  value, footprint, sheet path, UUIDs and properties, match on every fixture
+  (above).
+- **Hostile input, still open**: the line index tests diagonal lines by
+  their X range and then exactly, so many overlapping diagonal lines still
+  cost labels times lines; renaming many weakly driven subgraphs that share
+  one name (`_1`, `_2`, ...) is quadratic in their count.
+- **Not modeled in connectivity**: text variables in labels (`${VAR}`),
+  KiCad 10 variants, and hit-testing within a wire's pen width (KiCad's own
+  model is exact coordinates too; inferred, not checked on off-grid files).
+  Bus resolution matches on all 12 fixtures that use buses but is the least exercised
+  part on real designs; the engine says so in `approximate`.
+- **Edits**: annotation does not group unannotated units into parts (each
+  `U?` unit gets its own number; units that already share a number keep
+  sharing one) and has only KiCad's default "first free number, sort by X"
+  mode. A new field is hidden as its file's format hides fields: in
+  `effects` up to 20240819, on the property from 20241004. The switch version
+  is **inferred**: the fixtures show 20240819 and 20250227 on either side,
+  and 20241004 ("use booleans for 'hide' in symbols") is the only format
+  change between them about `hide`. Placement copies field positions from
+  the library without KiCad's autoplacement, and labels get a simple
+  justification, so new items look plainer than KiCad's. Copying a symbol
+  between files, delete, rotate, mirror, drag with stretch, undo/redo,
+  autosave, the content-hash save check and the netlist diff on save are not
+  built (they belong with the commands).
+- **Not checked**: that KiCad 10's GUI opens an edited file without a repair
+  prompt (spike 4). `kicad-cli` loading and exporting each edited project is
+  the closest check made. KiCad's autosave file name, `kicad-cli` under the
+  sandbox (spike 5) and the corpus beyond KiCad's own QA projects (spike 1's
+  open-hardware set) are still open.
+
+**Format-bump procedure** (the brief owed one): when KiCad ships a new
+schematic token, read `eeschema/sch_file_versions.h` and the parser
+(`sch_io_kicad_sexpr_parser.cpp`) on that release branch; add any new
+connectivity-relevant syntax to `model.rs`; add a project saved by that
+release to the fixtures with its `kicad-cli` netlist; run the suite with
+`kicad-cli` installed; then raise `NEWEST_KNOWN_VERSION` in `model.rs`. Until
+then files with the new token open read-only.
 
 ### Useful subset (v1)
 

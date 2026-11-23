@@ -163,6 +163,9 @@ fn a_real_app_launched_by_the_core_can_use_its_system_files() {
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let env = OsEnv::new();
+    // As the core's attendant would: a launch hands the core its end of
+    // the app's link, and is refused when nothing is there to take it.
+    let _links = env.links().attend("probe");
     let found = apps::discover(&install, &env);
     let installed = found
         .apps
@@ -573,6 +576,9 @@ fn an_app_launched_by_the_core_gets_exactly_the_tcp_ports_its_manifest_names() {
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let env = OsEnv::new();
+    // As the core's attendant would: a launch hands the core its end of
+    // the app's link, and is refused when nothing is there to take it.
+    let _links = env.links().attend("probe");
     let found = apps::discover(&install, &env);
     let installed = found
         .apps
@@ -597,5 +603,160 @@ fn an_app_launched_by_the_core_gets_exactly_the_tcp_ports_its_manifest_names() {
             format!("connect {other} {}", eacces()),
         ],
         "the launched app reaches the manifest's port and is refused on another"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ffmpeg under the launcher (docs/lanes/5c-convert.md, spike S1)
+// ---------------------------------------------------------------------------
+
+/// Convert's premise, on this kernel with nothing faked: an app declaring
+/// Convert's grants (`Videos/` and `Music/` writable, no network, no GPU) is
+/// planned and spawned as the core does it, and runs the system's `ffprobe`
+/// and `ffmpeg` as children. They inherit the app's Landlock and seccomp
+/// policy, so they can read and write what the grant names and nothing else,
+/// and cannot open a socket.
+///
+/// Each step is paired with its control: the same probe on a file outside the
+/// grant, the same ffmpeg reading from a listening HTTP port.
+#[test]
+fn ffmpeg_run_by_a_confined_app_reaches_its_grant_and_nothing_else() {
+    use deckjack_core::apps::{self, Confinement, Env as _, LaunchPlan, OsEnv};
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (ffmpeg, ffprobe) = ("/usr/bin/ffmpeg", "/usr/bin/ffprobe");
+    if !std::path::Path::new(ffmpeg).exists() || !std::path::Path::new(ffprobe).exists() {
+        eprintln!("skipped: no system ffmpeg");
+        return;
+    }
+    if !sandbox::availability().is_enforcing() {
+        eprintln!("skipped: this host cannot confine");
+        return;
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let install = root.path().join("install");
+    let work = root.path().join("work");
+    for dir in ["Videos", "Music", "Secret"] {
+        std::fs::create_dir_all(work.join(dir)).unwrap();
+    }
+    // The same two-second clip inside the grant and outside it, made by an
+    // unconfined ffmpeg.
+    let made = std::process::Command::new(ffmpeg)
+        .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi"])
+        .args(["-i", "testsrc2=s=320x240:r=25:d=2", "-c:v", "mpeg4"])
+        .arg(work.join("Videos/in.mkv"))
+        .status()
+        .unwrap();
+    assert!(made.success());
+    std::fs::copy(work.join("Videos/in.mkv"), work.join("Secret/in.mkv")).unwrap();
+
+    // An HTTP port that counts who reaches it: a refusal must be the
+    // sandbox's, not a closed port's.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let reached = Arc::new(AtomicUsize::new(0));
+    {
+        let reached = Arc::clone(&reached);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                reached.fetch_add(1, Ordering::SeqCst);
+                drop(conn);
+            }
+        });
+    }
+
+    let app_dir = install.join("apps").join("probe");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("app.toml"),
+        format!(
+            "[app]\nname = \"probe\"\nversion = \"1.0.0\"\nprotocol = {}\n\
+             [needs]\nworking_dir = [\
+             {{ path = \"Videos\", write = true }}, {{ path = \"Music\", write = true }}]\n",
+            apps::PROTOCOL_VERSION
+        ),
+    )
+    .unwrap();
+    let dri = if std::path::Path::new("/dev/dri/renderD128").exists() {
+        "if (exec 3< /dev/dri/renderD128) 2>/dev/null; then echo 'dri opened' >> $log; \
+         else echo 'dri refused' >> $log; fi\n"
+    } else {
+        "echo 'dri refused' >> $log\n"
+    };
+    let binary = app_dir.join("deckjack-probe");
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\n\
+             log=Videos/log\n\
+             {ffprobe} -v error -of json -show_streams file:Videos/in.mkv > Videos/probe.json \
+               && grep -q mpeg4 Videos/probe.json && echo 'probe granted' >> $log\n\
+             if {ffprobe} -v error -show_streams file:Secret/in.mkv > Videos/secret.txt 2>&1; \
+               then echo 'probe outside read' >> $log; \
+               elif grep -q 'Permission denied' Videos/secret.txt; \
+               then echo 'probe outside eacces' >> $log; \
+               else echo 'probe outside failed otherwise' >> $log; fi\n\
+             {ffmpeg} -nostdin -v error -protocol_whitelist file,pipe -i file:Videos/in.mkv \
+               -c:v libx264 -preset ultrafast -f mp4 -n file:Videos/out.mp4 \
+               && echo 'encode wrote' >> $log\n\
+             if {ffmpeg} -nostdin -v error -rw_timeout 2000000 \
+               -i http://127.0.0.1:{port}/in.mkv -f null - 2>/dev/null; \
+               then echo 'http read' >> $log; else echo 'http failed' >> $log; fi\n\
+             {dri}\
+             echo done >> $log\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let env = OsEnv::new();
+    let found = apps::discover(&install, &env);
+    let installed = found
+        .apps
+        .into_iter()
+        .find(|app| app.name == "probe")
+        .unwrap_or_else(|| panic!("probe was not discovered: {:?}", found.problems));
+    let plan = LaunchPlan::build(&installed, &install, &work, Confinement::Enforced, &env)
+        .expect("a plan for a real install");
+
+    // As the core's attendant would: a launch hands the core its end of
+    // the app's link, and is refused when nothing is waiting for it.
+    let _links = env.links().attend("probe");
+    let pid = env.spawn(&plan).expect("the confined app starts");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while env.is_running(pid) {
+        assert!(std::time::Instant::now() < deadline, "the probe app hung");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // The port answers nothing, so ffmpeg fails either way: whether it got
+    // there is what tells the sandbox's refusal from a broken request.
+    assert_eq!(
+        reached.load(Ordering::SeqCst),
+        0,
+        "the confined ffmpeg never reached the listening port"
+    );
+    let log = std::fs::read_to_string(work.join("Videos/log")).unwrap_or_default();
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        [
+            "probe granted",
+            "probe outside eacces",
+            "encode wrote",
+            "http failed",
+            "dri refused",
+            "done"
+        ],
+        "a confined ffmpeg reads and writes its grant, and nothing else"
+    );
+    assert!(
+        std::fs::metadata(work.join("Videos/out.mp4"))
+            .unwrap()
+            .len()
+            > 0,
+        "the encode wrote a real file"
     );
 }

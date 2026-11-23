@@ -135,8 +135,9 @@ impl Node {
 
 /// What a node is. Tagged by `kind` on the wire.
 ///
-/// Twelve widgets, deliberately few: each is a component the shell owns and
-/// styles with tokens, so each one added is shell code to keep.
+/// Thirteen widgets, deliberately few: each is a component the shell owns and
+/// styles with tokens, so each one added is shell code to keep. A new one
+/// needs two apps that need it (docs/TIERS.md).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Widget {
@@ -160,6 +161,10 @@ pub enum Widget {
     /// A date or date-time, formatted by the shell in the viewer's locale
     /// and time zone, which only the viewer's device knows.
     Date(Date),
+    /// How far a long piece of work has got, as a bar. Added for Convert's
+    /// job queue; Video's export list and Files' transfers are the next two
+    /// users (docs/lanes/5c-convert.md, "Built").
+    Progress(Progress),
 }
 
 /// Space between children, in the shell's spacing steps.
@@ -430,6 +435,21 @@ pub struct Date {
     pub flag_past: bool,
 }
 
+/// A bar from empty to full. Only the bar: the words beside it ("12 min
+/// left") are a [`Text`], so they read the same to a screen reader and in
+/// `ui.snapshot` as anywhere else.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Progress {
+    /// From 0.0 to 1.0, clamped by the shell. `None` while nobody knows how
+    /// far along it is, drawn as a bar that moves without a position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    /// The accessible name: what is progressing ("Encoding trip.mov").
+    #[serde(skip_serializing_if = "is_default")]
+    pub label: String,
+}
+
 macro_rules! widget_from {
     ($($t:ident),*) => {
         $(impl From<$t> for Widget {
@@ -440,7 +460,8 @@ macro_rules! widget_from {
     };
 }
 widget_from!(
-    Stack, Row, Scroll, Text, Heading, Button, Checkbox, TextField, Select, List, Empty, Date
+    Stack, Row, Scroll, Text, Heading, Button, Checkbox, TextField, Select, List, Empty, Date,
+    Progress
 );
 
 impl Widget {
@@ -459,6 +480,7 @@ impl Widget {
             Widget::List(_) => "list",
             Widget::Empty(_) => "empty",
             Widget::Date(_) => "date",
+            Widget::Progress(_) => "progress",
         }
     }
 }
@@ -1449,6 +1471,34 @@ mod tests {
         let field = serde_json::to_value(Widget::from(TextField::default())).unwrap();
         assert_eq!(field["kind"], "text_field");
         assert_eq!(Widget::from(TextField::default()).kind(), "text_field");
+    }
+
+    #[test]
+    fn a_progress_bar_says_how_far_or_that_nobody_knows() {
+        // What `UiNode.vue` reads: `value` absent is the indeterminate bar,
+        // which is not the same as 0 ("not started").
+        let known = serde_json::to_value(Widget::from(Progress {
+            value: Some(0.25),
+            label: "Encoding a.mov".into(),
+        }))
+        .unwrap();
+        assert_eq!(
+            known,
+            serde_json::json!({"kind": "progress", "value": 0.25, "label": "Encoding a.mov"})
+        );
+        let started = serde_json::to_value(Widget::from(Progress {
+            value: Some(0.0),
+            label: String::new(),
+        }))
+        .unwrap();
+        assert_eq!(
+            started,
+            serde_json::json!({"kind": "progress", "value": 0.0})
+        );
+        let unknown = serde_json::to_value(Widget::from(Progress::default())).unwrap();
+        assert_eq!(unknown, serde_json::json!({"kind": "progress"}));
+        let back: Widget = serde_json::from_value(unknown).unwrap();
+        assert_eq!(back, Widget::Progress(Progress::default()));
     }
 
     #[test]

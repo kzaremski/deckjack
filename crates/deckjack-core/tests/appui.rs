@@ -44,7 +44,6 @@ struct Rig {
     registry: Arc<Registry>,
     bus: Arc<Bus>,
     store: Arc<std::sync::Mutex<Store>>,
-    install: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -118,7 +117,6 @@ async fn rig(apps_to_install: &[(&str, &str)]) -> Rig {
             Box::new(StoreGrants::new(Arc::clone(&store))),
         ),
         Arc::clone(&registry),
-        install.clone(),
         Duration::from_millis(80),
     );
     host.start().await;
@@ -128,7 +126,6 @@ async fn rig(apps_to_install: &[(&str, &str)]) -> Rig {
         registry,
         bus,
         store,
-        install,
         _dir: dir,
     }
 }
@@ -149,10 +146,14 @@ fn id(s: &str) -> CommandId {
 impl Rig {
     /// Connect as `name`'s process and register its two commands.
     async fn connect(&self, name: &str) -> FakeApp {
-        let path = apps::socket_path(&self.install, name);
-        let stream = UnixStream::connect(&path)
-            .await
-            .unwrap_or_else(|e| panic!("connect to {}: {e}", path.display()));
+        // A link made the way a launch makes one: the other end is
+        // already with this app's attendant.
+        let link = self
+            .host
+            .link(name)
+            .unwrap_or_else(|e| panic!("a link for {name}: {e}"));
+        link.set_nonblocking(true).unwrap();
+        let stream = UnixStream::from_std(link).unwrap();
         let mut app = FakeApp {
             name: name.to_string(),
             stream: BufReader::new(stream),

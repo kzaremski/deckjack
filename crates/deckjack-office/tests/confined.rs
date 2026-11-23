@@ -41,6 +41,8 @@ fn convert_confined(rig: &Rig, fixture: &str) -> (serde_json::Value, Vec<u8>) {
 
     let mut plan = rig.plan();
     plan.args = vec!["--worker".into(), job.to_string_lossy().into_owned()];
+    // The app spawns its worker itself, and hands it no link to the core.
+    plan.core_link = false;
     // What the app sets for its worker; the plan's own env (HOME, TMPDIR)
     // is kept.
     for (key, value) in deckjack_office::worker::WORKER_ENV {
@@ -82,6 +84,9 @@ fn libreoffice_converts_docx_xlsx_and_pptx_under_the_real_launcher() {
         // not return LibreOffice's version JSON.
         let version = result["version"].as_str().unwrap_or_default();
         assert!(version.contains("\"ProductName\""), "{fixture}: {version}");
+        // Non-dumpable before the engine boots, so a crash in it is never
+        // handed to systemd-coredump (docs/lanes/10-sandbox-all-apps.md).
+        assert_eq!(result["dumpable"], 0, "{fixture}: {result}");
         eprintln!(
             "S1 {fixture}: {} ms, peak RSS {} MiB",
             result["millis"],
@@ -115,6 +120,7 @@ fn a_worker_held_under_its_memory_limit_fails_instead_of_converting() {
     std::fs::write(job.join("job.json"), spec.to_string()).unwrap();
     let mut plan = rig.plan();
     plan.args = vec!["--worker".into(), job.to_string_lossy().into_owned()];
+    plan.core_link = false;
     let pid = rig.env.spawn(&plan).unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
     while rig.env.is_running(pid) {
@@ -125,4 +131,26 @@ fn a_worker_held_under_its_memory_limit_fails_instead_of_converting() {
         !job.join("output.pdf").exists(),
         "a worker limited to 64 MiB of data converted anyway: the limit is not applied"
     );
+    // It got as far as booting LibreOffice: every limit was set and it was
+    // marked non-dumpable. A worker that failed before that (a refused
+    // prctl, an unreadable job) also writes no PDF, and would otherwise
+    // pass here as "held under its memory limit".
+    assert!(
+        job.join(deckjack_office::worker::BOOTING_FILE).exists(),
+        "the starved worker failed before LibreOffice booted, so this says nothing about \
+         its memory limit (result: {:?})",
+        std::fs::read_to_string(job.join("result.json")).ok()
+    );
+    // The engine dies under the limit (SIGSEGV, measured), so there is
+    // usually no result at all; a result that is there must not claim
+    // success. The worker is non-dumpable, so that death is not handed to
+    // systemd-coredump and raises no desktop crash notification.
+    match std::fs::read(job.join("result.json")) {
+        Ok(bytes) => {
+            let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            eprintln!("the starved worker reported {result}");
+            assert_eq!(result["ok"], false, "{result}");
+        }
+        Err(_) => eprintln!("the starved worker died without a result"),
+    }
 }

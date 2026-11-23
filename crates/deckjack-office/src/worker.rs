@@ -37,15 +37,13 @@ pub const WORKER_FLAG: &str = "--worker";
 
 /// The worker's environment, beyond its private `HOME` and `TMPDIR`.
 ///
-/// Landlock (ABI 4) does not govern `connect()` to a pathname Unix socket,
-/// and a confined LibreOffice was measured connecting to CUPS, the D-Bus
-/// system bus and systemd-resolved (docs/lanes/6-office.md, S1). The two
-/// that a client library reads an address for from the environment are
-/// pointed at a path that does not exist, so the connect fails before it
-/// starts. Measured with strace, that removed every one of those connects,
-/// the resolver's included (why that one went too was not traced).
-/// It is a mitigation for this app only: Landlock still does not govern the
-/// sockets, so any other app can reach them (a platform gap).
+/// Before every app was held to Landlock's Unix-socket rule (ABI 9,
+/// docs/lanes/10-sandbox-all-apps.md), a confined LibreOffice was measured
+/// connecting to CUPS, the D-Bus system bus and systemd-resolved
+/// (docs/lanes/6-office.md, S1). The sandbox now refuses those connects.
+/// The two that a client library reads an address for from the environment
+/// are still pointed at a path that does not exist, so the library gives up
+/// before it tries rather than meeting a refusal it may log as an error.
 pub const WORKER_ENV: &[(&str, &str)] = &[
     // Headless rendering, no display connection attempted.
     ("SAL_USE_VCLPLUGIN", "svp"),
@@ -60,6 +58,10 @@ pub const WORKER_ENV: &[(&str, &str)] = &[
 
 const JOB_FILE: &str = "job.json";
 const RESULT_FILE: &str = "result.json";
+/// Written in the job directory just before LibreOffice boots, after every
+/// limit is set and the worker is non-dumpable. A worker that dies without
+/// a result can then be told apart from one that never got that far.
+pub const BOOTING_FILE: &str = "booting";
 
 /// What one worker is asked to do. Written by the app, read by the worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +97,11 @@ pub struct JobResult {
     /// The worker's peak resident set, KiB, as the kernel counted it.
     #[serde(default)]
     pub peak_rss_kib: u64,
+    /// `prctl(PR_GET_DUMPABLE)` as the worker read it just before booting
+    /// LibreOffice: 0 when a crash will not be handed to a core dump
+    /// handler. Absent when the job failed before that point.
+    #[serde(default)]
+    pub dumpable: Option<i32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +118,7 @@ pub fn worker_main(dir: &Path) -> i32 {
             version: None,
             millis: 0,
             peak_rss_kib: 0,
+            dumpable: None,
         },
     };
     let mut result = result;
@@ -143,6 +151,27 @@ fn run_job(dir: &Path) -> Result<JobResult, String> {
     // A crashing engine must not leave a core file of a confidential
     // document behind.
     limit(libc::RLIMIT_CORE, 0)?;
+    // And not hand its memory to anything else either. With only the
+    // rlimit, the kernel still pipes the whole image to systemd-coredump,
+    // which reads it, logs the crash (a desktop crash notification on a
+    // machine that watches the journal) and only then declines to store it.
+    // A non-dumpable process is never dumped at all: the kernel stops in
+    // do_coredump before running the handler. The death itself is unchanged
+    // (still SIGSEGV or SIGABRT), and the app reports it from the exit
+    // status ([`describe_death`]); a converter crashing on an operator's
+    // document is that job's failure, not a desktop crash.
+    // SAFETY: prctl with PR_SET_DUMPABLE takes plain integers.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(format!(
+            "cannot mark the worker non-dumpable: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // SAFETY: PR_GET_DUMPABLE takes plain integers and returns the flag.
+    let dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+    std::fs::write(dir.join(BOOTING_FILE), b"")
+        .map_err(|e| format!("cannot mark the job as booting: {e}"))?;
 
     let started = Instant::now();
     let office = lok::Lok::boot(&spec.install, &spec.profile).map_err(|e| e.to_string())?;
@@ -157,6 +186,7 @@ fn run_job(dir: &Path) -> Result<JobResult, String> {
         version,
         millis: started.elapsed().as_millis() as u64,
         peak_rss_kib: 0,
+        dumpable: Some(dumpable),
     })
 }
 

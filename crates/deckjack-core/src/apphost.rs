@@ -13,13 +13,14 @@
 //!
 //! # Shape
 //!
-//! One **attendant** task per installed app, owning that app's
-//! [`UnixListener`] for the life of the process. It waits for the app to
-//! connect, runs the handshake, registers the app's commands on the bus,
-//! pumps frames until the connection ends, then drops the commands again and
-//! goes back to waiting. An app that crashes and is restarted by
-//! [`apps::Host::poll`] reconnects to the same socket and the same attendant
-//! picks it up, which is why the listener outlives any one connection.
+//! One **attendant** task per installed app, attending that app's
+//! [`apps::Links`] for the life of the process. Every launch makes a fresh
+//! socket pair, hands the core's end to the attendant and the other to the
+//! child (docs/lanes/10-sandbox-all-apps.md). The attendant runs the
+//! handshake on it, registers the app's commands on the bus, pumps frames
+//! until the connection ends, then drops the commands again and goes back to
+//! waiting. An app that crashes and is restarted by [`apps::Host::poll`]
+//! arrives on a new link at the same attendant.
 //!
 //! One **link** per connected app: a channel into its pump. Everything that
 //! wants something from an app — a bus dispatch, a UI asset request, a clean
@@ -57,7 +58,6 @@
 //! `agentbridge`'s note on where authority lives.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -126,7 +126,9 @@ pub struct AppHost {
     /// — so removal is by id.
     provided: Mutex<BTreeMap<String, Vec<CommandId>>>,
     registry: Arc<Registry>,
-    install_dir: PathBuf,
+    /// Where each launch's link to the core arrives; shared with the
+    /// [`apps::OsEnv`] that makes them.
+    app_links: apps::Links,
     handshake: Duration,
     /// How an app's invocation reaches the bus. Attached after construction
     /// because the bus is built from this host's registry and an app's
@@ -148,7 +150,6 @@ impl AppHost {
     pub fn new(
         mut host: apps::Host<apps::OsEnv>,
         registry: Arc<Registry>,
-        install_dir: PathBuf,
         handshake: Duration,
     ) -> Arc<AppHost> {
         // Approval summaries group a window's `[ui]` scope by risk, read from
@@ -156,12 +157,13 @@ impl AppHost {
         // the caller, so a host the product builds can never summarize
         // without it.
         host.set_command_risks(Arc::clone(&registry) as Arc<dyn apps::CommandRisks>);
+        let app_links = host.env().links();
         Arc::new(AppHost {
             host: Mutex::new(host),
             links: Mutex::new(BTreeMap::new()),
             provided: Mutex::new(BTreeMap::new()),
             registry,
-            install_dir,
+            app_links,
             handshake,
             bridge: OnceLock::new(),
             ui: OnceLock::new(),
@@ -216,10 +218,8 @@ impl AppHost {
 
     /// Discover what is installed and start the attendants.
     ///
-    /// Sockets are bound here, before anything is spawned, because an app
-    /// starts by connecting to one: binding after the spawn is a race the app
-    /// loses, and it loses it as a handshake timeout that looks like the
-    /// app's fault.
+    /// Each attendant is in place before anything is spawned, because a
+    /// launch refuses an app nothing attends: its link would never be read.
     pub async fn start(self: &Arc<AppHost>) {
         let events = self.host().refresh();
         self.report(events);
@@ -244,29 +244,28 @@ impl AppHost {
             .collect();
 
         for manifest in manifests {
-            let name = manifest.app.name.clone();
-            let path = apps::socket_path(&self.install_dir, &name);
-            match apps::bind_socket(&path).await {
-                Ok(listener) => {
-                    let me = Arc::clone(self);
-                    tokio::spawn(attend(me, manifest, listener));
-                }
-                Err(e) => {
-                    // No socket means no handshake, so the app can never
-                    // become ready. Saying so now beats a timeout later that
-                    // blames the app.
-                    tracing::error!(
-                        app = %name,
-                        path = %path.display(),
-                        error = %e,
-                        "cannot bind this app's socket; it will not be launched"
-                    );
-                }
-            }
+            let links = self.app_links.attend(&manifest.app.name);
+            let me = Arc::clone(self);
+            tokio::spawn(attend(me, manifest, links));
         }
 
         let events = self.host().start_services();
         self.report(events);
+    }
+
+    /// A link to the core for `app`, as a launch makes one: the core's end
+    /// goes to the app's attendant and the app's end is returned.
+    ///
+    /// For a harness standing in for an app process. The core itself never
+    /// calls this; [`apps::OsEnv::spawn`] does the same for a real child.
+    pub fn link(&self, app: &str) -> std::io::Result<std::os::unix::net::UnixStream> {
+        self.app_links.open(app)
+    }
+
+    /// Why no app can launch on this node, or `None` when apps can. See
+    /// [`apps::launch_refusal`].
+    pub fn launch_refusal(&self) -> Option<String> {
+        self.host().launch_refusal()
     }
 
     /// The idle sweep, the crash-backoff restarts and the handshake
@@ -680,11 +679,25 @@ impl Invocations {
     }
 }
 
-/// One app's attendant: accept, handshake, pump, repeat.
-async fn attend(host: Arc<AppHost>, manifest: Manifest, listener: tokio::net::UnixListener) {
+/// One app's attendant: take a link, handshake, pump, repeat.
+async fn attend(
+    host: Arc<AppHost>,
+    manifest: Manifest,
+    mut links: mpsc::UnboundedReceiver<apps::LinkEnd>,
+) {
     let app = manifest.app.name.clone();
-    loop {
-        match apps::accept_handshake(&listener, &manifest, host.handshake).await {
+    while let Some(link) = links.recv().await {
+        let stream = match link
+            .set_nonblocking(true)
+            .and_then(|()| tokio::net::UnixStream::from_std(link))
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::error!(app = %app, error = %e, "cannot use this app's link");
+                continue;
+            }
+        };
+        match apps::handshake(stream, &manifest, host.handshake).await {
             Ok((conn, commands)) => {
                 let (out, rx) = mpsc::unbounded_channel();
                 host.links().insert(app.clone(), Link { out: out.clone() });
@@ -710,12 +723,10 @@ async fn attend(host: Arc<AppHost>, manifest: Manifest, listener: tokio::net::Un
                 }
             }
             Err(e) => {
-                // Usually a timeout, and usually because the app is simply
-                // not running: an on-demand app spends most of its life not
-                // running, and this loop is what is waiting when it starts.
-                // So it is debug, not warn — and the timeout is itself what
-                // paces this loop rather than a sleep.
-                tracing::debug!(app = %app, error = %e, "no app connected");
+                // A launch whose process died before saying anything, or
+                // hung: the host's own handshake deadline and crash
+                // accounting already deal with both, and say so at warn.
+                tracing::debug!(app = %app, error = %e, "an app's handshake failed");
             }
         }
     }

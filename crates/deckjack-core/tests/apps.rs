@@ -80,8 +80,9 @@ impl FakeEnv {
         *env.inner.now.lock().unwrap() = 1_000;
         *env.inner.next_pid.lock().unwrap() = 500;
         *env.inner.availability.lock().unwrap() = Some(sandbox::Availability::Enforcing {
-            landlock_abi: 5,
+            landlock_abi: 9,
             network_rules: true,
+            ipc_scoping: true,
         });
         env.mkdir(INSTALL);
         env.mkdir(WORK);
@@ -915,6 +916,7 @@ fn an_app_that_asked_for_no_network_is_refused_where_that_cannot_be_enforced() {
     env.set_availability(sandbox::Availability::Enforcing {
         landlock_abi: 3,
         network_rules: false,
+        ipc_scoping: false,
     });
     install(&env, "pim", &manifest_text("pim", ""));
     match plan_for(&env, "pim") {
@@ -922,9 +924,9 @@ fn an_app_that_asked_for_no_network_is_refused_where_that_cannot_be_enforced() {
         other => panic!("expected a refusal, got {other:?}"),
     }
 
-    // An app that *did* ask for the network loses nothing on that kernel, so
-    // it runs — and the launcher knows the grant is coarser than the
-    // manifest asked for.
+    // An app that *did* ask for the whole network loses nothing to the
+    // missing network rules, but that kernel cannot scope Unix sockets
+    // either, and no app runs without that.
     install(
         &env,
         "notes",
@@ -933,11 +935,78 @@ fn an_app_that_asked_for_no_network_is_refused_where_that_cannot_be_enforced() {
             manifest_text("notes", "")
         ),
     );
-    let plan = plan_for(&env, "notes").expect("an app that asked for network still runs");
-    assert!(plan.sandbox.policy.network.is_whole());
+    match plan_for(&env, "notes") {
+        Err(ConfinementError::NoIpcScoping { abi, .. }) => assert_eq!(abi, 3),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn every_app_is_refused_on_a_kernel_that_cannot_keep_unix_sockets_in_its_sandbox() {
+    // Landlock ABI 6 to 8: TCP rules, and even the abstract-socket and
+    // signal scopes, but no rule for pathname Unix sockets, so an app could
+    // reach the session bus and leave through `systemd-run --user`.
+    let env = FakeEnv::new();
+    env.set_availability(sandbox::Availability::Enforcing {
+        landlock_abi: 4,
+        network_rules: true,
+        ipc_scoping: false,
+    });
+    for (name, needs) in [
+        ("plain", ""),
+        ("net", "network = [\"cloud.example.net\"]"),
+        ("gpu", "gpu = true"),
+    ] {
+        install(&env, name, &with_needs(name, needs));
+        match plan_for(&env, name) {
+            Err(e @ ConfinementError::NoIpcScoping { .. }) => {
+                let said = e.to_string();
+                assert!(said.contains(apps::MIN_KERNEL), "{said}");
+                assert!(said.contains("ABI 4"), "{said}");
+            }
+            other => panic!("{name}: expected a refusal, got {other:?}"),
+        }
+    }
+
+    // The host refuses the same way, starts nothing, and says why for the
+    // whole node, which is what `system.apps` and the shell show.
+    let mut host = host_with(&env, apps::Policy::default(), FakeGrants::default());
+    host.refresh();
+    let opened = host.open_window("plain");
     assert!(
-        plan.sandbox.network_is_coarse(),
-        "a per-host allowlist that cannot be installed must be reported, not hidden"
+        matches!(
+            opened,
+            Err(HostError::Confinement(
+                ConfinementError::NoIpcScoping { .. }
+            ))
+        ),
+        "{opened:?}"
+    );
+    assert_eq!(env.spawn_count(), 0, "an app was spawned less confined");
+    let refusal = host
+        .launch_refusal()
+        .expect("the node says it launches no app");
+    assert!(refusal.contains(apps::MIN_KERNEL), "{refusal}");
+
+    // In developer mode nothing is confined, so nothing is refused for this.
+    assert_eq!(
+        apps::launch_refusal(
+            &env.sandbox_availability(),
+            apps::Confinement::unconfined_for_development()
+        ),
+        None
+    );
+    // And a kernel that can scope them refuses nothing.
+    assert_eq!(
+        apps::launch_refusal(
+            &sandbox::Availability::Enforcing {
+                landlock_abi: 9,
+                network_rules: true,
+                ipc_scoping: true,
+            },
+            apps::Confinement::Enforced
+        ),
+        None
     );
 }
 
@@ -2134,13 +2203,42 @@ fn a_network_entry_that_is_not_a_host_name_is_refused() {
 }
 
 #[test]
-fn an_app_socket_lives_in_the_install_directory_and_never_in_the_working_one() {
-    // A socket that got synced to another machine would be a door to a
-    // process that was never there.
-    let path = apps::socket_path(Path::new(INSTALL), "pim");
-    assert!(path.starts_with(INSTALL));
-    assert!(!path.starts_with(WORK));
-    assert!(path.to_string_lossy().contains("pim"));
+fn an_app_is_handed_its_link_and_reaches_no_unix_socket_made_outside_its_sandbox() {
+    // No path to connect to, so none to grant: the link is inherited at a
+    // fixed descriptor, Unix sockets and signals are scoped to the sandbox,
+    // and the run directory (the core's MCP sockets) is not granted at all.
+    let env = FakeEnv::new();
+    install(&env, "pim", &manifest_text("pim", ""));
+    let plan = plan_for(&env, "pim").unwrap();
+    assert!(plan.core_link, "an app is launched with a link to the core");
+    assert!(plan.pass_fds.is_empty());
+    assert!(
+        plan.env
+            .iter()
+            .any(|(k, v)| k == apps::LINK_FD_ENV && *v == apps::LINK_FD.to_string()),
+        "{:?}",
+        plan.env
+    );
+    assert!(
+        !plan.env.iter().any(|(k, _)| k == "DECKJACK_APP_SOCKET"),
+        "an app is told no socket path"
+    );
+    assert_eq!(
+        plan.sandbox.policy.ipc,
+        sandbox::Ipc::Scoped {
+            connect_unix: Vec::new()
+        }
+    );
+    let run = Path::new(INSTALL).join(apps::RUN_SUBDIR);
+    let policy = &plan.sandbox.policy;
+    assert!(
+        !policy
+            .read
+            .iter()
+            .chain(&policy.read_write)
+            .any(|p| p.starts_with(&run) || run.starts_with(p)),
+        "the run directory, or a tree holding it, was granted: {policy:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2309,6 +2407,7 @@ fn ports_on_a_kernel_without_network_rules_are_refused_not_widened() {
     env.set_availability(sandbox::Availability::Enforcing {
         landlock_abi: 3,
         network_rules: false,
+        ipc_scoping: false,
     });
     for (name, needs) in [
         (
@@ -3072,4 +3171,70 @@ fn the_summary_leads_with_the_riskiest_thing_the_window_can_do() {
         "{summary}"
     );
     assert!(summary.contains("does not know"), "{summary}");
+}
+
+// ---------------------------------------------------------------------------
+// The real launcher's own refusals
+// ---------------------------------------------------------------------------
+
+/// A plan for `/bin/true`, unconfined so it does not depend on this kernel.
+fn bare_plan(app: &str, pass_fds: Vec<i32>, core_link: bool) -> LaunchPlan {
+    LaunchPlan {
+        app: app.to_string(),
+        program: PathBuf::from("/bin/true"),
+        args: Vec::new(),
+        cwd: PathBuf::from("/"),
+        core_link,
+        pass_fds,
+        env: Vec::new(),
+        sandbox: apps::Sandbox {
+            gpu: false,
+            network_hosts: Vec::new(),
+            denied: Vec::new(),
+            policy: sandbox::Policy::nothing(),
+        },
+        confinement: Confinement::unconfined_for_development(),
+    }
+}
+
+#[test]
+fn a_link_for_an_app_nothing_attends_is_refused_in_words() {
+    let links = apps::Links::default();
+    let err = links
+        .open("late")
+        .expect_err("a link nobody reads must not be made");
+    let err = err.to_string();
+    assert!(err.contains("late"), "{err}");
+    assert!(err.contains("restart the core"), "{err}");
+
+    // And through the launcher: nothing is spawned for it.
+    let env = apps::OsEnv::new();
+    let err = env
+        .spawn(&bare_plan("late", Vec::new(), true))
+        .expect_err("an app with no attendant must not launch");
+    assert!(err.to_string().contains("restart the core"), "{err}");
+
+    // Control: once attended, the same launch goes ahead.
+    let _rx = env.links().attend("late");
+    let pid = env
+        .spawn(&bare_plan("late", Vec::new(), true))
+        .expect("an attended app launches");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while env.is_running(pid) {
+        assert!(std::time::Instant::now() < deadline, "/bin/true hung");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_plan_that_passes_the_link_descriptor_itself_is_refused() {
+    let env = apps::OsEnv::new();
+    let mut rx = env.links().attend("clash");
+    let err = env
+        .spawn(&bare_plan("clash", vec![apps::LINK_FD], true))
+        .expect_err("a plan may not pass the descriptor the link goes to");
+    let err = err.to_string();
+    assert!(err.contains("passes descriptor 3"), "{err}");
+    // Refused before a link was made, so the attendant got nothing.
+    assert!(rx.try_recv().is_err(), "a link was made for a refused plan");
 }

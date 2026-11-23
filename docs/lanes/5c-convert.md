@@ -159,7 +159,7 @@ be a sentence, not `EACCES`).
 | `convert.estimate` | read | `{path, preset, range?}` → predicted size, predicted time, speed, metric name and score per sample, warnings ("source is already lossy") | yes: per sample encode and the metric pass |
 | `convert.frame` | read | `{path, at, preset?, max_edge≤1280}` → one JPEG, base64, ≤512 KiB (well under the broker's 1 MiB param and socket frame caps); with `preset`, the frame comes from a sample encode | yes, when it encodes |
 | `convert.job.add` | write | `{paths[≤100], preset, range?, dest?: "beside" \| "<granted dir>", allow_lossy_to_lossless?}` → job ids. Never overwrites; refuses up front if the estimated total does not fit free space | — |
-| `convert.job.list` | read | `{since?}` → jobs: state (queued, running, done, failed, cancelled), fraction, speed, ETA, output path, error sentence | — |
+| `convert.job.list` | read | `{since?}` (not built: see Built) → jobs: state (queued, running, done, failed, cancelled), fraction, speed, ETA, output path, error sentence | — |
 | `convert.job.watch` | read | `{id, max_secs≤50}` → final state, or `still_running` at the deadline. Reports the job's progress through `Ctx::progress` while held | **yes, this is where job progress flows** |
 | `convert.job.cancel` | write | `{id}` → kills the child (SIGTERM, then SIGKILL after 5 s), deletes only its own partial file | — |
 | `convert.job.retry` | write | `{id}` → re-queues a failed or cancelled job | — |
@@ -193,8 +193,8 @@ jobs; outputs are files. On start, a job found `running` becomes `failed:
 interrupted` with Retry offered, and the app deletes leftover partials that
 match its own naming pattern (job id in the name) and nothing else.
 
-ffmpeg is run with `nice 10` (setpriority is not denied by the seccomp list)
-and a thread cap, because neither sandbox layer limits CPU (`sandbox.rs`
+ffmpeg is run 10 nicer than Convert itself (setpriority is not denied by the
+seccomp list) and with a thread cap, because neither sandbox layer limits CPU (`sandbox.rs`
 module doc) and a GPD Pocket 4 at full load for an hour is hot and loud.
 
 ## UI and touch contract
@@ -290,7 +290,16 @@ Notes on each:
   refuses TCP; UDP is not filtered by Landlock at all (Lane 0.6), which is
   one more reason for the whitelist.
 - **CPU and memory:** unconstrained by the sandbox; mitigated by `nice`,
-  thread caps and one job at a time.
+  thread caps, one or two jobs at a time, one measurement (`convert.estimate`
+  or `convert.frame`) at a time with the rest waiting their turn, and a
+  wall-clock limit on every sample encode (a minute per second of sample, at
+  least two minutes).
+- **Children outliving Convert:** every ffmpeg and ffprobe is started with
+  `PR_SET_PDEATHSIG = SIGKILL`, tied to the thread that waits for it, so a
+  core SIGTERM (stop, restart, shutdown), a crash, or the frame loop ending
+  when the socket closes takes the running encode with it. Without it the
+  encode was reparented and kept writing into a partial the next start
+  removes, while Retry started a second one.
 
 **UI-isolation design (after APP-UI-ISOLATION stage 4):**
 
@@ -467,6 +476,251 @@ as hostile, which S4 decides. Roughly two to three focused weeks for one
 lane agent including spikes, assuming APP-UI-ISOLATION stage 4 either lands
 first or the UI is written to the broker's rules from the start (no
 `contentDocument` theming, no inline script, no direct fetches).
+
+---
+
+## Built (2026-11-23)
+
+Status: v1 backend complete, UI on **tier 1** (not the plain-JS page this
+brief planned; docs/TIERS.md has since decided apps ship no JavaScript).
+Everything below marked **tested** has a test that ran green on this machine
+(GPD Pocket 4 class x86_64, 24 threads, ffmpeg n9.0.2, SVT-AV1 4.2.0).
+Nothing here was run from a phone or over the tailnet.
+
+### What exists
+
+- **`crates/deckjack-convert`** (~7.9k lines including ~3.0k of tests):
+  - `tools.rs`: ffmpeg/ffprobe found at fixed absolute paths under `/usr`
+    (never `PATH`); every child gets `-protocol_whitelist file` and a
+    `-format_whitelist` of plain media demuxers before every `-i`; children
+    run 10 nicer than Convert (**tested**, relative to the test's own nice
+    value) with half the cores as the thread cap; a child that overruns its
+    deadline is stopped and said so; a child that ignores SIGTERM is killed
+    after the grace (**tested**); every child dies with the thread that
+    started it and with Convert on SIGTERM (`PR_SET_PDEATHSIG`; **tested**
+    with a thread and with a whole process stopped by SIGTERM).
+  - `probe.rs`: `ffprobe -of json` into typed streams; playlist, concat and
+    image-sequence inputs refused **by content** before any ffmpeg runs
+    (a `.mp4` that is really an HLS playlist is refused too).
+  - `presets.rs`: the six presets as fixed, versioned argument builders
+    (`remux@1`, `trim@1`, `share-h264@1`, `small-av1@1`, `audio-opus@1`,
+    `audio-flac@1`). Every path reaches ffmpeg as `file:<absolute>`. Outputs
+    carry `comment=deckjack-convert <preset>@<version>`. Remux refuses a codec
+    the target container cannot hold and names what it drops.
+  - `progress.rs`: `-progress pipe:1` parsed by `out_time_us` (the misnamed
+    `out_time_ms` is ignored), fraction, speed, time left.
+  - `estimate.rs`: three 2 s samples at 10/50/85% (one sample of up to 6 s
+    under 12 s), size extrapolated with a band (sample spread, widened 10%),
+    speed and predicted time, VMAF per sample (SSIM where libvmaf is absent),
+    and `convert.frame` (a JPEG still of the source or of a sample encode,
+    ≤1280 px, ≤512 KiB). Each call writes in a scratch folder of its own,
+    removed when the call ends however it ends; two calls at once used to
+    share fixed names and unlink or read each other's samples (**tested**:
+    two concurrent estimates failed before the fix). Estimates and stills
+    take turns, one at a time, and a waiting call says so (**tested**,
+    through the frame loop). A sample encode has a wall-clock limit
+    (**tested** with a stand-in that spins). The one-sample path for short
+    files is **tested** on an 8 s clip, inside its band.
+  - `queue.rs`: app-owned jobs persisted atomically to `$HOME/queue.json`;
+    one or two at a time (**tested**: two run together and a third waits);
+    batch cap 100, queue cap 500 (both **tested**, and a mixed batch queues
+    what passes and lists the rest); free space checked against the estimate
+    (or the source size) before a batch is accepted, whole or not at all. A
+    remembered estimate counts only for the options it was measured with (a
+    ten-second range says nothing about the whole file; **tested**). A job
+    can save into another granted folder (**tested**: output there, no
+    partial left in either folder). A retried trim says its keyframe warning
+    once (**tested**); cancel = SIGTERM, SIGKILL after 5 s, delete only its
+    own partial; on start, a `running` job becomes `failed: interrupted` with
+    Retry and leftover partials matching its own pattern are deleted.
+  - `files.rs`: grants read from the manifest; outputs written as a hidden
+    partial in the destination and published with a no-replace hard link
+    (copy fallback, still no-replace), named `name (Share).mp4`, then
+    `name (Share) 2.mp4`.
+  - `window.rs`: the tier-1 window (below). It shows what a measurement
+    covered ("Measured on the whole file", or the range, container and
+    options), because it cannot see the range and container fields the shell
+    holds, and it does not show a remux or FLAC measurement taken with the
+    other setting of its option box. `main.rs`: the 12 commands of the
+    brief's table plus `convert.settings` (1 or 2 at once), with one gap:
+    `convert.job.list` takes no parameters and always returns the whole list
+    (at most 500 jobs). The table's `since` was dropped; a caller that passes
+    it is not refused, it gets everything. `convert.status`,
+    `convert.settings` and `convert.job.watch` (an answer at once for a
+    finished job, at `max_secs` for a running one, and the cap) are
+    **tested** through the SDK's frame loop with the test as the core.
+- **Manifest**: `tier = 1`, `lifecycle = "service"` (R3), `Videos/` and
+  `Music/` writable (R5 left at the conventional names), no network, no GPU,
+  no `[ui]` invoke. No `ui/` directory; `/apps/convert/` answers 404
+  (**tested**, e2e).
+- **SDK (`deckjack-app`)**: `App::notifier()` and `Program::notified()`. A
+  background job can re-render every open window with no event or command
+  behind it; notifications sent while the UI loop is busy merge into one, and
+  a notifier taken before `run` attaches when the app connects and detaches
+  when it disconnects (both halves **tested**: the detach test fails with the
+  guard removed). This is how the queue view moves on its own; Video's
+  export and Files' transfers need the same. `App::serve_connected` (hidden
+  from the docs) serves on a socket the caller holds, so an app's own tests
+  can stand in for the core.
+- **Protocol widget 13: `Progress { value: Option<f64>, label }`**. TIERS.md's
+  v1 catalog already lists Progress; the two-apps rule is met by Convert's
+  queue and estimate and by Video's export (5d) and Files' bulk transfers,
+  both of which show long work today with text. `None` is an indeterminate
+  bar, distinct from 0. Rendered as a native `<progress>` (role
+  `progressbar`, clamped, accessible name from `label`) (**tested**: Rust
+  wire shape, vitest render and clamp, e2e visible on all four projects).
+- **Registered** in the workspace, the xtask app list test, and the e2e
+  harness (`web/e2e/support/paths.ts` APPS, global setup builds it).
+  `convert.e2e.ts` runs in the shell projects.
+- **Spike S1 test** in `crates/deckjack-core/tests/sandbox.rs`
+  (`ffmpeg_run_by_a_confined_app_reaches_its_grant_and_nothing_else`).
+
+### The window (tier 1)
+
+One column with three steps as tabs (Files, Preset, Queue), which is what
+works at 320 px:
+
+1. **Files**: the granted media as a list, a tick box per row, a filter
+   field, one All/None button, Refresh. A window opened while jobs are queued
+   or running starts on the Queue.
+2. **Preset**: the six presets as a single-select list, each with its quality
+   sentence; range fields (required for Trim); Container and "All audio
+   tracks" for Remux; "Allow from lossy" for FLAC; Save to (beside each file,
+   or into a granted folder). **Measure on samples** (or **Check** for the
+   stream-copy presets) is bound to `convert.estimate` with the same fields
+   Start sends, and shows a progress bar while it runs, then the size line
+   with its band, the time, the score gloss and warnings. **Show command**
+   reveals the exact ffmpeg line. **Convert N files** is bound to
+   `convert.job.add`.
+3. **Queue**: one row per job with state, a bar and "42% · 1.5× · 12 min
+   left" while running, Cancel or Retry bound to the job commands, the output
+   path when done, the error sentence when failed; Two at once; Clear
+   finished.
+
+Every action is a bus command, so the palette and an agent can do what the
+window does. An estimate an agent runs shows in an open window too.
+
+### Exit check, item by item
+
+| # | Item | Result |
+|---|---|---|
+| 1 | Select files, choose Share, read the estimate, start | **Tested** on desktop and phone layouts, Chromium and WebKit (e2e, one file; the batch path with two files is in the cancel test). Not run with ten real phone videos, and not from a phone. |
+| 2 | Lock the phone 20 min; the queue is where it is without a reload | **Not tested.** The parts are tested: jobs are app-owned and outlive the window and the socket (`lifecycle = "service"`), and the open window re-renders from the notifier with no event (e2e: the bar advances with no input). The 20-minute lock over the tailnet was not run. |
+| 3 | Cancel a running job: no partial, next job starts | **Tested**, real ffmpeg (unit) and through the window (e2e, AV1 at 1080p on all four projects). |
+| 4 | Outputs play and seek in Quick Look; sizes within the stated band | Band: **measured**, table below, 9 of 9 inside. Quick Look playback: **not tested** (tier 1 cannot open Quick Look, gap G2). |
+| 5 | Sources byte-identical; second batch gets `(…) 2` names | **Tested** (unit and e2e, hashed). |
+| 6 | Remux MKV→MP4 takes seconds and says "no quality change"; FLAC from MP3 refused unless overridden | **Tested** (unit and e2e, with the override as the control). |
+| 7 | Crafted HLS/concat refused before ffmpeg; killed ffmpeg fails with a sentence; restart mid-job leaves `interrupted` + Retry and no orphan partial | **Tested** (unit, real ffmpeg; the HLS/concat test uses a recording fake ffmpeg to prove nothing ran). |
+
+**S1 (R1), ffmpeg under the real launcher — passed.** An app declaring
+Convert's grants, discovered, planned with `OsEnv` and spawned with
+`Confinement::Enforced`, runs `ffprobe` and an x264 encode on a granted file;
+the same probe on a file outside the grant fails with `Permission denied`;
+ffmpeg reading `http://127.0.0.1:<port>` never reaches a listening port; and
+`/dev/dri/renderD128` is refused without `gpu = true`. Mutation-checked:
+granting the outside folder makes the probe line read `probe outside read`,
+and granting the port makes the listener count 1. The e2e suite also runs
+every encode through the real launcher. **Not run**: VA-API with
+`gpu = true`, so whether `/run/udev` is needed is still unknown.
+
+**S2 (R2), estimate accuracy — measured on synthetic content only.**
+`cargo test -p deckjack-convert measure_estimates -- --ignored --nocapture`.
+60 s 720p30 sources made with lavfi (clean test pattern, grain, a Mandelbrot
+zoom whose detail changes throughout, and three 20 s scenes of very different
+complexity), full encode through the queue after each estimate:
+
+| source | preset | predicted | band | actual | error | in band | score | predicted time | took |
+|---|---|---|---|---|---|---|---|---|---|
+| clean | share-h264 | 22.41 MB | 19.19–25.44 | 21.17 MB | +6% | yes | VMAF 97.9 | 9.9 s | 5.2 s |
+| grain | share-h264 | 90.03 MB | 80.34–100.17 | 88.47 MB | +2% | yes | VMAF 96.8 | 31.4 s | 20.4 s |
+| zoom | share-h264 | 149.66 MB | 38.14–287.75 | 117.37 MB | +28% | yes | VMAF 90.0 | 26.7 s | 13.5 s |
+| cuts | share-h264 | 98.60 MB | 1.12–298.96 | 99.55 MB | −1% | yes | VMAF 96.2 | 20.1 s | 14.3 s |
+| clean | small-av1 | 21.21 MB | 18.93–23.62 | 20.64 MB | +3% | yes | VMAF 97.1 | 24.2 s | 6.6 s |
+| grain | small-av1 | 27.27 MB | 23.61–31.43 | 26.87 MB | +1% | yes | VMAF 96.2 | 33.8 s | 10.8 s |
+| zoom | small-av1 | 178.77 MB | 39.34–349.33 | 145.90 MB | +23% | yes | VMAF 91.8 | 42.9 s | 13.9 s |
+| cuts | small-av1 | 36.85 MB | 0.98–97.20 | 40.04 MB | −8% | yes | VMAF 95.6 | 30.7 s | 9.4 s |
+| mix (FLAC) | audio-opus | 0.93 MB | 0.84–1.03 | 0.91 MB | +3% | yes | — | 1.5 s | 0.4 s |
+
+Measuring took 0.2–6.5 s per file here. What this says:
+
+- **Size**: the point estimate was within ±10% on steady content and +23–28%
+  on the zoom, and every actual size fell inside the stated band. But on
+  content that changes a lot the band is **honest and nearly useless**
+  (1–299 MB): three samples cannot locate a scene change. Real footage was
+  not measured; this is the first thing to redo with a real corpus.
+- **Time is over-predicted 1.5–3.7×**, worst for AV1: a 2 s sample is
+  dominated by process start and encoder lookahead. The UI says "About …";
+  it should either subtract a measured fixed cost per sample or say "at
+  most". Not fixed in this lane.
+- **AV1 vs H.264 at the starting values** (CRF 35 preset 8 vs CRF 23
+  medium): similar size, similar VMAF on clean content, and far smaller on
+  grain (27 MB vs 88 MB at 96). Starting values left as they are.
+- **A metric defect found and fixed by this measurement**: VMAF paired frames
+  by time, and Matroska keeps milliseconds, so every AV1 (MKV) sample was
+  compared against neighboring source frames and scored ~72 for an encode
+  that scores 97 frame for frame. Scoring now pairs frames by index
+  (`settb=AVTB,setpts=N` on both inputs). Regression test
+  `an_mkv_sample_is_scored_frame_for_frame_not_by_rounded_time`, which fails
+  (73.6) with the old graph.
+
+**S3–S5**: not run. R3 was decided by declaring `lifecycle = "service"`, not
+by the platform fix. R4's fixtures (playlist, concat, crafted names) are
+unit tests with a recording fake ffmpeg; a fuzzed corpus was not run. R6
+(Termux) waits on Lane 0.5.
+
+### Gaps, as inputs to tier-1 phase 1
+
+The brief's UI assumed a page with script. On the 12 phase-0 widgets plus
+Progress, these could not be expressed; each is listed, not invented:
+
+- **G1 — Image.** No way to show `convert.frame`'s JPEG, so the still
+  comparison (brief item 4) is not in the window. The command exists and is
+  tested; an agent can use it. Needs TIERS' Image (content route) and the
+  `image` surface's before/after with locked pinch-zoom.
+- **G2 — Shell actions from a tier-1 window.** A bound action is a bus
+  command; `shell.quicklook.open` and `shell.app.open` are shell ops, so a
+  finished row cannot open in Quick Look or "Show in Files". The row shows
+  the output path instead.
+- **G3 — Selection mode on touch.** The List's multi-select is Ctrl/Shift
+  click; there is no long-press selection mode. Files are picked with a
+  tick box per row instead, which works on the phone but is not the Files
+  gesture the brief asked for.
+- **G4 — Open with a path.** `?path=` from Files' "Open with…" has no tier-1
+  equivalent (no launch parameters reach `Program::open`).
+- **G5 — Two panes from 720 px.** No Split; the window is one column at every
+  width.
+- **G6 — Async effects.** The window reads the queue and the folders
+  directly (they are in-process), so it did not need `Cmd`-style effects; a
+  window that had to call another app would.
+- An **unbound box** must be held in the app's model (the shell drops its
+  local tick once the app answers). A Convert bug from exactly this ("Allow
+  from lossy" unticked itself and Start sent `false`) was caught by e2e and
+  fixed; phase 1 should document the rule or let a box be field-only.
+
+### Other open items
+
+- Real-footage S2 corpus (phone video, screen recording, film grain,
+  talking head) and the time correction above.
+- The exit check from a phone over the tailnet, including the 20-minute lock.
+- VA-API under confinement (S1's GPU half).
+- R7 (Files' video thumbnails through `convert.frame`), R8 (batch hand-off),
+  R9 (app events instead of `job.watch`), R10 (codecs into placement): not
+  started, as the brief scoped them.
+- The concurrent sandbox lane (inherited fd, Landlock `ResolveUnix`): Convert
+  uses only `App::run` and the SDK's `Cancellation`, no pathname sockets or
+  D-Bus, so it should inherit that change unmodified. Not verified against
+  that branch.
+
+### Changes outside the new crate (for merging)
+
+- `crates/deckjack-protocol/src/ui.rs`: `Widget::Progress`.
+- `crates/deckjack-app/src/{lib.rs,ui.rs}`: `Notifier`, `Program::notified`,
+  `App::notifier`.
+- `web/src/uiproto/{UiNode.vue,tree.ts}`: the Progress renderer;
+  `UiProtocolPanel.test.ts`: its tests.
+- `crates/deckjack-core/tests/sandbox.rs`: the S1 test.
+- `Cargo.toml`, `xtask/src/main.rs` (test list), `web/e2e/support/paths.ts`,
+  `web/e2e/playwright.config.ts` (shell projects include `convert.e2e.ts`).
 
 ---
 

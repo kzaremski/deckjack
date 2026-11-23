@@ -1,0 +1,115 @@
+# The Convert app: turn a video or audio file into one that is smaller,
+# plays everywhere, or is in an open format, as a queued job on this node.
+# See docs/lanes/5c-convert.md.
+#
+# This file is the single source of truth about what Convert is: the binary
+# embeds it with include_str! and registers exactly what it declares, and the
+# core compares that registration against its own copy of this file.
+#
+# The work is done by the system's `ffmpeg` and `ffprobe`, exec'd as children
+# of this confined process (they inherit its Landlock and seccomp policy),
+# found at fixed absolute paths under /usr. No argument ever comes from a
+# caller: every ffmpeg line is built here from a preset id and typed values.
+#
+# Nothing here is destructive or outbound. A job writes a new file beside its
+# source (or into another granted folder) and never replaces one; the source
+# is only read.
+
+[app]
+name = "convert"
+version = "0.1.0"
+protocol = 1
+title = "Convert"
+# A service, not on-demand: the host stops an on-demand app five minutes
+# after its last window closes, and a job must survive the phone locking or
+# the window closing (lane brief, R3). The platform fix (count running work as
+# activity) is not this lane's.
+lifecycle = "service"
+min_width = 320
+tag = "Cv"
+summary = "Convert and compress video and audio"
+default_width = 720
+default_height = 560
+# Described with the UI protocol and drawn by the shell: no ui/ page, no
+# JavaScript shipped by the app.
+tier = 1
+
+# `Videos/` and `Music/`, the conventional names (lane brief, R5: the
+# operator may choose others; changing them is a re-approval). No GPU (no
+# hardware encoding in v1), no network, no ports, no bus invocations: ffmpeg
+# never needs the network here, and every input is also passed with
+# `-protocol_whitelist file`.
+[needs]
+working_dir = [
+  { path = "Videos", write = true },
+  { path = "Music", write = true },
+]
+
+[[commands]]
+id = "convert.status"
+summary = "Say whether ffmpeg is here and which encoders it has"
+risk = "read"
+
+[[commands]]
+id = "convert.presets"
+summary = "List the conversion presets and what each costs in quality"
+risk = "read"
+
+[[commands]]
+id = "convert.browse"
+summary = "List video and audio files in Videos/ and Music/"
+risk = "read"
+
+[[commands]]
+id = "convert.probe"
+summary = "Describe a media file's streams, duration and size"
+risk = "read"
+
+[[commands]]
+id = "convert.estimate"
+summary = "Measure a preset on samples of a file: size, time and quality"
+risk = "read"
+
+[[commands]]
+id = "convert.frame"
+summary = "One still frame of a file, or of a preset's encode of it, as JPEG"
+risk = "read"
+
+# Write, not destructive: the effect is a new file the operator can delete,
+# and nothing is ever replaced.
+[[commands]]
+id = "convert.job.add"
+summary = "Queue files to convert with a preset"
+risk = "write"
+
+[[commands]]
+id = "convert.job.list"
+summary = "List conversion jobs and their progress"
+risk = "read"
+
+# The app protocol has no app-emitted events, so a caller holds this to hear a
+# job's progress and its end.
+[[commands]]
+id = "convert.job.watch"
+summary = "Wait for a conversion job to finish, reporting its progress"
+risk = "read"
+
+[[commands]]
+id = "convert.job.cancel"
+summary = "Cancel a queued or running conversion job"
+risk = "write"
+
+[[commands]]
+id = "convert.job.retry"
+summary = "Queue a failed or cancelled conversion job again"
+risk = "write"
+
+[[commands]]
+id = "convert.job.clear"
+summary = "Forget finished conversion jobs; their outputs stay"
+risk = "write"
+
+[[commands]]
+id = "convert.settings"
+summary = "Read or set how many conversion jobs run at once"
+risk = "write"

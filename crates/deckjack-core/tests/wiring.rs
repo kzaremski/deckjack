@@ -281,7 +281,6 @@ async fn start_with(auto: lockdown::AutoPolicy) -> Node {
             Box::new(deckjack_core::store::StoreGrants::new(Arc::clone(&store))),
         ),
         Arc::clone(&registry),
-        install,
         Duration::from_millis(50),
     );
     windows.attach_app_host(Arc::clone(&app_host));
@@ -2116,7 +2115,7 @@ impl Revoking {
 async fn the_kill_switch_leaves_one_audit_row_for_every_session_it_took() {
     let r = revoking();
     let first = r.seat("127.0.0.1");
-    let second = r.seat("100.69.236.100");
+    let second = r.seat("100.64.0.20");
     assert_ne!(first.tag(), second.tag(), "two sessions, two tags");
 
     let revoked = r.revoke_all_before(Duration::from_secs(20));
@@ -2732,7 +2731,7 @@ async fn the_fetch_gate_refuses_a_borrowed_session_on_every_route_that_acts() {
 async fn the_fetch_gate_lets_a_browser_on_plain_remote_http_use_the_shell() {
     let h = start().await;
     let cookie = h.sign_in().await;
-    let remote = "100.70.30.57:7878";
+    let remote = "100.64.0.10:7878";
     let remote_origin = format!("http://{remote}");
     let remote_page = format!("http://{remote}/");
 
@@ -2759,11 +2758,11 @@ async fn the_fetch_gate_lets_a_browser_on_plain_remote_http_use_the_shell() {
     for (what, extra) in [
         (
             "an https Origin",
-            vec![("host", remote), ("origin", "https://100.70.30.57:7878")],
+            vec![("host", remote), ("origin", "https://100.64.0.10:7878")],
         ),
         (
             "an https Referer",
-            vec![("host", remote), ("referer", "https://100.70.30.57:7878/")],
+            vec![("host", remote), ("referer", "https://100.64.0.10:7878/")],
         ),
         (
             "a proxy saying https",

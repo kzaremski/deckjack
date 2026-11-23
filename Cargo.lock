@@ -1228,6 +1228,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "deckjack-circuit"
+version = "0.1.0"
+dependencies = [
+ "rand 0.10.3",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "deckjack-convert"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "deckjack-app",
+ "deckjack-protocol",
+ "libc",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "deckjack-core"
 version = "0.1.0"
 dependencies = [

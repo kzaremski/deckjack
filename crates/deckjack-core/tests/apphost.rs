@@ -1,18 +1,20 @@
-//! The app host's runtime half: a real socket, a real handshake, real frames.
+//! The app host's runtime half: a real link, a real handshake, real frames.
 //!
 //! `tests/apps.rs` proves the host's *decisions* — discovery, backoff, idle
 //! stops, what a manifest becomes as a sandbox policy — with its world
 //! injected, and it passed all of them while no `Host` was ever constructed
 //! and no socket ever existed. What is exercised here is the half that was
-//! missing: accept, handshake, the frame pump, and the bridge that puts an
-//! app's commands on the bus and takes them away again.
+//! missing: the link, the handshake, the frame pump, and the bridge that puts
+//! an app's commands on the bus and takes them away again.
 //!
 //! The "app" is a task in this process that speaks the protocol over the same
-//! Unix socket a real one would. Nothing is spawned, so nothing depends on a
-//! binary existing, a kernel that can confine it, or a timeout: every app in
-//! here declares `lifecycle = "on-demand"` and no window is opened, so the
-//! host never tries to launch it and the attendant is simply waiting when the
-//! fake app connects.
+//! kind of link a real one inherits: a socket pair from
+//! `AppHost::link`, whose other end goes to the app's attendant exactly as a
+//! launch's does. Nothing is spawned, so nothing depends on a binary
+//! existing, a kernel that can confine it, or a timeout: every app in here
+//! declares `lifecycle = "on-demand"` and no window is opened, so the host
+//! never tries to launch it and the attendant is simply waiting when the fake
+//! app arrives.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -39,7 +41,6 @@ struct Rig {
     host: Arc<AppHost>,
     registry: Arc<Registry>,
     bus: Arc<Bus>,
-    install: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -92,6 +93,11 @@ async fn rig(apps_to_install: &[&str]) -> Rig {
 
 /// A rig over apps whose manifests the test writes itself.
 async fn rig_with(apps_to_install: &[(&str, String)]) -> Rig {
+    rig_on(apps::OsEnv::new(), apps_to_install).await
+}
+
+/// A rig whose host runs on `env`.
+async fn rig_on(env: apps::OsEnv, apps_to_install: &[(&str, String)]) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let install = dir.path().join("install");
     std::fs::create_dir_all(&install).unwrap();
@@ -112,14 +118,13 @@ async fn rig_with(apps_to_install: &[(&str, String)]) -> Rig {
             install.clone(),
             dir.path().to_path_buf(),
             apps::CoreDoor::new("127.0.0.1:7878".parse().unwrap(), vec![]),
-            apps::OsEnv::new(),
+            env,
             apps::Policy::default(),
             Box::new(StoreGrants::new(store)),
         ),
         Arc::clone(&registry),
-        install.clone(),
-        // Short, because every iteration of an attendant's accept loop costs
-        // one of these when no app is connected.
+        // Short, because a link whose process never speaks holds its
+        // attendant for this long before the next link is taken.
         Duration::from_millis(80),
     );
     host.start().await;
@@ -128,21 +133,23 @@ async fn rig_with(apps_to_install: &[(&str, String)]) -> Rig {
         host,
         registry,
         bus,
-        install,
         _dir: dir,
     }
 }
 
 impl Rig {
-    /// Connect as an app and complete the handshake.
+    /// Arrive as an app, on a link made the way a launch makes one, and
+    /// complete the handshake.
     async fn connect(&self, name: &str) -> FakeApp {
-        let path = apps::socket_path(&self.install, name);
-        // The attendant binds before anything is spawned, so the socket is
-        // there as soon as `start` returned. A retry loop would hide exactly
-        // the race this ordering exists to prevent.
-        let stream = UnixStream::connect(&path)
-            .await
-            .unwrap_or_else(|e| panic!("connect to {}: {e}", path.display()));
+        // The attendant is in place as soon as `start` returned, so a link
+        // can be made at once. A retry loop would hide exactly the race that
+        // ordering exists to prevent.
+        let link = self
+            .host
+            .link(name)
+            .unwrap_or_else(|e| panic!("a link for {name}: {e}"));
+        link.set_nonblocking(true).unwrap();
+        let stream = UnixStream::from_std(link).unwrap();
         let mut app = FakeApp {
             name: name.to_string(),
             stream: BufReader::new(stream),
@@ -478,8 +485,8 @@ async fn an_app_that_reconnects_gets_its_commands_back() {
     drop(first);
     rig.until("demo.echo", false).await;
 
-    // The listener outlives any one connection, which is what makes a restart
-    // a reconnect rather than a permanently unlaunchable app.
+    // The attendant outlives any one link, which is what makes a restart a
+    // reconnect rather than a permanently unlaunchable app.
     let _second = rig.connect("demo").await;
     rig.until("demo.echo", true).await;
 }
@@ -506,7 +513,7 @@ async fn registering_twice_on_one_connection_is_refused() {
 }
 
 #[tokio::test]
-async fn two_apps_do_not_share_a_socket_or_a_namespace() {
+async fn two_apps_do_not_share_a_link_or_a_namespace() {
     let rig = rig(&["alpha", "beta"]).await;
     let _a = rig.connect("alpha").await;
     let _b = rig.connect("beta").await;
@@ -848,6 +855,71 @@ async fn opening_an_app_awaiting_approval_says_how_to_approve_it() {
 }
 
 // ---------------------------------------------------------------------------
+// A node whose kernel cannot hold an app
+// ---------------------------------------------------------------------------
+
+/// A host told its kernel has Landlock ABI 6: confinement, but no IPC
+/// scoping, so no app launches. Nothing here is spawned either way.
+async fn old_kernel_rig() -> Rig {
+    let env = apps::OsEnv::assuming_sandbox(deckjack_core::sandbox::Availability::Enforcing {
+        landlock_abi: 6,
+        network_rules: true,
+        ipc_scoping: false,
+    });
+    rig_on(env, &[("notes", manifest("notes"))]).await
+}
+
+#[tokio::test]
+async fn system_apps_carries_the_nodes_refusal_on_every_entry() {
+    let old = old_kernel_rig().await;
+    let value = system_apps(&old).await;
+    let apps = value["apps"].as_array().expect("an app list");
+    assert!(!apps.is_empty(), "{value}");
+    for app in apps {
+        let refusal = app["refusal"].as_str().unwrap_or_else(|| panic!("{app}"));
+        assert!(refusal.contains("Landlock ABI 6"), "{refusal}");
+        assert!(refusal.contains(apps::MIN_KERNEL), "{refusal}");
+    }
+
+    // Control: on a kernel that can hold apps the field is null.
+    let able = rig(&["notes"]).await;
+    if able.host.launch_refusal().is_none() {
+        let value = system_apps(&able).await;
+        for app in value["apps"].as_array().unwrap() {
+            assert!(app["refusal"].is_null(), "{app}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn opening_an_app_on_a_node_that_launches_none_says_why() {
+    let rig = old_kernel_rig().await;
+    // Approved, so the approval branch is not what answers.
+    wiring::register_apps(&rig.registry, Arc::clone(&rig.host)).expect("app commands register");
+    let windows = wiring::register_windows(&rig.registry, "apphost-node".to_string())
+        .expect("the window commands register");
+    windows.attach_app_host(Arc::clone(&rig.host));
+
+    let request = Request::new(
+        CommandId::new("shell.window.open".to_string()).unwrap(),
+        json!({ "id": "w1", "app": "notes" }),
+        Issuer::operator(),
+    );
+    let Ok(Admitted::Running(running)) = rig.bus.dispatch(request) else {
+        panic!("shell.window.open was not admitted");
+    };
+    let (_rx, done) = running.split();
+    let why = done
+        .await
+        .outcome
+        .expect_err("no app opens on this node")
+        .to_string();
+    assert!(why.contains("notes cannot run: "), "{why}");
+    assert!(why.contains("Landlock ABI 6"), "{why}");
+    assert!(!why.contains("see the log"), "{why}");
+}
+
+// ---------------------------------------------------------------------------
 // Idleness and long commands
 // ---------------------------------------------------------------------------
 
@@ -858,7 +930,9 @@ async fn opening_an_app_awaiting_approval_says_how_to_approve_it() {
 ///
 /// This one does launch something, because the idle sweep only touches an
 /// app the host started: a shell script that sleeps, standing in for the
-/// app's process, while the test speaks the protocol over the socket.
+/// app's process, while the test speaks the protocol over a link of its
+/// own. The stand-in is handed a link too and never speaks on it, so the
+/// attendant waits out one handshake timeout before it takes the test's.
 #[tokio::test]
 async fn progress_on_a_long_call_keeps_an_idle_app_running() {
     let dir = tempfile::tempdir().unwrap();
@@ -890,7 +964,6 @@ async fn progress_on_a_long_call_keeps_an_idle_app_running() {
             Box::new(StoreGrants::new(store)),
         ),
         Arc::clone(&registry),
-        install.clone(),
         Duration::from_millis(80),
     );
     host.start().await;
@@ -898,7 +971,6 @@ async fn progress_on_a_long_call_keeps_an_idle_app_running() {
         host,
         registry,
         bus,
-        install,
         _dir: dir,
     };
 

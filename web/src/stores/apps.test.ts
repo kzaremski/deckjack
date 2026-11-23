@@ -109,6 +109,16 @@ describe("what the core reports", () => {
     expect(parseInstalled({ apps: "nope" })).toEqual([]);
   });
 
+  it("says why an app cannot run where it is offered, when the node launches none", () => {
+    const refusal = "this node's kernel has Landlock ABI 4, and every app is held to ABI 9";
+    const contract = tableWith([{ ...photo, refusal }]).contract("photo");
+    expect(contract.summary).toBe(`Cannot run on this node: ${refusal}`);
+    expect(parseInstalled({ apps: [{ ...photo, refusal: null }] })[0]!.refusal).toBeUndefined();
+    expect(tableWith([{ ...photo, refusal: null }]).contract("photo").summary).toBe(
+      "Edit photographs",
+    );
+  });
+
   it("an empty install leaves exactly the built-in dock", () => {
     expect(tableWith([]).dock.value.map((a) => a.id)).toEqual(builtinApps.map((a) => a.id));
   });

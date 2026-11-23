@@ -82,6 +82,7 @@ export type Widget =
     }
   | { kind: "list"; label?: string; selection?: "none" | "single" | "multi"; selected?: string[] }
   | { kind: "empty"; title?: string; detail?: string | null }
+  | { kind: "progress"; value?: number | null; label?: string }
   | { kind: "date"; value?: string; flag_past?: boolean };
 
 export type WidgetKind = Widget["kind"];

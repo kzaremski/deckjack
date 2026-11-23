@@ -35,6 +35,8 @@ export const APPS = [
   { crate: "editor", name: "scribe" },
   // On the UI protocol: no page, its window drawn by the shell.
   { crate: "tasks", name: "tasks" },
+  // On the UI protocol too; runs the system's ffmpeg (convert.e2e.ts).
+  { crate: "convert", name: "convert" },
 ] as const;
 
 /**

@@ -628,7 +628,8 @@ fn every_path_the_core_keeps_in_the_install_directory_is_in_the_layout() {
     let install = Path::new("/srv/deckjack");
     let written = [
         install.join(deckjack_core::apps::APPS_SUBDIR),
-        deckjack_core::apps::socket_path(install, "notes"),
+        // The core's own sockets (MCP sessions).
+        install.join(deckjack_core::apps::RUN_SUBDIR).join("x.sock"),
         install.join(deckjack_core::apps::CACHE_SUBDIR),
         deckjack_core::thumbnail::cache_dir(install),
         install.join(deckjack_core::node::ID_FILE),

@@ -67,7 +67,7 @@ Lane 0.6 has the full table and its limits.
 
 `lifecycle` is `on-demand` or `service` (`protocol::Lifecycle`).
 
-**The sandbox is Landlock ABI 4 plus a seccomp denylist.** It read-grants
+**The sandbox is Landlock (ABI 4 filesystem and TCP rules, plus ABI 9's Unix-socket rule and the abstract-socket and signal scopes) and a seccomp denylist.** An app reaches no Unix socket, abstract socket or process outside its own sandbox; its link to the core is an inherited socket pair (docs/lanes/10-sandbox-all-apps.md). That changed the app contract: the core sets `DECKJACK_APP_FD=3` and no longer sets `DECKJACK_APP_SOCKET`, and the SDK's `SOCKET_ENV`, `AppError::NoSocket` and `AppError::Connect` are gone (replaced by `LINK_ENV`, `NoLink`, `BadLink` and `Link`), so out-of-tree code using them no longer builds. It read-grants
 `/usr /bin /sbin /lib /lib64 /etc /sys /proc/self` (`apps::SYSTEM_READ_DIRS`), and
 Landlock's read set includes `Execute`. `fork`/`clone` are deliberately not
 denied and a child inherits both Landlock and seccomp
@@ -1097,3 +1097,7 @@ not know works.
 injected traits, unit-tested in isolation, and never constructed — tests green,
 feature impossible at runtime. The structural answer is required struct fields
 and a construction test, because an unread field still compiles.
+
+The other ways tests here have passed while proving nothing, and the traps in
+the route tests and the end-to-end harness, are in docs/notes/testing.md. The
+security invariants a lane must not break are in docs/notes/security.md.

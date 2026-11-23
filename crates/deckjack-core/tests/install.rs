@@ -137,24 +137,39 @@ impl Grants for StoredGrants {
     }
 }
 
-fn host(install_dir: &Path, work: &Path, grants: StoredGrants) -> Host<apps::OsEnv> {
+/// A host over this install, and the receivers standing in for the core's
+/// attendants: a launch hands the core its end of the app's link and is
+/// refused when nothing is waiting for it. Hold the receivers while the
+/// host launches.
+fn host(
+    install_dir: &Path,
+    work: &Path,
+    grants: StoredGrants,
+) -> (Host<apps::OsEnv>, Vec<apps::LinkReceiver>) {
     let policy = apps::Policy {
         // The launch itself is not what these tests are about, and an
         // unconfined `true` exits harmlessly.
         confinement: apps::Confinement::unconfined_for_development(),
         ..apps::Policy::default()
     };
-    Host::new(
+    let env = apps::OsEnv::new();
+    let links = apps::discover(install_dir, &env)
+        .apps
+        .iter()
+        .map(|app| env.links().attend(&app.name))
+        .collect();
+    let host = Host::new(
         install_dir.to_path_buf(),
         work.to_path_buf(),
         // A core on its tailnet address: these manifests use the legacy
         // whole-network grant, which a core on loopback refuses (D2, tested in
         // tests/apps.rs). What is tested here is approval across updates.
         apps::CoreDoor::new("100.64.0.1:7878".parse().unwrap(), vec![]),
-        apps::OsEnv::new(),
+        env,
         policy,
         Box::new(grants),
-    )
+    );
+    (host, links)
 }
 
 const NEEDS_NETWORK: &str = "\n[needs]\nnetwork = [\"cloud.example.net\"]\n";
@@ -245,7 +260,7 @@ fn an_update_that_asks_for_more_is_not_covered_by_the_old_approval() {
 
     // The operator approves version 1.
     let grants = StoredGrants::open(&work);
-    let mut before = host(&home, &work, grants.clone());
+    let (mut before, _links) = host(&home, &work, grants.clone());
     before.refresh();
     before.approve("pim").unwrap();
 
@@ -268,7 +283,7 @@ fn an_update_that_asks_for_more_is_not_covered_by_the_old_approval() {
 
     // And the host, reading what the install put on disk with the grant the
     // operator gave version 1, refuses to launch it.
-    let mut after = host(&home, &work, grants);
+    let (mut after, _links) = host(&home, &work, grants);
     after.refresh();
     match after.open_window("pim") {
         Err(HostError::GrantStale { summary, .. }) => {
@@ -294,7 +309,7 @@ fn an_update_that_asks_for_the_same_keeps_its_approval() {
     );
     install::install_in(&home, &work, &source(&v1)).unwrap();
     let grants = StoredGrants::open(&work);
-    let mut before = host(&home, &work, grants.clone());
+    let (mut before, _links) = host(&home, &work, grants.clone());
     before.refresh();
     before.approve("pim").unwrap();
 
@@ -308,7 +323,7 @@ fn an_update_that_asks_for_the_same_keeps_its_approval() {
     let report = install::install_in(&home, &work, &source(&v2)).unwrap();
     assert_eq!(report.approval, Approval::Approved);
 
-    let mut after = host(&home, &work, grants);
+    let (mut after, _links) = host(&home, &work, grants);
     after.refresh();
     after
         .open_window("pim")
@@ -1050,7 +1065,7 @@ fn a_reinstall_over_a_grant_from_before_the_sha256_switch_says_it_must_be_approv
 
     // The server agrees, and its refusal points at the same way out rather
     // than at a command that does not exist.
-    let mut server = host(&home, &home, StoredGrants::open(&home));
+    let (mut server, _links) = host(&home, &home, StoredGrants::open(&home));
     server.refresh();
     match server.open_window("notes") {
         Err(e @ HostError::GrantStale { .. }) => {
@@ -1198,7 +1213,7 @@ fn a_stored_approval_the_server_cannot_read_is_not_reported_as_covering_the_app(
     );
     install::install_in(&home, &work, &source(&dir)).unwrap();
     let grants = StoredGrants::open(&work);
-    let mut server = host(&home, &work, grants.clone());
+    let (mut server, _links) = host(&home, &work, grants.clone());
     server.refresh();
     server.approve("notes").unwrap();
 
@@ -1224,10 +1239,62 @@ fn a_stored_approval_the_server_cannot_read_is_not_reported_as_covering_the_app(
     assert!(text.contains("Approve notes"), "{text}");
 
     // And the server agrees: it will not launch on that row.
-    let mut server = host(&home, &work, grants);
+    let (mut server, _links) = host(&home, &work, grants);
     server.refresh();
     assert!(
         server.open_window("notes").is_err(),
         "the server must refuse to launch on an unreadable approval"
     );
+}
+
+// ---------------------------------------------------------------------------
+// What `deckjack apps` says on a node that launches no app
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_apps_listing_says_when_none_of_the_apps_will_launch_and_why() {
+    let manifest =
+        apps::Manifest::parse(Path::new("app.toml"), &manifest_text("notes", "1.0.0", "")).unwrap();
+    let one = apps::Discovery {
+        apps: vec![apps::Installed {
+            name: "notes".to_string(),
+            dir: PathBuf::from("/nowhere/apps/notes"),
+            binary: PathBuf::from("/nowhere/apps/notes/deckjack-notes"),
+            manifest,
+        }],
+        problems: Vec::new(),
+    };
+    let none = apps::Discovery {
+        apps: Vec::new(),
+        problems: Vec::new(),
+    };
+    let old_kernel = deckjack_core::sandbox::Availability::Enforcing {
+        landlock_abi: 6,
+        network_rules: true,
+        ipc_scoping: false,
+    };
+    let no_landlock = deckjack_core::sandbox::Availability::Unavailable {
+        reason: "Landlock is not enabled".to_string(),
+    };
+    let new_kernel = deckjack_core::sandbox::Availability::Enforcing {
+        landlock_abi: 10,
+        network_rules: true,
+        ipc_scoping: true,
+    };
+
+    let said = install::render_node_refusal(&one, &old_kernel);
+    assert!(
+        said.starts_with("\nNONE OF THESE WILL LAUNCH ON THIS NODE: "),
+        "{said:?}"
+    );
+    assert!(said.contains("Landlock ABI 6"), "{said:?}");
+    assert!(said.contains(apps::MIN_KERNEL), "{said:?}");
+
+    let said = install::render_node_refusal(&one, &no_landlock);
+    assert!(said.contains("NONE OF THESE WILL LAUNCH"), "{said:?}");
+    assert!(said.contains("Landlock is not enabled"), "{said:?}");
+
+    // Nothing to say when apps can launch, or when nothing is listed.
+    assert_eq!(install::render_node_refusal(&one, &new_kernel), "");
+    assert_eq!(install::render_node_refusal(&none, &old_kernel), "");
 }

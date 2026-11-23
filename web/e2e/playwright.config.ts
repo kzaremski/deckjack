@@ -12,8 +12,9 @@ import { WEB, WEBKIT_COMPAT } from "./support/paths.ts";
  * fast and need neither cargo nor a browser.
  *
  * Projects:
- * - `desktop-chromium`, `desktop-webkit`: the shell smoke tests at a desktop
- *   size, so the shell is in desktop mode.
+ * - `desktop-chromium`, `desktop-webkit`: the shell smoke tests (and the
+ *   Convert app's, `convert.e2e.ts`) at a desktop size, so the shell is in
+ *   desktop mode.
  * - `phone-chromium` (Pixel 7), `phone-webkit` (iPhone 15): the same tests
  *   at a phone size with touch, so the shell is in compact mode and the tests
  *   tap rather than click.
@@ -39,7 +40,7 @@ const webkitLaunch: LaunchOptions = existsSync(WEBKIT_COMPAT)
     }
   : {};
 
-const SHELL = /shell\.e2e\.ts$/;
+const SHELL = /(shell|convert)\.e2e\.ts$/;
 const SPIKE = /spike[\\/].*\.e2e\.ts$/;
 const MEASURE = /tier1[\\/].*\.e2e\.ts$/;
 

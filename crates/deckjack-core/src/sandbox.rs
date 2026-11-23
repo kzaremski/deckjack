@@ -60,40 +60,64 @@ pub struct Policy {
     pub read_write_files: Vec<PathBuf>,
     /// What the process may do on the network. Denied unless said otherwise.
     pub network: Network,
-    /// Unix sockets and signals across the sandbox's edge. Open unless said
-    /// otherwise; see [`Ipc`] for why, and for what `Scoped` costs.
+    /// Unix sockets and signals across the sandbox's edge. Scoped unless
+    /// said otherwise; see [`Ipc`] for why, and for what that costs.
     pub ipc: Ipc,
 }
 
 /// Unix sockets and signals that cross the edge of the sandbox.
 ///
-/// Landlock ABI 4, which every app is held to, has no rule for either: a
-/// confined process can `connect()` to any pathname Unix socket its uid can
-/// reach (the session D-Bus, the systemd user manager, the operator's own X
-/// server, the desktop compositor's IPC), connect to any abstract socket, and
-/// signal any process of the same uid. Through the session bus that is a way
-/// out of the sandbox altogether (`systemd-run --user`).
+/// Landlock's filesystem and TCP rules (ABI 4) have no rule for either: a
+/// process held only to them can `connect()` to any pathname Unix socket its
+/// uid can reach (the session D-Bus, the systemd user manager, the
+/// operator's own X server, the desktop compositor's IPC, gpg-agent,
+/// PipeWire), connect to any abstract socket, and signal any process of the
+/// same uid. Through the session bus that is a way out of the sandbox
+/// altogether (`systemd-run --user`).
 ///
-/// [`Ipc::Scoped`] closes all three, and needs Landlock ABI 9
-/// (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`) for pathname sockets and ABI 6 for the
-/// abstract-socket and signal scopes. Everything inside the sandbox's own
-/// domain keeps working: a server socket created by the confined process or
-/// any of its children stays reachable by the others, and they may signal
-/// each other. A kernel without ABI 9 refuses a `Scoped` policy rather than
-/// running it as `Open` ([`CompatLevel::HardRequirement`]).
+/// [`Ipc::Scoped`] closes all three. It needs Landlock ABI 9
+/// (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, Linux 7.1) for pathname sockets and
+/// ABI 6 for the abstract-socket and signal scopes. Everything inside the
+/// sandbox's own domain keeps working: a server socket created by the
+/// confined process or any of its children stays reachable by the others,
+/// and they may signal each other. A kernel without ABI 9 refuses a `Scoped`
+/// policy rather than running it as `Open` ([`CompatLevel::HardRequirement`],
+/// and [`command`] refuses before forking).
 ///
-/// Streamed native apps are held to `Scoped` (docs/lanes/8-stream.md).
-/// Other apps are still `Open`: requiring ABI 9 of them would refuse every
-/// app on any kernel older than this one, which is a platform decision of
-/// its own, recorded in the lane brief.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// It is the default, and every launch the core makes uses it: every app
+/// (docs/lanes/10-sandbox-all-apps.md) and every streamed native app
+/// (docs/lanes/8-stream.md). An app reaches the core over a socket pair it
+/// inherits, so no app is granted any `connect_unix` path at all.
+///
+/// [`CompatLevel::HardRequirement`]: landlock::CompatLevel::HardRequirement
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ipc {
-    /// No Unix-socket or signal rule is installed (Landlock ABI 4).
-    #[default]
+    /// No Unix-socket or signal rule is installed.
+    ///
+    /// No launch the core makes uses this. It exists so the escape tests can
+    /// run the same probe with the restriction removed and show that what
+    /// `Scoped` refuses is reachable otherwise, which is what keeps those
+    /// tests from passing vacuously.
     Open,
     /// Pathname sockets created outside the sandbox only beneath
     /// `connect_unix`; abstract sockets and signals only within it.
     Scoped { connect_unix: Vec<PathBuf> },
+}
+
+impl Default for Ipc {
+    /// Scoped, with no path granted: fail closed, like every other default
+    /// in a [`Policy`].
+    fn default() -> Ipc {
+        Ipc::Scoped {
+            connect_unix: Vec::new(),
+        }
+    }
+}
+
+impl Ipc {
+    pub fn is_scoped(&self) -> bool {
+        matches!(self, Ipc::Scoped { .. })
+    }
 }
 
 /// The network half of a [`Policy`].
@@ -175,11 +199,20 @@ impl Policy {
 pub enum Availability {
     /// Landlock is present at this ABI and seccomp is compiled in.
     Enforcing {
+        /// The Landlock ABI the running kernel reports. Only messages read
+        /// it; what can be enforced is decided by probing, in
+        /// [`Availability::Enforcing::network_rules`] and
+        /// [`Availability::Enforcing::ipc_scoping`].
         landlock_abi: i32,
         /// Landlock gained network rules at ABI 4. Below that a policy that
         /// denies or narrows the network cannot be honored and is refused
         /// rather than quietly granted whole.
         network_rules: bool,
+        /// Whether [`Ipc::Scoped`] can be enforced (Landlock ABI 9, Linux
+        /// 7.1). Every app launch needs it, so on a host where this is false
+        /// apps are refused, by [`command`] and before that by the launch
+        /// planner, with a message naming the kernel.
+        ipc_scoping: bool,
     },
     /// Nothing here can be confined. Carries the reason so the operator is
     /// told why an app will not start.
@@ -207,6 +240,13 @@ pub enum SandboxError {
          manifest did not ask for"
     )]
     NoNetworkRules { abi: i32 },
+
+    #[error(
+        "this kernel's Landlock cannot keep Unix sockets and signals inside a sandbox (that \
+         needs Landlock ABI 9, Linux 7.1 or newer); refusing rather than launching a process \
+         that could reach the session bus and leave its sandbox through it"
+    )]
+    NoIpcScoping,
 
     #[error("{path} is named in the manifest but cannot be opened: {source}")]
     UnreadablePath {
@@ -307,13 +347,16 @@ mod linux {
     use seccompiler::{SeccompAction, SeccompFilter, TargetArch, apply_filter};
     use std::collections::BTreeMap;
 
-    /// The Landlock ABI this build asks for. v4 (Linux 6.7) is the floor
-    /// because it is where network rules arrive, and a manifest that denies
-    /// the network has to be honorable.
+    /// The Landlock ABI whose filesystem and TCP rights this build grants
+    /// and denies. v4 (Linux 6.7) is where network rules arrive, and a
+    /// manifest that denies the network has to be honorable.
     ///
-    /// This is the one knob. Raising it buys newer restrictions at the cost of
-    /// refusing older kernels; lowering it does the reverse. It is deliberately
-    /// a single constant so that trade is made in one visible place.
+    /// It is deliberately not raised to [`IPC`]: v5 adds `IoctlDev`, which
+    /// would take ioctls on `/dev/dri` away from every GPU app, and v9's
+    /// `ResolveUnix` is granted on its own (see [`apply`]) rather than with
+    /// every writable tree. What a kernel must support for an app to launch
+    /// at all is `WANTED` plus [`IPC`] — Linux 7.1 — because every launch is
+    /// [`Ipc::Scoped`].
     const WANTED: ABI = ABI::V4;
 
     /// The crate keeps runtime ABI detection private on purpose — a value read
@@ -321,14 +364,46 @@ mod linux {
     /// instead: build the ruleset we would really use and see whether the
     /// kernel accepts it. Authoritative, and it exercises the same path as
     /// `apply`.
+    ///
+    /// The ABI number it reports is read from the kernel all the same, but
+    /// only so a refusal can name it truthfully; nothing decides on it.
     pub fn availability() -> Availability {
         match probe() {
-            Ok(()) => Availability::Enforcing {
-                landlock_abi: WANTED as i32,
-                network_rules: true,
-            },
+            Ok(()) => {
+                let ipc_scoping = ipc_scoping().is_ok();
+                Availability::Enforcing {
+                    landlock_abi: kernel_abi().unwrap_or(if ipc_scoping {
+                        IPC as i32
+                    } else {
+                        WANTED as i32
+                    }),
+                    network_rules: true,
+                    ipc_scoping,
+                }
+            }
             Err(reason) => Availability::Unavailable { reason },
         }
+    }
+
+    /// The Landlock ABI version the running kernel reports, or `None` when
+    /// it reports none. The `landlock` crate keeps this private, so it is
+    /// asked directly: `landlock_create_ruleset(NULL, 0,
+    /// LANDLOCK_CREATE_RULESET_VERSION)` returns the version and creates
+    /// nothing.
+    pub(super) fn kernel_abi() -> Option<i32> {
+        const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+        // SAFETY: with a null attribute pointer, a size of 0 and only the
+        // VERSION flag, the kernel reads no memory and allocates no
+        // descriptor; it returns the ABI version or -1.
+        let got = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<libc::c_void>(),
+                0usize,
+                LANDLOCK_CREATE_RULESET_VERSION,
+            )
+        };
+        (got > 0).then_some(got as i32)
     }
 
     /// The ABI an [`Ipc::Scoped`] policy needs: 9, for
@@ -385,7 +460,7 @@ mod linux {
         // (`ReadDir`, `MakeReg`, `RemoveFile`, ...) masked off.
         let file = AccessFs::from_file(WANTED);
 
-        let scoped = matches!(policy.ipc, Ipc::Scoped { .. });
+        let scoped = policy.ipc.is_scoped();
         // Handled, so denied wherever it is not granted: connecting to a
         // pathname Unix socket made outside this domain. Granted only by the
         // `connect_unix` rules below, never as part of `read_write` (whose
@@ -641,8 +716,8 @@ pub fn command(
     program: impl AsRef<std::ffi::OsStr>,
     policy: Policy,
 ) -> Result<std::process::Command, SandboxError> {
-    if let Availability::Unavailable { reason } = availability() {
-        return Err(SandboxError::Unavailable { reason });
+    if let Some(refused) = refusal(&availability(), &policy) {
+        return Err(refused);
     }
 
     let mut cmd = std::process::Command::new(program);
@@ -657,20 +732,104 @@ pub fn command(
     Ok(cmd)
 }
 
+/// Why `policy` cannot be enforced on a host with `availability`, decided
+/// before anything forks. `None` when it can. [`command`] refuses on this,
+/// so a scoped policy on a kernel without IPC scoping never reaches the
+/// child's `CompatLevel::HardRequirement` check.
+fn refusal(availability: &Availability, policy: &Policy) -> Option<SandboxError> {
+    match availability {
+        Availability::Unavailable { reason } => Some(SandboxError::Unavailable {
+            reason: reason.clone(),
+        }),
+        Availability::Enforcing {
+            ipc_scoping: false, ..
+        } if policy.ipc.is_scoped() => Some(SandboxError::NoIpcScoping),
+        Availability::Enforcing { .. } => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn enforcing(landlock_abi: i32) -> Availability {
+        Availability::Enforcing {
+            landlock_abi,
+            network_rules: landlock_abi >= 4,
+            ipc_scoping: landlock_abi >= 9,
+        }
+    }
+
+    #[test]
+    fn a_scoped_policy_is_refused_before_forking_on_a_kernel_without_ipc_scoping() {
+        // Fabricated hosts, because the live one decides which arm runs.
+        let scoped = Policy::nothing();
+        let open = Policy::nothing().with_ipc(Ipc::Open);
+        assert!(scoped.ipc.is_scoped() && !open.ipc.is_scoped());
+
+        for abi in [4, 6, 8] {
+            assert!(
+                matches!(
+                    refusal(&enforcing(abi), &scoped),
+                    Some(SandboxError::NoIpcScoping)
+                ),
+                "ABI {abi} cannot scope IPC, so a scoped policy must be refused"
+            );
+            assert!(
+                refusal(&enforcing(abi), &open).is_none(),
+                "ABI {abi} can enforce an open policy"
+            );
+        }
+        for abi in [9, 10] {
+            assert!(refusal(&enforcing(abi), &scoped).is_none(), "ABI {abi}");
+            assert!(refusal(&enforcing(abi), &open).is_none(), "ABI {abi}");
+        }
+        let none = Availability::Unavailable {
+            reason: "no Landlock".to_string(),
+        };
+        for policy in [&scoped, &open] {
+            assert!(matches!(
+                refusal(&none, policy),
+                Some(SandboxError::Unavailable { reason }) if reason == "no Landlock"
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_reported_abi_is_the_one_the_kernel_reports() {
+        // Not the highest ABI this build asked for: a 6.12 kernel (ABI 6)
+        // that cannot scope IPC must not be told it has ABI 4.
+        if let Availability::Enforcing { landlock_abi, .. } = availability() {
+            let kernel = linux::kernel_abi().expect("an enforcing kernel reports an ABI");
+            assert_eq!(landlock_abi, kernel);
+        }
+    }
 
     #[test]
     fn a_host_that_cannot_enforce_refuses_to_launch() {
         // The rule this module exists for. Whatever this host is, `command`
         // must agree with `availability`: never hand back a Command that
         // would run unconfined.
-        let can = availability().is_enforcing();
+        // A default policy is scoped, so it needs Landlock ABI 9 as well.
+        let availability = availability();
+        let can = matches!(
+            availability,
+            Availability::Enforcing {
+                ipc_scoping: true,
+                ..
+            }
+        );
         let got = command("/bin/true", Policy::nothing());
         assert_eq!(can, got.is_ok(), "availability and command disagree");
-        if !can {
-            assert!(matches!(got.unwrap_err(), SandboxError::Unavailable { .. }));
+        match availability {
+            Availability::Unavailable { .. } => {
+                assert!(matches!(got.unwrap_err(), SandboxError::Unavailable { .. }))
+            }
+            Availability::Enforcing {
+                ipc_scoping: false, ..
+            } => assert!(matches!(got.unwrap_err(), SandboxError::NoIpcScoping)),
+            Availability::Enforcing { .. } => {}
         }
     }
 
@@ -682,7 +841,13 @@ mod tests {
         assert!(p.read_files.is_empty());
         assert!(p.read_write_files.is_empty());
         assert!(p.network.is_denied(), "network must be opt-in, not opt-out");
-        assert_eq!(p.ipc, Ipc::Open);
+        assert_eq!(
+            p.ipc,
+            Ipc::Scoped {
+                connect_unix: Vec::new()
+            },
+            "Unix sockets and signals must be scoped unless said otherwise"
+        );
     }
 
     #[test]
@@ -709,9 +874,14 @@ mod tests {
             Availability::Enforcing {
                 landlock_abi,
                 network_rules,
+                ipc_scoping,
             } => {
                 assert!(landlock_abi >= 1);
-                println!("enforcing: landlock ABI {landlock_abi}, network_rules={network_rules}");
+                assert_eq!(ipc_scoping, landlock_abi >= 9);
+                println!(
+                    "enforcing: landlock ABI {landlock_abi}, network_rules={network_rules}, \
+                     ipc_scoping={ipc_scoping}"
+                );
             }
             Availability::Unavailable { reason } => println!("unavailable: {reason}"),
         }

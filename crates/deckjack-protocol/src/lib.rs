@@ -92,6 +92,19 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// moment it sends a frame the core will not answer.
 pub const INVOKE_PROTOCOL: u32 = 2;
 
+/// The environment variable naming the descriptor an app's link to the core
+/// is on, set by the core on every app it launches.
+///
+/// The link is one end of a Unix socket pair the app inherits, not a path it
+/// connects to. A path would need the sandbox to let the app connect to a
+/// socket made outside it, and an app that may do that is one Landlock
+/// grant away from the session bus (docs/lanes/10-sandbox-all-apps.md).
+pub const LINK_FD_ENV: &str = "DECKJACK_APP_FD";
+
+/// The descriptor number the link is on, in every app: the first one after
+/// stdin, stdout and stderr, as with systemd's socket activation.
+pub const LINK_FD: i32 = 3;
+
 /// The oldest protocol this build will talk to.
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
 

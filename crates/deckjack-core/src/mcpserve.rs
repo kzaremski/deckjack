@@ -298,11 +298,14 @@ where
 // Where an agent attaches
 // ---------------------------------------------------------------------------
 
-/// Agent sockets live under the *install* directory's run directory, beside
-/// the app sockets in `run/` rather than in it: an app socket is named for an
-/// installed app and an agent socket for a granted session, and one directory
-/// holding both would make a name collision between the two into a silent
-/// authority swap.
+/// Agent sockets live under the *install* directory's run directory, in
+/// their own `run/agents/` subdirectory. That kept them apart from the app
+/// sockets that used to sit in `run/` (an app socket was named for an
+/// installed app and an agent socket for a granted session, so one directory
+/// holding both would have made a name collision a silent authority swap).
+/// No app socket exists any more (apps inherit a socket pair, see
+/// [`crate::apps::Links`]); the subdirectory stays so `run/` holds nothing
+/// else of the core's by accident.
 ///
 /// The install directory, not the working directory, for two reasons that
 /// point the same way. The design's own rule is that `~/.deckjack/` is built

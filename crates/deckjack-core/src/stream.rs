@@ -260,12 +260,19 @@ pub fn native_plan(
         &private_root,
     )
     .map_err(|e| e.to_string())?;
-    // Nothing outside the sandbox is a socket the compositor or the app
-    // needs: the link is inherited, and the Wayland and X11 sockets are
-    // made inside it.
-    plan.sandbox.policy.ipc = sandbox::Ipc::Scoped {
-        connect_unix: Vec::new(),
-    };
+    // Already `Ipc::Scoped` with no path, as every app's plan is: nothing
+    // outside the sandbox is a socket the compositor or the app needs. The
+    // link is inherited, and the Wayland and X11 sockets are made inside it.
+    debug_assert_eq!(
+        plan.sandbox.policy.ipc,
+        sandbox::Ipc::Scoped {
+            connect_unix: Vec::new()
+        }
+    );
+    // The compositor's link is its own, in `pass_fds` below, and speaks the
+    // stream protocol rather than the app protocol.
+    plan.core_link = false;
+    plan.env.retain(|(key, _)| key != crate::apps::LINK_FD_ENV);
     let spec = LaunchSpec {
         app: app.name().to_string(),
         exec: app.native.exec.clone(),
@@ -1752,6 +1759,10 @@ x11 = false
         );
         assert_eq!(plan.pass_fds, vec![7]);
         assert_eq!(var(ENV_LINK_FD).as_deref(), Some("7"));
+        assert!(
+            !plan.core_link && var(crate::apps::LINK_FD_ENV).is_none(),
+            "a compositor is handed the stream link, not an app link"
+        );
         let spec: LaunchSpec = serde_json::from_str(&var(ENV_SPEC).unwrap()).unwrap();
         assert_eq!(spec.exec, vec!["/usr/bin/gimp"]);
     }

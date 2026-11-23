@@ -212,7 +212,7 @@ fn a_version_one_database_migrates_forward_and_drops_its_plaintext_sessions() {
     {
         let conn = raw(dir.path());
         conn.execute_batch(V1_SCHEMA).unwrap();
-        seed_v1_session(&conn, &cookie.encode(), "100.69.236.100", unix(expires));
+        seed_v1_session(&conn, &cookie.encode(), "100.64.0.20", unix(expires));
     }
 
     let store = Store::open(dir.path()).unwrap();
@@ -285,7 +285,7 @@ fn a_version_two_database_migrates_forward_with_its_rows_intact() {
         )
         .unwrap();
         assert!(!has_column(&conn, "command_log", "issuer_session"));
-        seed_v1_session(&conn, &cookie.encode(), "100.69.236.100", unix(expires));
+        seed_v1_session(&conn, &cookie.encode(), "100.64.0.20", unix(expires));
         // A populated v2 database: a log row an older build wrote.
         conn.execute(
             "INSERT INTO command_log (dispatch, at, node, command, risk, issuer, decision)
@@ -421,7 +421,7 @@ fn the_state_file_is_readable_only_by_the_user_running_the_server() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     store
-        .insert_session(&an_id(), &session("100.69.236.100", 3600))
+        .insert_session(&an_id(), &session("100.64.0.20", 3600))
         .unwrap();
 
     // The sessions table holds the cookies a browser presents, so "another
@@ -448,7 +448,7 @@ fn a_live_session_cookie_is_never_written_to_the_state_file_in_plaintext() {
     let id = a_cookie();
     let store = Store::open(dir.path()).unwrap();
     store
-        .insert_session(&id.hash(), &session("100.69.236.100", 3600))
+        .insert_session(&id.hash(), &session("100.64.0.20", 3600))
         .unwrap();
     store.checkpoint().unwrap();
 
@@ -542,7 +542,7 @@ fn checkpoint_folds_the_wal_back_so_the_main_file_alone_carries_the_rows() {
     let id = an_id();
     let store = Store::open(dir.path()).unwrap();
     store
-        .insert_session(&id, &session("100.69.236.100", 3600))
+        .insert_session(&id, &session("100.64.0.20", 3600))
         .unwrap();
     store.checkpoint().unwrap();
 
@@ -699,7 +699,7 @@ fn an_unreadable_session_row_is_skipped_and_the_readable_ones_still_load() {
     {
         let store = Store::open(dir.path()).unwrap();
         store
-            .insert_session(&good, &session("100.69.236.100", 3600))
+            .insert_session(&good, &session("100.64.0.20", 3600))
             .unwrap();
     }
     let future = unix(SystemTime::now() + Duration::from_secs(3600));
@@ -731,7 +731,7 @@ fn reinserting_a_session_id_replaces_it_rather_than_duplicating_it() {
     let id = an_id();
     let store = Store::open(dir.path()).unwrap();
     store
-        .insert_session(&id, &session("100.69.236.100", 60))
+        .insert_session(&id, &session("100.64.0.20", 60))
         .unwrap();
     store
         .insert_session(&id, &session("100.69.236.101", 3600))
@@ -785,7 +785,7 @@ fn a_second_store_on_the_same_file_sees_what_the_first_one_wrote() {
     let writer = Store::open(dir.path()).unwrap();
     let id = an_id();
     writer
-        .insert_session(&id, &session("100.69.236.100", 3600))
+        .insert_session(&id, &session("100.64.0.20", 3600))
         .unwrap();
 
     // Opening a second Store runs migrate again against a live database. It

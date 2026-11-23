@@ -642,10 +642,10 @@ mod tests {
     #[test]
     fn a_trusted_proxy_is_believed() {
         let c = ctx(&["127.0.0.1"]);
-        let h = headers(&[("x-forwarded-for", "100.69.236.100")]);
+        let h = headers(&[("x-forwarded-for", "100.64.0.20")]);
         assert_eq!(
             c.client_ip(peer("127.0.0.1"), &h),
-            "100.69.236.100".parse::<IpAddr>().unwrap()
+            "100.64.0.20".parse::<IpAddr>().unwrap()
         );
     }
 
@@ -655,10 +655,10 @@ mod tests {
         // its value pushed left when the trusted hop appends what it saw.
         // Taking the leftmost would take the forged one.
         let c = ctx(&["127.0.0.1"]);
-        let h = headers(&[("x-forwarded-for", "9.9.9.9, 100.69.236.100")]);
+        let h = headers(&[("x-forwarded-for", "9.9.9.9, 100.64.0.20")]);
         assert_eq!(
             c.client_ip(peer("127.0.0.1"), &h),
-            "100.69.236.100".parse::<IpAddr>().unwrap()
+            "100.64.0.20".parse::<IpAddr>().unwrap()
         );
     }
 
@@ -667,11 +667,11 @@ mod tests {
         let c = ctx(&["127.0.0.1"]);
         let h = headers(&[
             ("x-forwarded-for", "9.9.9.9"),
-            ("x-forwarded-for", "100.69.236.100"),
+            ("x-forwarded-for", "100.64.0.20"),
         ]);
         assert_eq!(
             c.client_ip(peer("127.0.0.1"), &h),
-            "100.69.236.100".parse::<IpAddr>().unwrap()
+            "100.64.0.20".parse::<IpAddr>().unwrap()
         );
     }
 

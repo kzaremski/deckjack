@@ -42,6 +42,10 @@
 //!   whoever called it — a button bound to it, the palette, an agent. That is
 //!   how a window stays true after a button dispatched `tasks.add` through
 //!   the bus: the app hears that its handler ran and re-reads what changed.
+//! - [`Program::notified`]: the app's own background work changed something
+//!   the windows show (a long job advanced or finished), and said so through
+//!   a [`Notifier`] from [`App::notifier`](crate::App::notifier). This is
+//!   the only way a window changes with no event and no command behind it.
 //!
 //! # Each window is its own model
 //!
@@ -56,7 +60,8 @@
 //! events for one window are never handled out of order.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use deckjack_protocol::AppFrame;
 use serde_json::Value;
@@ -81,6 +86,76 @@ pub trait Program: Send + 'static {
     fn command_ran(&self, _command: &str, _params: &Value) -> Option<Self::Msg> {
         None
     }
+
+    /// The app's own work said, through a [`Notifier`], that something the
+    /// windows show has changed. Notifications are coalesced: many sent while
+    /// the loop was busy arrive as one, so read the current state here rather
+    /// than counting calls.
+    fn notified(&self) -> Option<Self::Msg> {
+        None
+    }
+}
+
+/// Tells every open window that the app's state changed outside any event or
+/// command: a background job advanced, a file it watches appeared.
+///
+/// Cheap to clone and safe to call from any thread, as often as wanted:
+/// calls made while the UI loop has not yet handled the last one are merged
+/// into it, so a job reporting every half second never queues renders faster
+/// than they are drawn. A call made before the app connects, or after it
+/// disconnects, is dropped; a window opened later renders the current state
+/// anyway.
+#[derive(Clone, Default)]
+pub struct Notifier {
+    inner: Arc<NotifierInner>,
+}
+
+#[derive(Default)]
+struct NotifierInner {
+    jobs: Mutex<Option<std::sync::mpsc::Sender<Job>>>,
+    /// Set by a notify, cleared by the UI loop when it takes the job.
+    pending: Arc<AtomicBool>,
+}
+
+impl Notifier {
+    /// Re-render every window whose [`Program::notified`] asks for it.
+    pub fn notify(&self) {
+        if self.inner.pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let jobs = self
+            .inner
+            .jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let sent = jobs.as_ref().is_some_and(|tx| {
+            tx.send(Job::Notified(Arc::clone(&self.inner.pending)))
+                .is_ok()
+        });
+        if !sent {
+            self.inner.pending.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Point at a running UI loop, or at none.
+    pub(crate) fn attach(&self, jobs: Option<std::sync::mpsc::Sender<Job>>) {
+        *self
+            .inner
+            .jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = jobs;
+        self.inner.pending.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether this points at a UI loop, for tests of attach and detach.
+    #[cfg(test)]
+    pub(crate) fn is_attached(&self) -> bool {
+        self.inner
+            .jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
 }
 
 /// A [`Program`] with its message type erased, so windows of any program
@@ -90,6 +165,7 @@ pub(crate) trait Instance: Send {
     /// True when the event became a message, so the view may have changed.
     fn event(&mut self, event: &Event) -> bool;
     fn command_ran(&mut self, command: &str, params: &Value) -> bool;
+    fn notified(&mut self) -> bool;
 }
 
 struct Held<P: Program>(P);
@@ -118,6 +194,16 @@ impl<P: Program> Instance for Held<P> {
             None => false,
         }
     }
+
+    fn notified(&mut self) -> bool {
+        match self.0.notified() {
+            Some(msg) => {
+                self.0.update(msg);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// Makes a fresh model for a new window.
@@ -139,6 +225,9 @@ pub(crate) enum Job {
     Event(String, Event),
     Close(String),
     CommandRan(String, Value),
+    /// A [`Notifier`] fired; the flag is cleared when the job is taken, so
+    /// notifications sent while it waited are merged into it.
+    Notified(Arc<AtomicBool>),
 }
 
 /// One open window: its model, the tree the shell has, and its revision.
@@ -236,30 +325,45 @@ impl Windows {
                 }
             }
             Job::CommandRan(command, params) => {
-                let mut windows: Vec<&String> = self.open.keys().collect();
-                windows.sort();
-                let windows: Vec<String> = windows.into_iter().cloned().collect();
-                for window in windows {
-                    let Some(entry) = self.open.get_mut(&window) else {
-                        continue;
-                    };
-                    if !entry.instance.command_ran(&command, &params) {
-                        continue;
-                    }
-                    let patches = step(entry, &window, &mut out);
-                    if !patches.is_empty() {
-                        entry.rev += 1;
-                        out.push(AppFrame::UiPatch {
-                            window,
-                            rev: entry.rev,
-                            ack: None,
-                            patches,
-                        });
-                    }
-                }
+                self.broadcast(&mut out, |instance| instance.command_ran(&command, &params));
+            }
+            Job::Notified(pending) => {
+                // Cleared before rendering, so a notify that lands while the
+                // windows render is a new job, never lost in this one.
+                pending.store(false, Ordering::SeqCst);
+                self.broadcast(&mut out, |instance| instance.notified());
             }
         }
         out
+    }
+
+    /// Offer something to every open window, in a fixed order, and send the
+    /// patches of each that took it.
+    fn broadcast(
+        &mut self,
+        out: &mut Vec<AppFrame>,
+        mut offer: impl FnMut(&mut dyn Instance) -> bool,
+    ) {
+        let mut windows: Vec<String> = self.open.keys().cloned().collect();
+        windows.sort();
+        for window in windows {
+            let Some(entry) = self.open.get_mut(&window) else {
+                continue;
+            };
+            if !offer(entry.instance.as_mut()) {
+                continue;
+            }
+            let patches = step(entry, &window, out);
+            if !patches.is_empty() {
+                entry.rev += 1;
+                out.push(AppFrame::UiPatch {
+                    window,
+                    rev: entry.rev,
+                    ack: None,
+                    patches,
+                });
+            }
+        }
     }
 
     #[cfg(test)]
@@ -397,6 +501,9 @@ mod tests {
         fn command_ran(&self, command: &str, _params: &Value) -> Option<Msg> {
             (command == "demo.touch").then_some(Msg::Reload)
         }
+        fn notified(&self) -> Option<Msg> {
+            Some(Msg::Bump)
+        }
     }
 
     fn windows() -> (Windows, Arc<std::sync::atomic::AtomicBool>) {
@@ -492,6 +599,52 @@ mod tests {
             w.handle(Job::CommandRan("demo.other".into(), Value::Null))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_notification_re_renders_every_open_window_with_no_event_behind_it() {
+        let (mut w, _) = windows();
+        w.handle(Job::Open("a".into()));
+        w.handle(Job::Open("b".into()));
+        let pending = Arc::new(AtomicBool::new(true));
+        let frames = w.handle(Job::Notified(Arc::clone(&pending)));
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        let (window, rev, ack, patches) = patch(&frames[0]);
+        assert_eq!((window, rev, ack), ("a", 2, None));
+        assert!(
+            matches!(patches, [Patch::Props { widget: Widget::Text(t), .. }] if t.text == "n 1"),
+            "{patches:?}"
+        );
+        assert!(
+            !pending.load(Ordering::SeqCst),
+            "taking the job clears the flag, so the next notify is sent"
+        );
+    }
+
+    #[test]
+    fn notifications_sent_while_one_waits_are_merged_into_it() {
+        let notifier = Notifier::default();
+        // Not attached: dropped, and the next one is not swallowed by it.
+        notifier.notify();
+        let (tx, rx) = std::sync::mpsc::channel();
+        notifier.attach(Some(tx));
+        notifier.notify();
+        notifier.notify();
+        notifier.notify();
+        let Ok(Job::Notified(pending)) = rx.try_recv() else {
+            panic!("the first notify is sent")
+        };
+        assert!(rx.try_recv().is_err(), "the next two were merged into it");
+        // The loop takes it: a notify after that is a new job.
+        let (mut w, _) = windows();
+        w.handle(Job::Open("a".into()));
+        w.handle(Job::Notified(pending));
+        notifier.notify();
+        assert!(matches!(rx.try_recv(), Ok(Job::Notified(_))));
+        // Detached (the app disconnected): dropped again.
+        notifier.attach(None);
+        notifier.notify();
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

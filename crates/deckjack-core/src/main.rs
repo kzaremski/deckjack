@@ -604,7 +604,6 @@ fn main() -> anyhow::Result<()> {
             Box::new(deckjack_core::store::StoreGrants::new(Arc::clone(&store))),
         ),
         Arc::clone(&registry),
-        install.clone(),
         Duration::from_secs(apps::Policy::default().handshake_secs),
     );
     // So opening a window for an app starts it, and closing the last one lets
@@ -1180,8 +1179,15 @@ fn apps_cmd(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
         }
         bail!("unknown argument to apps: {arg}");
     }
-    let found = apps::discover(&node::install_dir(), &apps::OsEnv::new());
+    let env = apps::OsEnv::new();
+    let found = apps::discover(&node::install_dir(), &env);
     print!("{}", deckjack_core::install::render_listing(&found));
+    // Asked of this kernel.
+    use apps::Env as _;
+    print!(
+        "{}",
+        deckjack_core::install::render_node_refusal(&found, &env.sandbox_availability())
+    );
     Ok(())
 }
 

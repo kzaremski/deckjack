@@ -67,11 +67,10 @@ fn install_app(install: &Path, name: &str, tier: &str) {
 }
 
 struct Rig {
-    install: std::path::PathBuf,
     registry: Arc<Registry>,
     relay: Arc<UiChannel>,
     browser: Arc<Browser>,
-    _host: Arc<AppHost>,
+    host: Arc<AppHost>,
     _dir: tempfile::TempDir,
 }
 
@@ -94,7 +93,6 @@ async fn rig() -> Rig {
             Box::new(StoreGrants::new(Arc::clone(&store))),
         ),
         Arc::clone(&registry),
-        install.clone(),
         Duration::from_millis(80),
     );
     let browser = Arc::new(Browser::default());
@@ -102,11 +100,10 @@ async fn rig() -> Rig {
     host.attach_ui(Arc::clone(&relay));
     host.start().await;
     Rig {
-        install,
         registry,
         relay,
         browser,
-        _host: host,
+        host,
         _dir: dir,
     }
 }
@@ -146,9 +143,10 @@ impl FakeApp {
 
 impl Rig {
     async fn connect(&self, name: &str) -> FakeApp {
-        let stream = UnixStream::connect(apps::socket_path(&self.install, name))
-            .await
-            .unwrap();
+        // A link made the way a launch makes one.
+        let link = self.host.link(name).unwrap();
+        link.set_nonblocking(true).unwrap();
+        let stream = UnixStream::from_std(link).unwrap();
         let mut app = FakeApp {
             stream: BufReader::new(stream),
         };

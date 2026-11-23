@@ -18,6 +18,24 @@
   - JackLink's Python is removed rather than kept as a port reference. Its
     MIT-licensed source stays in git history at 7b89edb.
   - Licensed AGPL-3.0-or-later as the doc proposes.
+
+  2026-11-21
+  - One node primarily, for file-transfer cost and latency, with the
+    multi-node seams kept: `target_node`, `node:path` and `registry.rs` stay,
+    single-valued, and no multi-node scheduling is built ahead of need. The
+    lock file constrains the shell node, the one that owns the data
+    directory; worker nodes hold no data directory and no lock.
+  - Bus transport between nodes is WebSocket with signed JSON (answers the
+    open question below). Signatures cover the bytes sent, since JSON is not
+    canonical. QUIC and gRPC were rejected; reasons in docs/notes/history.md.
+  - The app sandbox is built now and fails closed: a node that cannot
+    enforce a manifest refuses to launch that app.
+  - Landlock and seccomp need neither namespaces nor root, so "Termux has no
+    namespaces without root" (The always-on assistant) does not rule out confining
+    apps on a phone; whether the phone's kernel enables Landlock does.
+  - "No app ever sees `.deckjack/`" holds for opening it. Landlock does not
+    govern `stat`, so a confined app can learn that `state.db` exists, its
+    size and its mtime (docs/notes/sandbox.md).
 -->
 
 # Deckjack: Design
@@ -86,7 +104,7 @@ The goal is a daily-driver computer for the overwhelming majority of my tasks, u
 - 96 dpi, scale 1, everywhere: apps see one logical 1920x1080 output like a 1080p monitor, whatever device looks. The browser scales the picture; the app never learns client density.
 - Marked as streamed in the dock and on the window.
 - Only the device holding the seat sends input; a takeover moves the streams with the workspace (the new holder is sent a keyframe).
-- Confined like any app: spawned by the core under Landlock and seccomp with a manifest; native apps are children of the compositor. On top of an app's sandbox, a native app cannot connect to a Unix socket or signal a process outside its own sandbox (Landlock ABI 9); a node whose kernel cannot enforce that does not stream native apps. The sandbox denies the GPU, so rendering is Smithay's software (pixman) renderer and encoding is on the CPU.
+- Confined like any app: spawned by the core under Landlock and seccomp with a manifest; native apps are children of the compositor. Like every app, a native app cannot connect to a Unix socket or signal a process outside its own sandbox (Landlock ABI 9); a node whose kernel cannot enforce that launches no app at all (docs/lanes/10-sandbox-all-apps.md). The sandbox denies the GPU, so rendering is Smithay's software (pixman) renderer and encoding is on the CPU.
 
 **The second exception: streamed native apps** (decided 2026-11-22; scoped in `docs/lanes/8-stream.md`). A native Linux app the suite has no web UI for can run on a Linux node under Deckjack's own Wayland compositor (Smithay, headless, with XWayland for X11 apps). Each of its top-level windows and popups becomes its own Deckjack window, with Deckjack's chrome around it and the app's pixels inside, encoded as H.264 and decoded in the browser. Fixed rules:
 
@@ -216,11 +234,11 @@ Deckjack installs per machine into `~/.deckjack/`: one core binary plus one `dec
 
 1. **Discovery:** scan `~/.deckjack/apps/*/app.toml` at startup.
 2. **Launch:** on demand when a window opens, or at startup for services such as PIM sync, reminders and the assistant. Idle on-demand apps are stopped.
-3. **Handshake** over a Unix socket or stdio: the app registers its commands as JSON Schema, and they appear in the command palette and as agent tools automatically.
+3. **Handshake** over one end of a Unix socket pair the app inherits at launch (descriptor 3, `DECKJACK_APP_FD`), so no app needs a socket path and none may connect to a Unix socket made outside its sandbox: the app registers its commands as JSON Schema, and they appear in the command palette and as agent tools automatically.
 4. **UI routing:** the core serves each app's UI at `/apps/<name>/` on the same origin, so sign-in, theming and the window manager stay unified. The browser never talks to an app directly.
 5. **Supervision:** a crashed app is restarted, and its windows show "reconnecting" instead of taking down the desktop.
 
-**Permissions.** Each app runs under the Landlock and seccomp launcher with only what its manifest requested and I approved. No app ever sees `.deckjack/`; the core is the only process that opens `state.db`, and apps reach state through the bus.
+**Permissions.** Each app runs under the Landlock and seccomp launcher with only what its manifest requested and I approved, and cannot reach a Unix socket, an abstract socket or a process outside its own sandbox (Landlock ABI 9, Linux 7.1 or newer; an older kernel launches no app rather than a less confined one). No app ever sees `.deckjack/`; the core is the only process that opens `state.db`, and apps reach state through the bus.
 
 **Installing and updating.** `deckjack install <app>` downloads the build for this machine's architecture, verifies its signature and unpacks it into `apps/`. Updates swap the binary and restart the app only when none of its windows are open. A host installs only the apps it can run: the Fold can skip the video editor.
 
@@ -273,7 +291,7 @@ One set of open windows, shown two ways: a desktop window manager on wide screen
 
 One workspace, one device using it at a time. Several devices can stay signed in, but only one shell connection **holds the seat**; the others show a full-screen "Deckjack is in use on *device* since *HH:MM*" with a **Take over** button, and a device the seat was taken from shows "Taken over by *device*" with **Take back**. Taking over asks once through the ordinary confirmation dialog. Built in `crates/deckjack-core/src/seat.rs`.
 
-- **Enforced by the server.** A call that arrives over a shell socket without the seat is refused with `seat_not_held` before it reaches the bus (`wiring::BusDispatch`), app windows' calls (`as_app`) included. Exempt: `seat.*` (`status`, `take`, `claim`, `release`) and `system.lockdown`, which must stay one click from any signed-in device. Not a shell socket, so not held to it: the host's CLI and unlock, agents over the agent bridge, approvals released from the Inbox, app backends over their own sockets.
+- **Enforced by the server.** A call that arrives over a shell socket without the seat is refused with `seat_not_held` before it reaches the bus (`wiring::BusDispatch`), app windows' calls (`as_app`) included. Exempt: `seat.*` (`status`, `take`, `claim`, `release`) and `system.lockdown`, which must stay one click from any signed-in device. Not a shell socket, so not held to it: the host's CLI and unlock, agents over the agent bridge, approvals released from the Inbox, app backends over their own links to the core.
 - **Devices and attendants.** Only a connection whose hello names a device (the shell) takes the seat. An app's own UI socket (`/kit/bus.js`, no device) rides on its session's seat: admitted while that session holds it, never taking it from the shell that framed it. Such a socket is refused `seat.take`, `seat.claim` and `seat.release` by the seat itself, because it is a plain browser connection that the hard-deny list (which sees only `as_app` calls) never applies to.
 - **`seat.*` is hard-denied to app windows** and reserved as a namespace. With the attendant rule above, an app's UI cannot take the seat (and with it the operator's terminals) on either path.
 - **Grace.** When the holder's connection drops, the seat stays reserved for its *session* for 30 seconds, so a phone changing networks reconnects into it silently. A new connection from the holding session always takes it at once (a reload, a second tab). After the grace, or once released, the seat is vacant and the next device to connect or ask for anything gets it without a prompt; a waiting device claims it with `seat.claim`, which never takes it from another device.
@@ -497,7 +515,7 @@ Agents ride along in every phase: each new command is an agent tool the day it s
 ## Open questions
 
 - [ ] Does the session browser's live view stream pixels (screencast) today? If so, confirm it fits the "streamed content, never streamed UI" exception. Not verified: browser.ts hasn't been read.
-- [ ] Bus transport between nodes: WebSocket with signed JSON, or something with built-in streams (QUIC, gRPC)?
+- [x] Bus transport between nodes: WebSocket with signed JSON, or something with built-in streams (QUIC, gRPC)? WebSocket with signed JSON (2026-11-21, see the note at the top).
 - [ ] FilmCraft UI: rebuild its panels in Vue on my tokens, or keep egui compiled to wasm and theme it from the same tokens?
 - [ ] Does growing agentmancer into this make the public repo too personal, or should the shell become its own repo?
 - [ ] CI: add typecheck and tests on push before multi-node work raises the stakes?

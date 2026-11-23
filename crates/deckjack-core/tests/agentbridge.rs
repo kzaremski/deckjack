@@ -180,7 +180,6 @@ struct Rig {
     registry: Arc<Registry>,
     grants: Arc<MemoryGrants>,
     log: Arc<Log>,
-    install: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -288,9 +287,6 @@ async fn rig() -> Rig {
             Box::new(StoreGrants::new(Arc::clone(&store))),
         ),
         Arc::clone(&registry),
-        install.clone(),
-        // Short, because every iteration of an attendant's accept loop costs
-        // one of these while no app is connected.
         Duration::from_millis(80),
     );
 
@@ -310,7 +306,6 @@ async fn rig() -> Rig {
         registry,
         grants,
         log,
-        install,
         _dir: dir,
     }
 }
@@ -318,10 +313,14 @@ async fn rig() -> Rig {
 impl Rig {
     /// Connect as an app and complete the handshake.
     async fn connect(&self, name: &str, protocol: u32) -> FakeApp {
-        let path = apps::socket_path(&self.install, name);
-        let stream = UnixStream::connect(&path)
-            .await
-            .unwrap_or_else(|e| panic!("connect to {}: {e}", path.display()));
+        // A link made the way a launch makes one: the other end is
+        // already with this app's attendant.
+        let link = self
+            .host
+            .link(name)
+            .unwrap_or_else(|e| panic!("a link for {name}: {e}"));
+        link.set_nonblocking(true).unwrap();
+        let stream = UnixStream::from_std(link).unwrap();
         let mut app = FakeApp {
             name: name.to_string(),
             calls: 0,
