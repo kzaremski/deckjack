@@ -15,11 +15,11 @@ path = "src/main.rs"
 deckjack-app.workspace = true
 anyhow.workspace = true
 rand.workspace = true
-rust-embed.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+deckjack-protocol.workspace = true
 tempfile.workspace = true

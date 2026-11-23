@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { crc32, deflateSync } from "node:zlib";
 
@@ -24,6 +24,33 @@ export function seed(work: string): Seeded {
   writeFileSync(join(work, SEEDED.text.name), `${SEEDED.text.firstLine}\nsecond line\n`);
   writeFileSync(join(work, SEEDED.image.name), png(SEEDED.image.width, SEEDED.image.height));
   return SEEDED;
+}
+
+/**
+ * `count` open tasks in `Tasks/`, as the Tasks app writes them: one VTODO per
+ * `.ics` file. Summaries are zero-padded so the app's order (by summary,
+ * when nothing else differs) is the numeric one, and row `i` is `Row i`.
+ */
+export function seedTasks(work: string, count: number): void {
+  const dir = join(work, "Tasks");
+  mkdirSync(dir, { recursive: true });
+  for (let i = 0; i < count; i++) {
+    const uid = `e2e-${String(i).padStart(5, "0")}`;
+    const text = [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//Deckjack e2e//EN",
+      "BEGIN:VTODO",
+      `UID:${uid}`,
+      "DTSTAMP:20260101T000000Z",
+      `SUMMARY:Row ${String(i).padStart(5, "0")}`,
+      "STATUS:NEEDS-ACTION",
+      "END:VTODO",
+      "END:VCALENDAR",
+      "",
+    ].join("\r\n");
+    writeFileSync(join(dir, `${uid}.ics`), text);
+  }
 }
 
 /** An RGB PNG of the given size: a horizontal gradient, so it is not blank. */

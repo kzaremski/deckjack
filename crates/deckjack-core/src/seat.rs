@@ -389,6 +389,34 @@ impl Seat {
             .contains(&connection)
     }
 
+    /// Whether `connection` has joined and its hello named a device: the
+    /// shell, not an app's own page (an attendant). See "Devices and
+    /// attendants".
+    pub fn names_device(&self, connection: ConnectionId) -> bool {
+        self.state()
+            .peers
+            .get(&connection)
+            .is_some_and(|p| p.names_device)
+    }
+
+    /// The browser session the workspace belongs to right now: the holder's,
+    /// or, during the grace after its connection dropped, the session the
+    /// seat is reserved for. `None` when the seat is vacant.
+    ///
+    /// For a connection that is not a bus socket and so never joins the seat
+    /// itself: a streamed window's socket (`crate::stream`) is admitted while
+    /// its session is this one, and closed when it stops being.
+    pub fn holder_session(&self) -> Option<SessionHash> {
+        let mut st = self.state();
+        if self.expire_if_due(&mut st) {
+            self.broadcast(&st);
+        }
+        match &st.holder {
+            Holder::Vacant => None,
+            Holder::Held { lease, .. } | Holder::Reserved { lease, .. } => Some(lease.session),
+        }
+    }
+
     fn now_ms(&self) -> u64 {
         self.clock
             .now()

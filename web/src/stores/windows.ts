@@ -12,6 +12,7 @@ import {
 } from "../shell/geometry.ts";
 import { safeStorage } from "../tokens/runtime.ts";
 import type { WireWindow } from "../protocol.ts";
+import { nativeAppId, parseStreamMeta, popupRect, type StreamMeta } from "../shell/stream.ts";
 import type { AppContract, AppId, AppTable } from "./apps.ts";
 import type { Bus } from "./bus.ts";
 
@@ -29,6 +30,12 @@ import type { Bus } from "./bus.ts";
  * records over the same windows, so a day of using the phone never scrambles
  * the desktop arrangement.
  */
+
+/** A streamed app's popup (a menu, a tooltip): placed against its parent
+ * window, never laid out, tiled, cycled to or focused on its own. */
+export function isPopup(w: ShellWindow): boolean {
+  return w.stream?.kind === "popup";
+}
 
 export interface ShellWindow {
   id: string;
@@ -56,6 +63,13 @@ export interface ShellWindow {
    * request to the app, and the app keeps what it opened.
    */
   launch?: AppLaunch | null;
+  /**
+   * A streamed native app's window: the node made it when the app mapped a
+   * window, and removes it when the app unmaps it. Its `app` is
+   * `native:<name>`, which is what the dock groups it under and what draws
+   * it with the stream panel.
+   */
+  stream?: StreamMeta | null;
 }
 
 /** A request for an app's window to open a file. */
@@ -180,6 +194,15 @@ export interface WindowsStore {
   setSplitFraction(fraction: number): void;
   /** Reconciles from the server, which is the source of truth. */
   adopt(wire: WireWindow[]): void;
+  /**
+   * Take the node's streamed windows, and only those, from a list. For the
+   * device holding the seat, which does not adopt the node's echo of its
+   * own changes: a streamed window is the app's doing, not this device's,
+   * so this device has nothing optimistic to protect for it. Adds the ones
+   * the node has and this store lacks, drops the ones it no longer lists,
+   * and takes the title and picture size of the rest.
+   */
+  syncStreamed(wire: WireWindow[]): void;
 }
 
 /** Gap between tiled and snapped windows, in CSS pixels. */
@@ -218,6 +241,64 @@ export function createWindows(bus: Bus, env: WindowsEnv, apps: AppTable): Window
       const w = byId.get(id);
       return w ? [w] : [];
     });
+  }
+
+  /** Drop a window from this store only. True when it was there. */
+  function forget(id: string): boolean {
+    const existed = byId.delete(id);
+    order.value = order.value.filter((x) => x !== id);
+    focusHistory.value = focusHistory.value.filter((x) => x !== id);
+    if (split.value && (split.value.left === id || split.value.right === id)) {
+      split.value = null;
+    }
+    if (focusedId.value === id) focusedId.value = focusHistory.value[0] ?? null;
+    if (existed) env.storage.remove?.(windowStorageKey(id));
+    return existed;
+  }
+
+  /** A window from the node's list, as this store keeps one. */
+  function fromWire(w: WireWindow, stream: StreamMeta | null): ShellWindow {
+    const app = stream ? nativeAppId(stream.app) : w.app;
+    // The app's own minimum where the shell knows the app: the node keeps a
+    // width only, and a window another device opened should resize here the
+    // way one opened here does.
+    const known = apps.contract(app).minSize;
+    return {
+      id: w.id,
+      app,
+      appId: app,
+      title: w.title,
+      rect: { x: w.desktop.x, y: w.desktop.y, w: w.desktop.w, h: w.desktop.h },
+      z: w.desktop.z,
+      minimized: w.desktop.minimized,
+      maximized: w.desktop.maximized,
+      restore: null,
+      snap: null,
+      loading: false,
+      // A streamed window takes whatever size it is given: the app is asked
+      // for that size, and the picture is scaled until it complies.
+      minSize: stream
+        ? { w: 120, h: 80 }
+        : { w: Math.max(known.w, w.minWidth), h: Math.max(known.h, w.minHeight) },
+      stream,
+    };
+  }
+
+  /**
+   * Put each streamed popup where its app put it: against its parent's
+   * picture as this device draws it. A popup whose parent is not here yet
+   * keeps the node's guess.
+   */
+  function placePopups() {
+    for (const w of byId.values()) {
+      const meta = w.stream;
+      if (!meta || meta.kind !== "popup" || !meta.parent) continue;
+      const parent = byId.get(meta.parent);
+      if (!parent?.stream) continue;
+      w.rect = popupRect(parent.rect, titlebar.value, parent.stream, meta);
+      // Above its parent, always: a menu under its window is no menu.
+      if ((w.z ?? 0) <= parent.z) raise(w.id);
+    }
   }
 
   function touch(id: string) {
@@ -272,14 +353,36 @@ export function createWindows(bus: Bus, env: WindowsEnv, apps: AppTable): Window
   }
 
   /** Raising, remembering and focusing in one place: a window that is raised
-   * without being remembered breaks the compact switcher's order. */
+   * without being remembered breaks the compact switcher's order.
+   *
+   * A streamed popup is never the focused window: focusing it focuses its
+   * parent, with the parent's popups kept above it. In compact mode the
+   * popup is drawn inside its parent's panel, and the one panel follows
+   * the focused window; a focused popup would take that panel from its
+   * parent and unmount itself under the finger that tapped it. */
   function focusWindow(id: string) {
-    const w = byId.get(id);
+    let w = byId.get(id);
     if (!w) return;
+    const parent = isPopup(w) && w.stream?.parent ? byId.get(w.stream.parent) : undefined;
+    if (parent) {
+      w = parent;
+      id = parent.id;
+    }
     w.minimized = false;
     raise(id);
+    for (const popup of byId.values()) {
+      if (isPopup(popup) && popup.stream?.parent === id) raise(popup.id);
+    }
     touch(id);
     focusedId.value = id;
+  }
+
+  /** A streamed popup whose parent is minimized or gone has nothing to be
+   * drawn against, so it is not drawn. */
+  function hiddenPopup(w: ShellWindow): boolean {
+    if (!isPopup(w)) return false;
+    const parent = w.stream?.parent ? byId.get(w.stream.parent) : undefined;
+    return !parent || parent.minimized;
   }
 
   function contract(window: ShellWindow): AppContract {
@@ -300,7 +403,7 @@ export function createWindows(bus: Bus, env: WindowsEnv, apps: AppTable): Window
    */
   function arrange(record_: boolean) {
     if (layout.value !== "tiling") return;
-    const vis = list().filter((w) => !w.minimized);
+    const vis = list().filter((w) => !w.minimized && !isPopup(w));
     if (vis.length === 0) return;
     const rects = tileMasterStack(vis.length, workArea.value, SNAP_GAP);
     vis.forEach((w, i) => {
@@ -344,11 +447,13 @@ export function createWindows(bus: Bus, env: WindowsEnv, apps: AppTable): Window
 
   const store: WindowsStore = {
     all: computed(() => list()),
-    visible: computed(() => list().filter((w) => !w.minimized)),
+    visible: computed(() => list().filter((w) => !w.minimized && !hiddenPopup(w))),
     recent: computed(() =>
       focusHistory.value.flatMap((id) => {
         const w = byId.get(id);
-        return w ? [w] : [];
+        // A streamed popup is drawn by its parent's panel in compact mode,
+        // never switched to on its own.
+        return w && !isPopup(w) ? [w] : [];
       }),
     ),
     focused: computed(() => (focusedId.value ? byId.get(focusedId.value) ?? null : null)),
@@ -418,14 +523,14 @@ export function createWindows(bus: Bus, env: WindowsEnv, apps: AppTable): Window
 
     async close(id) {
       if (noNode("closed")) return;
-      const existed = byId.delete(id);
-      order.value = order.value.filter((x) => x !== id);
-      focusHistory.value = focusHistory.value.filter((x) => x !== id);
-      if (split.value && (split.value.left === id || split.value.right === id)) {
-        split.value = null;
+      // A streamed window is the app's: closing asks the app (which may
+      // ask to save first), and the window goes when the node says the app
+      // unmapped it. Removing it here would show a window gone that is not.
+      if (byId.get(id)?.stream) {
+        await record("shell.window.close", { id });
+        return;
       }
-      if (focusedId.value === id) focusedId.value = focusHistory.value[0] ?? null;
-      if (existed) env.storage.remove?.(windowStorageKey(id));
+      const existed = forget(id);
       if (existed) await record("shell.window.close", { id });
       // The survivors grow into the freed slot, which is the whole point of a
       // tiling mode: a gap where a window used to be is a floating layout.
@@ -537,7 +642,8 @@ export function createWindows(bus: Bus, env: WindowsEnv, apps: AppTable): Window
 
     async tile() {
       if (noNode("tiled")) return;
-      const vis = list().filter((w) => !w.minimized);
+      // A popup is placed against its parent, never tiled.
+      const vis = list().filter((w) => !w.minimized && !isPopup(w));
       const rects = tileRow(vis.length, workArea.value, SNAP_GAP);
       vis.forEach((w, i) => {
         const rect = rects[i];
@@ -557,7 +663,7 @@ export function createWindows(bus: Bus, env: WindowsEnv, apps: AppTable): Window
     relayout: () => arrange(false),
 
     cycle(direction) {
-      const vis = list().filter((w) => !w.minimized);
+      const vis = list().filter((w) => !w.minimized && !isPopup(w));
       if (vis.length === 0) return;
       const index = vis.findIndex((w) => w.id === focusedId.value);
       const next = vis[(index + direction + vis.length) % vis.length];
@@ -595,6 +701,7 @@ export function createWindows(bus: Bus, env: WindowsEnv, apps: AppTable): Window
         seen.add(w.id);
         const existing = byId.get(w.id);
         const rect = { x: w.desktop.x, y: w.desktop.y, w: w.desktop.w, h: w.desktop.h };
+        const stream = parseStreamMeta(w.stream);
         if (existing) {
           existing.title = w.title;
           existing.rect = rect;
@@ -602,26 +709,10 @@ export function createWindows(bus: Bus, env: WindowsEnv, apps: AppTable): Window
           existing.minimized = w.desktop.minimized;
           existing.maximized = w.desktop.maximized;
           existing.loading = false;
+          existing.stream = stream;
           continue;
         }
-        // The app's own minimum where the shell knows the app: the node
-        // keeps a width only, and a window another device opened should
-        // resize here the way one opened here does.
-        const known = apps.contract(w.app).minSize;
-        byId.set(w.id, {
-          id: w.id,
-          app: w.app,
-          appId: w.app,
-          title: w.title,
-          rect,
-          z: w.desktop.z,
-          minimized: w.desktop.minimized,
-          maximized: w.desktop.maximized,
-          restore: null,
-          snap: null,
-          loading: false,
-          minSize: { w: Math.max(known.w, w.minWidth), h: Math.max(known.h, w.minHeight) },
-        });
+        byId.set(w.id, fromWire(w, stream));
       }
       // Kept: a window still being opened here, which the node's list may
       // simply predate. It stays on top, where it was opened.
@@ -650,6 +741,34 @@ export function createWindows(bus: Bus, env: WindowsEnv, apps: AppTable): Window
       if (!focusedId.value) {
         focusedId.value = focusHistory.value.find((id) => !byId.get(id)?.minimized) ?? null;
       }
+      placePopups();
+    },
+
+    syncStreamed(wire) {
+      const listed = new Map<string, { w: WireWindow; meta: StreamMeta }>();
+      for (const w of wire) {
+        const meta = parseStreamMeta(w.stream);
+        if (meta) listed.set(w.id, { w, meta });
+      }
+      for (const w of list()) {
+        if (w.stream && !listed.has(w.id)) forget(w.id);
+      }
+      for (const [id, { w, meta }] of listed) {
+        const existing = byId.get(id);
+        if (existing) {
+          existing.title = w.title;
+          existing.stream = meta;
+          continue;
+        }
+        const added = fromWire(w, meta);
+        byId.set(id, added);
+        raise(id);
+        // A new toplevel is what the operator just opened (or a dialog the
+        // app put up): it comes forward. A popup does not take focus from
+        // the window it belongs to.
+        if (meta.kind === "toplevel") focusWindow(id);
+      }
+      placePopups();
     },
   };
   return store;

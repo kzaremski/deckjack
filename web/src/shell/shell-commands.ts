@@ -366,17 +366,45 @@ export function shellCommands(deps: ShellCommandDeps): CommandEntry[] {
   return entries;
 }
 
-/** One "Open <app>" palette entry per app the dock offers. */
-export function appOpenEntries(dock: AppContract[], windows: WindowsStore): CommandEntry[] {
+/**
+ * One "Open <app>" palette entry per app the dock offers.
+ *
+ * A streamed native app is opened by starting it (`stream.launch`): its
+ * windows are the app's, made by the node as the app maps them, so there is
+ * no empty window to open first. `launch` is how; without it a streamed
+ * entry says it cannot.
+ */
+export function appOpenEntries(
+  dock: AppContract[],
+  windows: WindowsStore,
+  launch?: (name: string) => Promise<void>,
+): CommandEntry[] {
   return dock.map((app) => ({
     id: `app.open.${app.id}`,
     title: `Open ${app.title}`,
     summary: app.summary,
     risk: "write",
     group: "Apps",
-    keywords: [app.id, "app", "window", "open"],
-    run: () => windows.open(app.id).then(() => undefined),
+    keywords: app.streamed ? [app.id, "app", "native", "streamed", "open"] : [app.id, "app", "window", "open"],
+    run: () => {
+      const native = app.streamed;
+      if (native !== undefined) {
+        return launch ? launch(native) : Promise.reject(new Error("this shell cannot start native apps"));
+      }
+      return windows.open(app.id).then(() => undefined);
+    },
   }));
+}
+
+/** `stream.launch`, with the node's refusal as the error. */
+export function launchNative(bus: Bus): (name: string) => Promise<void> {
+  return async (name) => {
+    const outcome = await bus.call("stream.launch", { app: name });
+    if (outcome.status === "ok") return;
+    throw new Error(
+      outcome.status === "queued" ? `starting ${name} is waiting in the Inbox` : outcome.message,
+    );
+  };
 }
 
 /**
@@ -501,7 +529,7 @@ export function bindApps(deps: AppBindingDeps): () => void {
     apps.dock,
     (dock) => {
       unregister?.();
-      unregister = commands.register(appOpenEntries(dock, windows));
+      unregister = commands.register(appOpenEntries(dock, windows, launchNative(bus)));
     },
     { immediate: true },
   );

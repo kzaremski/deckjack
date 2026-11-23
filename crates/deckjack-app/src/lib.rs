@@ -77,6 +77,15 @@
 //! [`Bus::commands`] is what this app may call, as the core filters it. Worth
 //! asking rather than assuming: the answer depends on the grant the operator
 //! gave this app, and that can be narrowed while the app is running.
+//!
+//! # A window without a page
+//!
+//! An app whose manifest says `tier = 1` ships no `ui/` folder and no
+//! JavaScript. It describes its window instead, with [`App::view`] and the
+//! [`ui`] module: a model, a view function and an update function, which
+//! this crate runs and diffs and sends as keyed patches. See [`ui`].
+
+pub mod ui;
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -427,6 +436,18 @@ pub enum AppError {
         source: std::io::Error,
     },
 
+    #[error(
+        "app.toml says tier = 1, so the shell will ask this app to describe its window, but \
+         no view was given: call App::view with the window's program"
+    )]
+    NoView,
+
+    #[error(
+        "App::view was given, but app.toml does not say tier = 1, so the shell would frame a \
+         ui/ page and never ask for the view"
+    )]
+    ViewWithoutTier,
+
     #[error(transparent)]
     Protocol(#[from] deckjack_protocol::ProtocolError),
 
@@ -439,6 +460,7 @@ pub struct App {
     manifest: Manifest,
     handlers: BTreeMap<String, (Handler, schemars::Schema)>,
     assets: Option<AssetFn>,
+    view: Option<ui::Factory>,
 }
 
 impl App {
@@ -452,6 +474,7 @@ impl App {
             manifest,
             handlers: BTreeMap::new(),
             assets: None,
+            view: None,
         })
     }
 
@@ -474,6 +497,18 @@ impl App {
     /// `--release`.
     pub fn ui<A: Assets>(mut self) -> App {
         self.assets = Some(Arc::new(A::get));
+        self
+    }
+
+    /// Describe this app's window with the UI protocol: `init` builds one
+    /// window's model, and is called once for every window the shell opens.
+    /// The manifest must say `tier = 1`. See [`ui`].
+    pub fn view<P, F>(mut self, init: F) -> App
+    where
+        P: ui::Program,
+        F: Fn() -> P + Send + Sync + 'static,
+    {
+        self.view = Some(ui::factory(init));
         self
     }
 
@@ -529,6 +564,12 @@ impl App {
                     command: id.clone(),
                 });
             }
+        }
+        let described = self.manifest.app.tier == Some(deckjack_protocol::TIER_UI_PROTOCOL);
+        match (described, self.view.is_some()) {
+            (true, false) => return Err(AppError::NoView),
+            (false, true) => return Err(AppError::ViewWithoutTier),
+            _ => {}
         }
         Ok(out)
     }
@@ -624,6 +665,9 @@ impl App {
 
         let handlers = Arc::new(self.handlers);
         let assets = self.assets.clone();
+        // The UI loop, for an app that describes its window. Its sender is
+        // dropped with this function, which ends the loop's thread.
+        let ui_jobs = self.view.clone().map(|f| ui::spawn(f, out.clone()));
 
         let bus = Bus {
             out: out.clone(),
@@ -678,6 +722,11 @@ impl App {
                             // loop reading the next one. An app that wants to
                             // serialize its own work does that inside its
                             // handlers.
+                            // Kept for the UI loop, which re-renders the
+                            // windows that care once the command succeeds.
+                            let ran = ui_jobs
+                                .as_ref()
+                                .map(|jobs| (jobs.clone(), command.clone(), params.clone()));
                             let future = handler(params, cx.clone());
                             let out = out.clone();
                             let running = Arc::clone(&running);
@@ -690,7 +739,11 @@ impl App {
                                     .lock()
                                     .unwrap_or_else(PoisonError::into_inner)
                                     .remove(&id);
+                                let succeeded = error.is_none();
                                 send(&out, &AppFrame::Result { id, result, error });
+                                if succeeded && let Some((jobs, command, params)) = ran {
+                                    let _ = jobs.send(ui::Job::CommandRan(command, params));
+                                }
                             });
                         }
                         // Registered-but-unhandled is unreachable —
@@ -740,8 +793,36 @@ impl App {
                 CoreFrame::Available { call, commands } => {
                     bus.deliver(call, Reply::Available(commands));
                 }
+                // The UI protocol. The core sends these only to an app whose
+                // manifest says `tier = 1`, and `registration` refused to
+                // start such an app without a view, so `ui_jobs` is there.
+                CoreFrame::UiOpen { window } => ui_job(&ui_jobs, &out, ui::Job::Open(window)),
+                CoreFrame::UiEvent { window, event } => {
+                    ui_job(&ui_jobs, &out, ui::Job::Event(window, event))
+                }
+                CoreFrame::UiClose { window } => ui_job(&ui_jobs, &out, ui::Job::Close(window)),
             }
         }
+    }
+}
+
+/// Hand a job to the UI loop, or say plainly that there is none.
+fn ui_job(
+    jobs: &Option<std::sync::mpsc::Sender<ui::Job>>,
+    out: &mpsc::UnboundedSender<String>,
+    job: ui::Job,
+) {
+    match jobs {
+        Some(jobs) => {
+            let _ = jobs.send(job);
+        }
+        None => send(
+            out,
+            &AppFrame::Log {
+                level: "warn".to_string(),
+                message: "the core sent a UI protocol frame to an app with no view".to_string(),
+            },
+        ),
     }
 }
 
@@ -1103,5 +1184,170 @@ risk = "read"
             .unwrap()
             .expect_err("a refused listing returned commands");
         assert!(error.to_string().contains("invoke_commands"), "{error}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The UI protocol, over the socket
+    // -----------------------------------------------------------------------
+
+    const DESCRIBED: &str = r#"
+[app]
+name = "demo"
+version = "0.1.0"
+protocol = 1
+title = "Demo"
+tier = 1
+
+[[commands]]
+id = "demo.touch"
+summary = "Touch"
+risk = "write"
+
+[[commands]]
+id = "demo.fail"
+summary = "Fail"
+risk = "write"
+"#;
+
+    /// A window that shows how many times `demo.touch` has run.
+    struct Touches(u32);
+
+    impl ui::Program for Touches {
+        type Msg = ();
+        fn view(&self) -> ui::Node {
+            ui::Node::new(
+                "root",
+                ui::Text {
+                    text: self.0.to_string(),
+                    ..ui::Text::default()
+                },
+            )
+        }
+        fn update(&mut self, _: ()) {
+            self.0 += 1;
+        }
+        fn event(&self, _: &ui::Event) -> Option<()> {
+            None
+        }
+        fn command_ran(&self, command: &str, _: &Value) -> Option<()> {
+            // Any of its commands: whether a failed one is reported at all is
+            // what a test here checks.
+            command.starts_with("demo.").then_some(())
+        }
+    }
+
+    fn described_app() -> App {
+        App::new(DESCRIBED)
+            .unwrap()
+            .view(|| Touches(0))
+            .command("demo.touch", |_p: NoParams, _cx: Ctx| async move {
+                Ok(serde_json::json!("touched"))
+            })
+            .command("demo.fail", |_p: NoParams, _cx: Ctx| async move {
+                Err("it did not work".to_string())
+            })
+    }
+
+    #[test]
+    fn a_described_app_must_have_a_view_and_a_view_needs_the_tier() {
+        // Either half alone is a window that never draws: the shell asks for
+        // a tree nobody builds, or frames a page that is not there.
+        assert!(described_app().registration().is_ok());
+        let no_view = App::new(DESCRIBED)
+            .unwrap()
+            .command("demo.touch", |_p: NoParams, _cx: Ctx| async move {
+                Ok(Value::Null)
+            })
+            .command("demo.fail", |_p: NoParams, _cx: Ctx| async move {
+                Ok(Value::Null)
+            });
+        assert!(matches!(no_view.registration(), Err(AppError::NoView)));
+        let no_tier = App::new(MANIFEST)
+            .unwrap()
+            .view(|| Touches(0))
+            .command("demo.wait", |_p: NoParams, _cx: Ctx| async move {
+                Ok(Value::Null)
+            });
+        assert!(matches!(
+            no_tier.registration(),
+            Err(AppError::ViewWithoutTier)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_window_opens_as_a_tree_and_follows_the_apps_own_commands() {
+        let app = described_app();
+        let commands = app.registration().unwrap();
+        let (core, app_end) = UnixStream::pair().unwrap();
+        tokio::spawn(app.serve_on(app_end, commands));
+        let (read, writer) = core.into_split();
+        let mut core = FakeCore {
+            reader: BufReader::new(read),
+            writer,
+        };
+        core.send(&CoreFrame::Hello(deckjack_protocol::Hello {
+            protocol: PROTOCOL_VERSION,
+            core_version: "test".to_string(),
+            app: "demo".to_string(),
+        }))
+        .await;
+        assert!(matches!(core.recv().await, AppFrame::Register(_)));
+
+        core.send(&CoreFrame::UiOpen {
+            window: "w1".to_string(),
+        })
+        .await;
+        let AppFrame::UiPatch {
+            window,
+            rev,
+            patches,
+            ..
+        } = core.recv().await
+        else {
+            panic!("expected the window's tree");
+        };
+        assert_eq!((window.as_str(), rev), ("w1", 1));
+        assert!(matches!(&patches[..], [ui::Patch::Replace { path, .. }] if path.is_empty()));
+
+        // A command that fails changed nothing, so no window hears of it:
+        // the next frame is the following call's answer, and the window's
+        // count below starts from that call alone.
+        core.send(&CoreFrame::Call {
+            id: 9,
+            command: "demo.fail".to_string(),
+            params: serde_json::json!({}),
+        })
+        .await;
+        assert!(matches!(
+            core.recv().await,
+            AppFrame::Result {
+                id: 9,
+                error: Some(_),
+                ..
+            }
+        ));
+
+        // The command answers first, then the window hears it ran.
+        core.send(&CoreFrame::Call {
+            id: 1,
+            command: "demo.touch".to_string(),
+            params: serde_json::json!({}),
+        })
+        .await;
+        assert!(matches!(core.recv().await, AppFrame::Result { id: 1, .. }));
+        let AppFrame::UiPatch { rev, patches, .. } = core.recv().await else {
+            panic!("expected the window to follow the command");
+        };
+        assert_eq!(rev, 2);
+        let [
+            ui::Patch::Props {
+                widget: ui::Widget::Text(t),
+                ..
+            },
+        ] = &patches[..]
+        else {
+            panic!("{patches:?}");
+        };
+        assert_eq!(t.text, "1");
     }
 }

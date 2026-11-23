@@ -118,7 +118,7 @@ describe("an app installed on the node", () => {
     expect(params.h).toBe(600);
 
     const window = rig.shell.windows.all.value.find((w) => w.app === "photo")!;
-    expect(panelFor(window.appId, rig.shell.apps.isInstalled)).toBe(AppFramePanel);
+    expect(panelFor(window.appId, rig.shell.apps)).toBe(AppFramePanel);
   });
 
   it("leaves the palette when it is uninstalled", async () => {

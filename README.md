@@ -7,7 +7,9 @@ through the same commands I do.
 Three rules define it:
 
 - **Every interface is real web UI.** DOM, canvas or WebGPU rendered in the
-  browser. No VNC, RDP or pixel-streamed desktops.
+  browser. No VNC, RDP or pixel-streamed desktops. The one exception is a
+  native-only Linux app, streamed window by window and marked as streamed
+  (docs/DESIGN.md, "streamed native apps").
 - **Backends are Rust services and CLI tools.** The browser is the only front
   end; the heavy lifting runs on whichever node fits.
 - **One command bus.** Every action is a typed command. I, the CLI and agents

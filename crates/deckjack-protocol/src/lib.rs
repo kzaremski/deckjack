@@ -55,6 +55,20 @@
 //! halves have in common, which is 1 for a protocol-1 app and 2 for a
 //! protocol-2 one. A core that sends a bare [`PROTOCOL_VERSION`] in `Hello`
 //! is announcing a version it cannot know the app accepts.
+//!
+//! ## The UI protocol frames
+//!
+//! [`CoreFrame::UiOpen`], [`CoreFrame::UiEvent`], [`CoreFrame::UiClose`] and
+//! [`AppFrame::UiPatch`] carry a window described with [`ui`] rather than a
+//! page. They are the one exception to "the core sends no new frame
+//! unprompted", and the exception is bounded by the manifest: the core sends
+//! them only to an app whose `app.toml` says `tier = 1`, which an older core
+//! refuses at discovery (`[app]` denies unknown keys) and which no app built
+//! before this module could have written. No version bump, for that reason.
+
+pub mod ui;
+
+pub mod stream;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -149,6 +163,10 @@ pub const INSTALL_LAYOUT: &[&str] = &[
     // `[server] unix_socket` is set (it must be under here if it is inside
     // the install directory at all).
     "proxy",
+    // Native app declarations and the compositor that streams them
+    // (docs/lanes/8-stream.md). A grant reaching it could rewrite what a
+    // native app runs.
+    "native",
 ];
 
 // ---------------------------------------------------------------------------
@@ -266,7 +284,17 @@ pub struct AppInfo {
     pub compact: bool,
     #[serde(default = "yes")]
     pub wide: bool,
+    /// How the app's window is drawn. Absent: the app serves its own page
+    /// from `ui/`, framed by the shell. `1`: the app describes its window
+    /// with the UI protocol ([`ui`]) and ships no page at all. Not part of
+    /// the fingerprint: it changes how a window is drawn, not what the app
+    /// may reach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<u8>,
 }
+
+/// The [`AppInfo::tier`] of an app whose window is a UI protocol tree.
+pub const TIER_UI_PROTOCOL: u8 = 1;
 
 fn yes() -> bool {
     true
@@ -402,10 +430,18 @@ impl UiNeeds {
 ///   covers `as_app` calls; an app UI's own socket, which is a plain browser
 ///   connection, is refused the seat's commands by the core's seat itself
 ///   (`deckjack-core/src/seat.rs`, "Devices and attendants").
+/// - `ui`: the UI protocol's own commands (`ui.snapshot`), which read any
+///   window's tree. One app's window reading another's is exactly what
+///   isolation is for.
+/// - `stream`: native apps streamed into the workspace (`stream.launch`
+///   starts a process; docs/lanes/8-stream.md). Their pictures go only to
+///   the shell's own stream panel, never into an app frame (D6).
 ///
 /// One constant, applied to commands **and** event topics: in manifest
 /// validation here, and again by the core at dispatch.
-pub const HARD_DENY: &[&str] = &["terminal", "system", "shell", "auth", "seat"];
+pub const HARD_DENY: &[&str] = &[
+    "terminal", "system", "shell", "auth", "seat", "stream", "ui",
+];
 
 /// Whether a command id or an event topic falls under [`HARD_DENY`].
 ///
@@ -426,7 +462,7 @@ pub fn is_hard_denied(id: &str) -> bool {
 /// `files.*`. Every namespace the core registers must be in this list;
 /// `deckjack-core`'s tests check that against the core's real registry.
 pub const RESERVED_NAMESPACES: &[&str] = &[
-    "auth", "editor", "files", "git", "seat", "shell", "system", "terminal",
+    "auth", "editor", "files", "git", "seat", "shell", "stream", "system", "terminal", "ui",
 ];
 
 /// Whether `name` is a core namespace no app may take.
@@ -651,6 +687,15 @@ impl Manifest {
             return Err(bad(
                 "app.default_width and app.default_height must be above zero".into(),
             ));
+        }
+        if let Some(tier) = self.app.tier
+            && tier != TIER_UI_PROTOCOL
+        {
+            return Err(bad(format!(
+                "app.tier {tier} is not a tier this core draws: leave it out for an app that \
+                 serves its own page from ui/, or write tier = {TIER_UI_PROTOCOL} for one that \
+                 describes its window with the UI protocol"
+            )));
         }
         if !self.app.compact && !self.app.wide {
             return Err(bad(
@@ -1030,6 +1075,25 @@ pub enum CoreFrame {
         call: u64,
         commands: Vec<AvailableCommand>,
     },
+    /// A shell window of this app is showing: send its whole tree, as a
+    /// root [`ui::Patch::Replace`] in an [`AppFrame::UiPatch`]. Sent again
+    /// for a window already open whenever the core needs a fresh copy (the
+    /// app reconnected, say), and answered the same way. Only to an app
+    /// whose manifest says `tier = 1`.
+    UiOpen {
+        window: String,
+    },
+    /// Something happened in one window. Answered with an
+    /// [`AppFrame::UiPatch`] carrying the event's `seq` as `ack`, with
+    /// whatever patches the event caused (possibly none).
+    UiEvent {
+        window: String,
+        event: ui::Event,
+    },
+    /// The window closed. The app drops its state for it; nothing answers.
+    UiClose {
+        window: String,
+    },
 }
 
 /// What came of one [`AppFrame::Invoke`].
@@ -1171,6 +1235,21 @@ pub enum AppFrame {
     /// has no business enumerating the machine's commands either.
     Commands {
         call: u64,
+    },
+    /// The patches that bring one window's tree up to revision `rev`.
+    ///
+    /// Revisions count up from 1 per window and per [`CoreFrame::UiOpen`]: a
+    /// frame whose first patch is a root [`ui::Patch::Replace`] starts over,
+    /// and every other frame must be exactly one past the last. A gap means
+    /// a frame was lost, and the remedy is another `UiOpen`.
+    UiPatch {
+        window: String,
+        rev: u64,
+        /// The `seq` of the [`ui::Event`] this answers, when it answers one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<u64>,
+        #[serde(default)]
+        patches: Vec<ui::Patch>,
     },
 }
 

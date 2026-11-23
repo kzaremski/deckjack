@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 
-import { APPS, ROOT, WEB } from "./support/paths.ts";
+import { APPS, RELEASE, ROOT, WEB } from "./support/paths.ts";
 
 /**
  * Build what the tests run, once, before any of them.
@@ -15,6 +15,7 @@ export default function globalSetup(): void {
   const run = (cmd: string, args: string[], cwd: string) =>
     execFileSync(cmd, args, { cwd, stdio: "inherit", env: process.env });
   run("npm", ["run", "build"], WEB);
-  const packages = ["deckjack-core", ...APPS.map((a) => `deckjack-${a.name}`)].flatMap((p) => ["-p", p]);
-  run("cargo", ["build", ...packages, "--bins"], ROOT);
+  // deckjack-stream: the compositor a streamed native app runs under.
+  const packages = ["deckjack-core", "deckjack-stream", ...APPS.map((a) => `deckjack-${a.name}`)].flatMap((p) => ["-p", p]);
+  run("cargo", ["build", ...packages, "--bins", ...(RELEASE ? ["--release"] : [])], ROOT);
 }

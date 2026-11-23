@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["crates/deckjack-app", "crates/deckjack-core", "crates/deckjack-editor", "crates/deckjack-files", "crates/deckjack-notes", "crates/deckjack-office", "crates/deckjack-photo", "crates/deckjack-protocol", "crates/deckjack-tasks", "crates/deckjack-video", "xtask"]
+# A trimmed, patched smithay for deckjack-stream; see its Cargo.toml. Not a
+# member: it is upstream's code, held to upstream's lints, not this
+# workspace's.
+exclude = ["vendor/smithay"]
+members = ["crates/deckjack-app", "crates/deckjack-core", "crates/deckjack-editor", "crates/deckjack-files", "crates/deckjack-notes", "crates/deckjack-office", "crates/deckjack-photo", "crates/deckjack-protocol", "crates/deckjack-stream", "crates/deckjack-tasks", "crates/deckjack-video", "xtask"]
 
 [workspace.package]
 version = "0.1.0"

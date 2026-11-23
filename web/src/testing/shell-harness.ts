@@ -33,6 +33,7 @@ import { createQuickLook, openAppVia } from "../shell/quicklook.ts";
 import { bindApps, bindConfirmations, shellCommands } from "../shell/shell-commands.ts";
 import { createAppTable } from "../stores/apps.ts";
 import { createFrameBridge } from "../shell/frame-bridge.ts";
+import { createUiChannel } from "../uiproto/channel.ts";
 import { ref } from "vue";
 
 /** The origin the harness's frame bridge accepts, standing in for the page's. */
@@ -238,6 +239,29 @@ export function harness(options: HarnessOptions = {}): Harness {
   const seat = createSeat({ bus, ui, device });
   const unfollowWindows = followWindows({ bus, windows, seat });
   const stopClosingOverlays = closeOverlaysOnLoss({ seat, ui, quicklook });
+  // The UI channel's debounce runs on the harness clock, like every other
+  // timer here, so `advance()` is what sends a typed field's `changed`.
+  const uiTimers = new Map<number, { entry: { at: number; fn: () => void; dead: boolean } }>();
+  let uiTimer = 0;
+  const uiproto = createUiChannel({
+    bus,
+    windowIds: () => windows.all.value.map((w) => w.id),
+    env: {
+      now: () => clock,
+      setTimeout(fn, ms) {
+        const entry = { at: clock + ms, fn, dead: false };
+        timers.push(entry);
+        uiTimer += 1;
+        uiTimers.set(uiTimer, { entry });
+        return uiTimer as unknown as ReturnType<typeof setTimeout>;
+      },
+      clearTimeout(handle) {
+        const t = uiTimers.get(handle as unknown as number);
+        if (t) t.entry.dead = true;
+      },
+      stats: { rtt: [], frames: [], firstPaint: [] },
+    },
+  });
 
   const shell: Shell = {
     bus,
@@ -252,7 +276,9 @@ export function harness(options: HarnessOptions = {}): Harness {
     apps,
     frames,
     seat,
+    uiproto,
     dispose() {
+      uiproto.dispose();
       unbindApps();
       unfollowWindows();
       stopClosingOverlays();

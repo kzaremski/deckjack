@@ -1,0 +1,42 @@
+[package]
+name = "deckjack-stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Deckjack's headless Wayland compositor: native Linux apps, one Deckjack window per app window"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "deckjack-stream"
+path = "src/main.rs"
+
+[dependencies]
+deckjack-protocol.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+libc.workspace = true
+
+# Linux only: the compositor is Wayland, XWayland and Landlock, none of
+# which exist elsewhere, and a macOS or Android node has no native apps to
+# stream (docs/lanes/8-stream.md).
+[target.'cfg(target_os = "linux")'.dependencies]
+# Vendored and patched (vendor/smithay/Cargo.toml says why). No GPU: the
+# sandbox denies /dev/dri unless an app asks, so the pixman renderer and a
+# CPU encoder are the whole graphics stack.
+smithay = { path = "../../vendor/smithay", default-features = false, features = ["desktop", "renderer_pixman", "wayland_frontend", "xwayland"] }
+# The system's libopenh264, loaded at run time, rather than the crate's
+# bundled source: built here without nasm, the bundled encoder has no SIMD
+# and is several times slower (measured in the brief, S2).
+openh264 = { version = "0.9.10", default-features = false, features = ["libloading"] }
+
+[dev-dependencies]
+deckjack-core = { path = "../deckjack-core" }
+tempfile.workspace = true
+tokio.workspace = true

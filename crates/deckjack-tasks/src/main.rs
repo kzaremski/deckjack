@@ -2,10 +2,12 @@
 //!
 //! A task is a `VTODO` in its own `.ics` file under `Tasks/`. Every rule about
 //! the format is in [`ical`] and every rule about the folder is in [`tasks`];
-//! this file is the seam between those and the bus.
+//! this file is the seam between those and the bus. The window is described
+//! with the UI protocol in [`window`]; the app ships no web page.
 
 mod ical;
 mod tasks;
+mod window;
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,10 +16,6 @@ use deckjack_app::{App, Ctx};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tasks::Fields;
-
-#[derive(rust_embed::RustEmbed)]
-#[folder = "ui"]
-struct Ui;
 
 fn root() -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -116,7 +114,7 @@ where
 
 fn main() -> anyhow::Result<()> {
     App::new(include_str!("../app.toml"))?
-        .ui::<Ui>()
+        .view(window::Tasks::open)
         .command("tasks.list", |_p: NoParams, _cx: Ctx| async move {
             let (tasks, broken) = tasks::list(&root()?).map_err(|e| e.to_string())?;
             Ok(json!({ "tasks": tasks, "unreadable": broken }))

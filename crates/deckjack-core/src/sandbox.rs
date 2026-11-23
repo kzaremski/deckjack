@@ -60,6 +60,40 @@ pub struct Policy {
     pub read_write_files: Vec<PathBuf>,
     /// What the process may do on the network. Denied unless said otherwise.
     pub network: Network,
+    /// Unix sockets and signals across the sandbox's edge. Open unless said
+    /// otherwise; see [`Ipc`] for why, and for what `Scoped` costs.
+    pub ipc: Ipc,
+}
+
+/// Unix sockets and signals that cross the edge of the sandbox.
+///
+/// Landlock ABI 4, which every app is held to, has no rule for either: a
+/// confined process can `connect()` to any pathname Unix socket its uid can
+/// reach (the session D-Bus, the systemd user manager, the operator's own X
+/// server, the desktop compositor's IPC), connect to any abstract socket, and
+/// signal any process of the same uid. Through the session bus that is a way
+/// out of the sandbox altogether (`systemd-run --user`).
+///
+/// [`Ipc::Scoped`] closes all three, and needs Landlock ABI 9
+/// (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`) for pathname sockets and ABI 6 for the
+/// abstract-socket and signal scopes. Everything inside the sandbox's own
+/// domain keeps working: a server socket created by the confined process or
+/// any of its children stays reachable by the others, and they may signal
+/// each other. A kernel without ABI 9 refuses a `Scoped` policy rather than
+/// running it as `Open` ([`CompatLevel::HardRequirement`]).
+///
+/// Streamed native apps are held to `Scoped` (docs/lanes/8-stream.md).
+/// Other apps are still `Open`: requiring ABI 9 of them would refuse every
+/// app on any kernel older than this one, which is a platform decision of
+/// its own, recorded in the lane brief.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Ipc {
+    /// No Unix-socket or signal rule is installed (Landlock ABI 4).
+    #[default]
+    Open,
+    /// Pathname sockets created outside the sandbox only beneath
+    /// `connect_unix`; abstract sockets and signals only within it.
+    Scoped { connect_unix: Vec<PathBuf> },
 }
 
 /// The network half of a [`Policy`].
@@ -126,6 +160,11 @@ impl Policy {
 
     pub fn with_network(mut self, network: Network) -> Policy {
         self.network = network;
+        self
+    }
+
+    pub fn with_ipc(mut self, ipc: Ipc) -> Policy {
+        self.ipc = ipc;
         self
     }
 }
@@ -263,7 +302,7 @@ mod linux {
     use super::*;
     use landlock::{
         ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
-        Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+        Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
     };
     use seccompiler::{SeccompAction, SeccompFilter, TargetArch, apply_filter};
     use std::collections::BTreeMap;
@@ -290,6 +329,32 @@ mod linux {
             },
             Err(reason) => Availability::Unavailable { reason },
         }
+    }
+
+    /// The ABI an [`Ipc::Scoped`] policy needs: 9, for
+    /// `LANDLOCK_ACCESS_FS_RESOLVE_UNIX`. The scopes arrived in 6.
+    const IPC: ABI = ABI::V9;
+
+    /// Whether this kernel can hold a process to [`Ipc::Scoped`], probed
+    /// the same way [`availability`] is: by building the ruleset.
+    pub fn ipc_scoping() -> Result<(), String> {
+        static ANSWER: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+        ANSWER
+            .get_or_init(|| {
+                Ruleset::default()
+                    .set_compatibility(CompatLevel::HardRequirement)
+                    .handle_access(AccessFs::from_all(WANTED) | AccessFs::ResolveUnix)
+                    .and_then(|r| r.scope(Scope::from_all(IPC)))
+                    .and_then(|r| r.create())
+                    .map(|_| ())
+                    .map_err(|e| {
+                        format!(
+                            "this kernel's Landlock cannot keep Unix sockets and signals inside \
+                             a sandbox (that needs ABI 9): {e}"
+                        )
+                    })
+            })
+            .clone()
     }
 
     fn probe() -> Result<(), String> {
@@ -320,12 +385,29 @@ mod linux {
         // (`ReadDir`, `MakeReg`, `RemoveFile`, ...) masked off.
         let file = AccessFs::from_file(WANTED);
 
+        let scoped = matches!(policy.ipc, Ipc::Scoped { .. });
+        // Handled, so denied wherever it is not granted: connecting to a
+        // pathname Unix socket made outside this domain. Granted only by the
+        // `connect_unix` rules below, never as part of `read_write` (whose
+        // rights stay ABI 4's), so a writable tree is not also a tree whose
+        // sockets the process may reach.
+        let handled = if scoped {
+            read_write | AccessFs::ResolveUnix
+        } else {
+            read_write
+        };
+
         let mut ruleset = Ruleset::default()
             // Missing kernel features become errors here rather than a
             // silently weaker sandbox. This is the fail-closed lever.
             .set_compatibility(CompatLevel::HardRequirement)
-            .handle_access(read_write)
+            .handle_access(handled)
             .map_err(|e| SandboxError::Ruleset(e.to_string()))?;
+        if scoped {
+            ruleset = ruleset
+                .scope(Scope::from_all(IPC))
+                .map_err(|e| SandboxError::Ruleset(e.to_string()))?;
+        }
 
         if !policy.network.is_whole() {
             ruleset = ruleset
@@ -348,6 +430,11 @@ mod linux {
         }
         for path in &policy.read_write_files {
             created = add_path(created, path, read_write & file)?;
+        }
+        if let Ipc::Scoped { connect_unix } = &policy.ipc {
+            for path in connect_unix {
+                created = add_path(created, path, AccessFs::ResolveUnix.into())?;
+            }
         }
 
         // Denying the network is the ABSENCE of any NetPort rule after having
@@ -512,12 +599,24 @@ mod linux {
             reason: "not Linux".to_string(),
         })
     }
+
+    pub fn ipc_scoping() -> Result<(), String> {
+        Err("Landlock is Linux-only".to_string())
+    }
 }
 
 /// Whether this host can confine a process. Check before launching, so the
 /// refusal is a clear message rather than a failure part-way in.
 pub fn availability() -> Availability {
     linux::availability()
+}
+
+/// Whether this host can hold a process to [`Ipc::Scoped`] (Landlock ABI
+/// 9). Asked before a launch that needs it, so the refusal is a sentence
+/// rather than an `EINVAL` from the forked child; [`apply`] refuses on its
+/// own either way.
+pub fn ipc_scoping() -> Result<(), String> {
+    linux::ipc_scoping()
 }
 
 /// Confine the calling process to `policy`.
@@ -583,6 +682,7 @@ mod tests {
         assert!(p.read_files.is_empty());
         assert!(p.read_write_files.is_empty());
         assert!(p.network.is_denied(), "network must be opt-in, not opt-out");
+        assert_eq!(p.ipc, Ipc::Open);
     }
 
     #[test]

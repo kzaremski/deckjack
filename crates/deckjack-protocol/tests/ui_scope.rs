@@ -298,3 +298,42 @@ fn an_app_without_a_ui_table_keeps_the_fingerprint_it_had() {
     let empty = parse(&app("notes", "\n[ui]\n")).unwrap();
     assert_eq!(absent.fingerprint(), empty.fingerprint());
 }
+
+// ---------------------------------------------------------------------------
+// The UI protocol: its namespace and the manifest's tier
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_ui_protocol_namespace_is_reserved_and_hard_denied_to_windows() {
+    // `ui.snapshot` reads any window's tree; a window reading another's is
+    // what isolation exists to stop. The control is an app's own command.
+    assert!(is_reserved_namespace("ui"));
+    assert!(is_hard_denied("ui.snapshot"));
+    assert!(!is_hard_denied("uix.snapshot"));
+    parse(&ui("demo", &["demo.go"], &[])).expect("the control: the app's own command");
+    let message = refused(&ui("demo", &["ui.snapshot"], &[]));
+    assert!(message.contains("ui.snapshot"), "{message}");
+    let message = refused(&app("ui", ""));
+    assert!(
+        message.contains("namespace the core itself uses"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_manifest_may_declare_the_ui_protocol_tier_and_no_other() {
+    let m = parse(&app("demo", "tier = 1\n")).expect("tier 1 is the UI protocol");
+    assert_eq!(m.app.tier, Some(deckjack_protocol::TIER_UI_PROTOCOL));
+    assert_eq!(parse(&app("demo", "")).unwrap().app.tier, None);
+    let message = refused(&app("demo", "tier = 2\n"));
+    assert!(message.contains("app.tier 2"), "{message}");
+}
+
+#[test]
+fn the_tier_does_not_change_what_the_operator_approved() {
+    // How a window is drawn is not a permission: switching an app to the UI
+    // protocol must not ask the operator to approve it again.
+    let page = parse(&app("demo", "")).unwrap();
+    let described = parse(&app("demo", "tier = 1\n")).unwrap();
+    assert_eq!(page.fingerprint(), described.fingerprint());
+}

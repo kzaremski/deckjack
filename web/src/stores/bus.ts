@@ -6,6 +6,7 @@ import {
   isPong,
   isProgress,
   isResponse,
+  isUi,
   isWelcome,
   type ClientFrame,
   type CallResult,
@@ -148,9 +149,18 @@ export interface Bus {
      * `cancel` with its correlation id, which a caller does not otherwise
      * learn until the call is over. A response still arrives and resolves
      * the promise. Aborted before the call starts, nothing is sent.
+     *
+     * `asApp` makes the call as that installed app's window rather than as
+     * the shell: the node holds it to the app's scope, and a confirmation
+     * it asks for is redeemed under the same name.
      */
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; asApp?: string },
   ): Promise<CallResult>;
+  /**
+   * Send one UI protocol frame for a window. Dropped while disconnected:
+   * the channel opens its windows again when the bus reconnects.
+   */
+  ui(window: string, body: unknown): boolean;
   /** Ask a running call to stop. A response still arrives for it. */
   cancel(correlation: CorrelationId): void;
   /**
@@ -466,6 +476,11 @@ export function createBus(env: BusEnv): Bus {
         return;
       }
 
+      if (isUi(frame)) {
+        emit({ kind: "ui", window: frame.window, body: frame.body });
+        return;
+      }
+
       if (isEvent(frame)) emit(topicToEvent(frame.topic, frame.payload));
     };
 
@@ -514,6 +529,8 @@ export function createBus(env: BusEnv): Bus {
       seq += 1;
       const correlation = `c${seq}`;
       const signal = options?.signal;
+      const asApp = options?.asApp;
+      const app = asApp ? { as_app: asApp } : {};
 
       if (signal?.aborted) {
         return { id: correlation, status: "error", message: `${id} was cancelled before it ran` };
@@ -557,8 +574,8 @@ export function createBus(env: BusEnv): Bus {
           if (onProgress) progressHandlers.set(corr, onProgress);
           send(
             ticket === null
-              ? { type: "invoke", id: corr, command: id, params: params ?? {} }
-              : { type: "confirm", id: corr, ticket, command: id, params: params ?? {} },
+              ? { type: "invoke", id: corr, command: id, params: params ?? {}, ...app }
+              : { type: "confirm", id: corr, ticket, command: id, params: params ?? {}, ...app },
           );
         });
 
@@ -612,6 +629,11 @@ export function createBus(env: BusEnv): Bus {
     },
     onConfirm(ask) {
       askToConfirm = ask;
+    },
+    ui(window, body) {
+      if (status.value !== "open" || !socket) return false;
+      send({ type: "ui", window, body });
+      return true;
     },
     cancel(correlation) {
       // Cooperative: a response still arrives, so nothing is cleaned up here.

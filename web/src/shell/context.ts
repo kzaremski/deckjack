@@ -34,6 +34,7 @@ import { bindApps, bindConfirmations, shellCommands } from "./shell-commands.ts"
 import { browserViewportEnv, createViewport, type Viewport } from "./viewport.ts";
 import { createQuickLook, openAppVia, type QuickLookStore } from "./quicklook.ts";
 import { createFrameBridge, type FrameBridge } from "./frame-bridge.ts";
+import { browserUiChannelEnv, createUiChannel, type UiChannel } from "../uiproto/channel.ts";
 
 /**
  * The composition root.
@@ -66,6 +67,8 @@ export interface Shell {
   frames: FrameBridge;
   /** Whether this connection is the one using the workspace. */
   seat: SeatStore;
+  /** Windows apps describe over the UI protocol, and their channel. */
+  uiproto: UiChannel;
   dispose(): void;
 }
 
@@ -147,6 +150,8 @@ export function createShell(): Shell {
       case "windows":
       case "node":
       case "seat":
+      // UI protocol frames are the channel's, below.
+      case "ui":
       // Progress is no longer an event: it is correlated to a call and
       // delivered to that call's own handler, so a stray one cannot be
       // attributed to the wrong command.
@@ -172,6 +177,12 @@ export function createShell(): Shell {
   const onFrameMessage = (event: MessageEvent) => frames.handle(event);
   window.addEventListener("message", onFrameMessage);
 
+  const uiproto = createUiChannel({
+    bus,
+    windowIds: () => windows.all.value.map((w) => w.id),
+    env: browserUiChannelEnv(),
+  });
+
   return {
     bus,
     windows,
@@ -185,8 +196,10 @@ export function createShell(): Shell {
     apps,
     frames,
     seat,
+    uiproto,
     dispose() {
       window.removeEventListener("message", onFrameMessage);
+      uiproto.dispose();
       unbindApps();
       unfollowWindows();
       stopClosingOverlays();

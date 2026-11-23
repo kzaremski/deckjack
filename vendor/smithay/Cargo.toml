@@ -1,0 +1,216 @@
+# Vendored from smithay 0.7.0 (crates.io, MIT) and trimmed for Deckjack
+# (docs/lanes/8-stream.md). One change to upstream's code: XWayland can
+# listen on an abstract socket only, with no lock file or socket in /tmp,
+# because Deckjack's sandbox grants an app no /tmp (see "Deckjack" in
+# src/xwayland/x11_sockets.rs and src/xwayland/xserver.rs). Removed with
+# their sources: the drm, egl, gbm, libinput, session, udev, vulkan, winit
+# and x11 backends, the gles, glow, multigpu and test renderers, examples
+# and benches.
+
+# Its own workspace: it is not one of Deckjack's crates, and with no table
+# here cargo would look for a workspace above it.
+[workspace]
+
+[package]
+edition = "2021"
+rust-version = "1.80.1"
+name = "smithay"
+version = "0.7.0"
+authors = [
+    "Victor Berger <victor.berger@m4x.org>",
+    "Drakulix (Victoria Brekenfeld)",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Smithay is a library for writing wayland compositors."
+homepage = "https://smithay.github.io/"
+readme = "README.md"
+keywords = [
+    "wayland",
+    "compositor",
+    "graphics",
+    "server",
+]
+categories = ["gui"]
+license = "MIT"
+repository = "https://github.com/Smithay/smithay"
+
+[features]
+# Trimmed for Deckjack: only what a headless, software-rendered compositor
+# with XWayland uses. The backends, the GL and Vulkan renderers and their
+# optional dependencies were removed with their sources.
+default = []
+desktop = []
+renderer_pixman = ["pixman"]
+wayland_frontend = [
+    "wayland-server",
+    "wayland-protocols",
+    "wayland-protocols-misc",
+    "wayland-protocols-wlr",
+    "tempfile",
+]
+x11rb_event_source = ["x11rb"]
+xwayland = [
+    "encoding_rs",
+    "wayland_frontend",
+    "x11rb/composite",
+    "x11rb/xfixes",
+    "x11rb/randr",
+    "x11rb_event_source",
+    "scopeguard",
+]
+
+[lib]
+name = "smithay"
+path = "src/lib.rs"
+
+[dependencies.appendlist]
+version = "1.4"
+
+
+[dependencies.atomic_float]
+version = "1.1.0"
+
+
+[dependencies.bitflags]
+version = "2.2.1"
+
+
+[dependencies.calloop]
+version = "0.14.0"
+
+
+[dependencies.cgmath]
+version = "0.18.0"
+
+
+[dependencies.cursor-icon]
+version = "1.2.0"
+
+
+[dependencies.downcast-rs]
+version = "1.2.0"
+
+
+[dependencies.drm-fourcc]
+version = "^2.2.0"
+
+
+[dependencies.encoding_rs]
+version = "0.8.33"
+optional = true
+
+
+[dependencies.errno]
+version = "0.3.5"
+
+
+[dependencies.indexmap]
+version = "2.0"
+
+
+[dependencies.libc]
+version = "0.2.103"
+
+
+[dependencies.pixman]
+version = "0.2.1"
+features = [
+    "drm-fourcc",
+    "sync",
+]
+optional = true
+
+
+[dependencies.profiling]
+version = "1.0.13"
+
+
+[dependencies.rand]
+version = "0.9.0"
+
+
+[dependencies.rustix]
+version = "1.0.7"
+features = [
+    "event",
+    "fs",
+    "mm",
+    "net",
+    "pipe",
+    "process",
+    "shm",
+    "time",
+]
+
+
+[dependencies.scopeguard]
+version = "1.1.0"
+optional = true
+
+
+[dependencies.sha2]
+version = "0.10.9"
+
+
+[dependencies.smallvec]
+version = "1.11"
+
+
+[dependencies.tempfile]
+version = "3.0"
+optional = true
+
+
+[dependencies.thiserror]
+version = "2.0.12"
+
+
+[dependencies.tracing]
+version = "0.1.37"
+
+
+[dependencies.wayland-backend]
+version = "0.3.10"
+optional = true
+
+
+[dependencies.wayland-protocols]
+version = "0.32.8"
+features = [
+    "unstable",
+    "staging",
+    "server",
+]
+optional = true
+
+
+[dependencies.wayland-protocols-misc]
+version = "0.3.8"
+features = ["server"]
+optional = true
+
+
+[dependencies.wayland-protocols-wlr]
+version = "0.3.8"
+features = ["server"]
+optional = true
+
+
+[dependencies.wayland-server]
+version = "0.31.9"
+optional = true
+
+
+[dependencies.x11rb]
+version = "0.13.0"
+features = ["res"]
+optional = true
+
+
+[dependencies.xkbcommon]
+version = "0.8.0"
+features = ["wayland"]

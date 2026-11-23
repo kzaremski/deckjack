@@ -41,6 +41,7 @@ const webkitLaunch: LaunchOptions = existsSync(WEBKIT_COMPAT)
 
 const SHELL = /shell\.e2e\.ts$/;
 const SPIKE = /spike[\\/].*\.e2e\.ts$/;
+const MEASURE = /tier1[\\/].*\.e2e\.ts$/;
 
 export default defineConfig<ShellOptions>({
   testDir: ".",
@@ -83,5 +84,8 @@ export default defineConfig<ShellOptions>({
       testMatch: SPIKE,
       use: { ...devices["Desktop Safari"], launchOptions: webkitLaunch },
     },
+    // The UI protocol's phase-0 numbers (docs/lanes/9-tier1-phase0.md),
+    // written to test-results/tier1-measurements.json.
+    { name: "tier1-measure", testMatch: MEASURE, use: { ...devices["Desktop Chrome"], mode: "desktop" } },
   ],
 });

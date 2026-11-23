@@ -19,8 +19,9 @@ export const TARGET = process.env.CARGO_TARGET_DIR
   ? resolve(process.env.CARGO_TARGET_DIR)
   : join(ROOT, "target");
 
-/** The debug build the harness runs. */
-export const BIN = join(TARGET, "debug");
+/** The build the harness runs: debug, or release with `DJ_E2E_RELEASE=1` (for measuring). */
+export const RELEASE = process.env.DJ_E2E_RELEASE === "1";
+export const BIN = join(TARGET, RELEASE ? "release" : "debug");
 
 /**
  * The apps installed into every scratch node. The shell smoke tests use both.
@@ -32,6 +33,8 @@ export const BIN = join(TARGET, "debug");
 export const APPS = [
   { crate: "files", name: "filer" },
   { crate: "editor", name: "scribe" },
+  // On the UI protocol: no page, its window drawn by the shell.
+  { crate: "tasks", name: "tasks" },
 ] as const;
 
 /**

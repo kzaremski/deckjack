@@ -55,7 +55,7 @@ The success test is using the computer through Deckjack full time; every time I 
 - **Installed as a PWA in its own window,** with the Keyboard Lock API in Chromium so Deckjack gets Ctrl/Cmd+W, T, Tab and Escape instead of the browser.
 - **Files in and out of the machine I'm sitting at:** drag and drop into Files, the File System Access API in Chromium, and WebDAV for the host's file manager.
 - **The web stays in the real browser.** Links open in browser tabs; the session browser is only for agents and locked-down machines.
-- **Honest exceptions:** games and native-only pro apps stay outside. Calls and printing go through the browser.
+- **Honest exceptions:** games stay outside, and native-only Linux apps are streamed window by window rather than rebuilt (see non-goals). Calls and printing go through the browser.
 - **Boot straight into it.** On a Linux laptop the login session can be a full-screen Chromium in app mode (`--app=https://deckjack.zarem.ski --kiosk`) or a minimal Wayland compositor such as `cage` running only the browser, with the server local so it works offline: effectively my own Chromebook.
 
 ## Goals and non-goals
@@ -72,18 +72,36 @@ The goal is a daily-driver computer for the overwhelming majority of my tasks, u
 
 **Non-goals**
 
-- **Pixel-streamed UI.** No VNC, RDP, Kasm-style desktops or remote X sessions as an app's interface. If an app only exists as a native desktop window, it is out of scope until it has a web front end.
+- **Pixel-streamed UI as the way apps are built.** No VNC, RDP or Kasm-style desktops. Deckjack's own apps always have a web front end. A native-only app may be streamed, as the marked exception below, but streaming never counts toward the suite.
 - Multi-user or team hosting.
 - Electron or native wrappers as the primary client. A PWA install is fine.
 - Replacing the OS. Nodes keep their normal OS; this is a layer on top.
 
-**The one exception: streamed content, never streamed UI.** Video frames are allowed where the content itself is video: the FilmCraft program monitor, and a live view of an external web page inside the session browser. The controls around them are always web UI.
+**Exception: streamed content.** Video frames are allowed where the content itself is video: the FilmCraft program monitor, and a live view of an external web page inside the session browser. The controls around them are always web UI.
+
+**Exception: native-only apps, streamed window by window** (decided 2026-11-22; [docs/lanes/8-stream.md](lanes/8-stream.md)).
+
+- A native Linux app the suite has no web UI for can run on a Linux node under Deckjack's own Wayland compositor (Smithay, headless, with XWayland for X11 apps). Each top-level window and popup becomes its own Deckjack window, Deckjack chrome around the app's pixels, encoded as H.264 and decoded in the browser (WebCodecs).
+- Linux nodes only. No macOS or Android capture.
+- 96 dpi, scale 1, everywhere: apps see one logical 1920x1080 output like a 1080p monitor, whatever device looks. The browser scales the picture; the app never learns client density.
+- Marked as streamed in the dock and on the window.
+- Only the device holding the seat sends input; a takeover moves the streams with the workspace (the new holder is sent a keyframe).
+- Confined like any app: spawned by the core under Landlock and seccomp with a manifest; native apps are children of the compositor. On top of an app's sandbox, a native app cannot connect to a Unix socket or signal a process outside its own sandbox (Landlock ABI 9); a node whose kernel cannot enforce that does not stream native apps. The sandbox denies the GPU, so rendering is Smithay's software (pixman) renderer and encoding is on the CPU.
+
+**The second exception: streamed native apps** (decided 2026-11-22; scoped in `docs/lanes/8-stream.md`). A native Linux app the suite has no web UI for can run on a Linux node under Deckjack's own Wayland compositor (Smithay, headless, with XWayland for X11 apps). Each of its top-level windows and popups becomes its own Deckjack window, with Deckjack's chrome around it and the app's pixels inside, encoded as H.264 and decoded in the browser. Fixed rules:
+
+- **Linux nodes only.** No macOS or Android capture.
+- **96 dpi, scale 1, everywhere.** Apps see one logical 1920×1080 output, like a 1080p monitor, whatever device is looking. The browser scales the picture; the app never learns the client's density.
+- **Marked as streamed** in the dock and on the window, so it is always clear which kind of window is in front.
+- **The seat holds input.** Only the device holding the seat sends keyboard and pointer events, and a takeover moves the streams with the workspace.
+- **Confined like any app:** spawned by the core under Landlock and seccomp with a manifest, as children of the compositor.
+- **Every reach for a streamed app still goes on the daily-driver list.** It keeps a task in Deckjack; it doesn't make that task done.
 
 ## Core principles
 
 These rules decide every design question below; when a feature conflicts with one, the feature changes.
 
-1. **Web-native or not at all.** Every control is rendered by the browser from my own components. Canvas and WebGPU are allowed for surfaces that need them (timelines, monitors, scopes, waveforms), but they draw with the same tokens as the DOM.
+1. **Web-native by default; streamed only when native-only.** Every control of Deckjack's own apps is rendered by the browser from my own components. Canvas and WebGPU are allowed for surfaces that need them (timelines, monitors, scopes, waveforms), but they draw with the same tokens as the DOM. An app that exists only as a native Linux window is streamed window by window (see the exceptions under non-goals), marked as streamed, inside Deckjack's own chrome; it is never the way to use an app the suite has a web UI for.
 2. **Structured first, terminal second.** A CLI tool gets a typed adapter and a real UI for its common paths. The raw terminal stays available as the escape hatch, never as the main interface.
 3. **Everything is a command.** Each app action has an id, typed parameters, a risk level and an enabled state. The UI, keyboard shortcuts, the command palette, the CLI and agents all dispatch the same commands.
 4. **Agents ask, I act.** My own actions run directly, with ordinary confirmations for destructive ones. Agent commands above a risk threshold wait in the Inbox, which is part of the Assistant. Agents get no back door.

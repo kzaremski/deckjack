@@ -18,3 +18,25 @@ interface KeyboardLockApi {
 interface Navigator {
   readonly keyboard?: KeyboardLockApi;
 }
+
+/**
+ * The app kit's selection rules (`public/kit/selection.js`), which the UI
+ * protocol's list uses too, so a described list and a page's list select
+ * the same way. Plain JavaScript, typed here.
+ */
+declare module "*/public/kit/selection.js" {
+  export interface KitSelection {
+    setItems(keys: string[]): void;
+    click(key: string, modifiers?: { toggle?: boolean; extend?: boolean }): void;
+    move(delta: number, modifiers?: { extend?: boolean }): void;
+    selectAll(): void;
+    clear(): void;
+    setMode(on: boolean): void;
+    readonly mode: boolean;
+    readonly selected: string[];
+    has(key: string): boolean;
+    readonly cursor: string | null;
+    readonly items: string[];
+  }
+  export function createSelection(options?: { onChange?: (s: KitSelection) => void }): KitSelection;
+}

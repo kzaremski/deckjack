@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 import { useShell } from "../shell/context.ts";
+import { isPopup } from "../stores/windows.ts";
 
 /**
  * The bar: the launcher, what is running, the layout, and the state of the node.
@@ -94,7 +95,8 @@ const latency = computed(() => {
 
 const items = computed(() =>
   shell.apps.dock.value.map((app) => {
-    const open = shell.windows.all.value.filter((w) => w.app === app.id);
+    // A streamed popup is part of its parent window, not one to act on.
+    const open = shell.windows.all.value.filter((w) => w.app === app.id && !isPopup(w));
     const focused = open.find((w) => !w.minimized && w.id === shell.windows.focusedId.value);
     return {
       app,
@@ -172,10 +174,12 @@ function activate(id: string, windowId: string | null, active: boolean) {
         <span
           class="tag"
           :data-accent="item.app.id === 'assistant' ? '' : undefined"
+          :data-streamed="item.app.streamed ? '' : undefined"
           aria-hidden="true"
           >{{ item.app.tag }}</span
         >
         <span class="label">{{ item.app.title }}</span>
+        <span v-if="item.app.streamed" class="dj-sr">, streamed native app</span>
         <span v-if="item.badge > 0" class="badge">
           {{ item.badge }}
           <span class="dj-sr">approvals waiting</span>
@@ -404,6 +408,12 @@ function activate(id: string, windowId: string | null, active: boolean) {
 .tag[data-accent] {
   background: var(--dj-color-accent);
   color: var(--dj-color-text-on-accent);
+}
+
+/* A streamed native app: a dashed outline, as its window says "Streamed". */
+.tag[data-streamed] {
+  outline: 1px dashed var(--dj-color-text-dim);
+  outline-offset: -1px;
 }
 
 .badge {

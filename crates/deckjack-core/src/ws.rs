@@ -398,6 +398,16 @@ pub enum ClientFrame {
         #[serde(default)]
         token: Option<String>,
     },
+
+    /// The UI protocol's per-window channel, browser to node: open a window
+    /// an app describes, send it an event, close it. `body` is carried, not
+    /// read, by this module; [`UiRelay`] decides what it means and whether
+    /// this connection may say it (the single seat).
+    Ui {
+        window: String,
+        #[serde(default)]
+        body: Value,
+    },
 }
 
 /// Server to browser.
@@ -445,6 +455,10 @@ pub enum ServerFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
+    /// The UI protocol's per-window channel, node to browser: a window's
+    /// patches, or its status. Pushed to the connections showing that
+    /// window, never broadcast. See [`Hub::send_ui`].
+    Ui { window: String, body: Value },
 }
 
 /// What a command reports while it runs. Every field optional on purpose: a
@@ -609,6 +623,18 @@ pub trait Presence: Send + Sync + 'static {
     /// The connection ended, for whatever reason. Called once, and only for
     /// a connection that `joined`.
     fn left(&self, connection: ConnectionId);
+}
+
+/// Where the UI protocol's per-window frames go (`ClientFrame::Ui`).
+///
+/// A third outward port beside [`Dispatch`] and [`Presence`], and like them
+/// a trait so this module carries the frames without knowing what a window,
+/// an app or the seat is. Called from the connection's own task between
+/// frames, so it must not block.
+pub trait UiRelay: Send + Sync + 'static {
+    /// One frame from a connection whose session the upgrade verified and
+    /// the periodic recheck still holds good.
+    fn upstream(&self, connection: ConnectionId, window: String, body: Value);
 }
 
 /// A [`Presence`] that listens to nothing, for a transport tested on its own.
@@ -1095,6 +1121,22 @@ impl Hub {
             .is_some_and(|conn| conn.out.try_send(Outbound::Frame(frame)).is_ok())
     }
 
+    /// Push one UI protocol frame to one connection.
+    ///
+    /// `None` when there is no such connection (it closed), `Some(false)`
+    /// when its queue was full and the frame was dropped, which the relay
+    /// answers by sending that connection a whole fresh tree next time
+    /// rather than patches it can no longer apply.
+    pub fn send_ui(&self, connection: ConnectionId, window: &str, body: Value) -> Option<bool> {
+        let frame = ServerFrame::Ui {
+            window: window.to_string(),
+            body,
+        };
+        self.connections()
+            .get(&connection)
+            .map(|conn| conn.out.try_send(Outbound::Frame(frame)).is_ok())
+    }
+
     /// Push an event only to the connections belonging to one session.
     pub fn publish_to_session(
         &self,
@@ -1180,6 +1222,11 @@ pub struct WsCtx {
     node_id: String,
     host_name: String,
     settings: Settings,
+    /// The UI protocol relay, attached after construction so the
+    /// constructor every caller and test uses is unchanged. Unattached, a
+    /// `ui` frame is ignored: no window can be drawn, and nothing else is
+    /// affected.
+    ui: std::sync::OnceLock<Arc<dyn UiRelay>>,
 }
 
 impl WsCtx {
@@ -1206,11 +1253,20 @@ impl WsCtx {
             node_id,
             host_name,
             settings,
+            ui: std::sync::OnceLock::new(),
         })
     }
 
     pub fn hub(&self) -> &Arc<Hub> {
         &self.hub
+    }
+
+    /// Carry `ui` frames to this relay. Once, at startup; a second call is
+    /// ignored rather than swapping the relay under open windows.
+    pub fn attach_ui(&self, relay: Arc<dyn UiRelay>) {
+        if self.ui.set(relay).is_err() {
+            tracing::warn!("a UI relay is already attached; the second was ignored");
+        }
     }
 
     fn now(&self) -> Now {
@@ -1634,6 +1690,14 @@ fn handle(
         // dropped pong is the correct signal, not something to block on.
         ClientFrame::Ping { token } => {
             let _ = out.try_send(Outbound::Frame(ServerFrame::Pong { token }));
+            None
+        }
+
+        ClientFrame::Ui { window, body } => {
+            match ctx.ui.get() {
+                Some(relay) => relay.upstream(conn, window, body),
+                None => tracing::debug!(%conn, "ui frame ignored: no relay attached"),
+            }
             None
         }
 

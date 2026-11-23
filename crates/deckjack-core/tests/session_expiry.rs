@@ -272,6 +272,7 @@ async fn the_assembled_node_reaps_expired_sessions_on_its_own() {
         None,
         None,
         files,
+        None,
     );
 
     assert!(

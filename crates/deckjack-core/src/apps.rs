@@ -584,6 +584,26 @@ impl Env for OsEnv {
             command.env(key, value);
         }
         command.current_dir(&plan.cwd);
+        if !plan.pass_fds.is_empty() {
+            let fds = plan.pass_fds.clone();
+            // SAFETY: runs in the forked child before exec, after the
+            // sandbox's own hook; fcntl is async-signal-safe and touches
+            // only this process's descriptor table.
+            unsafe {
+                use std::os::unix::process::CommandExt as _;
+                command.pre_exec(move || {
+                    for &fd in &fds {
+                        let flags = libc::fcntl(fd, libc::F_GETFD);
+                        if flags < 0
+                            || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                        {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
         // No stdin: an app that reads from the terminal would block on the
         // core's. stdout and stderr are inherited so an app's panic lands in
         // the same journal as the core's.
@@ -781,6 +801,12 @@ pub struct LaunchPlan {
     /// granted paths in.
     pub cwd: PathBuf,
     pub socket: PathBuf,
+    /// Descriptors the child keeps across `exec`, at the same numbers. Each
+    /// is close-on-exec in this process (so no other child spawned at the
+    /// same time inherits it) and is opened up only in this child, after
+    /// the sandbox is applied. The streamed apps' link to the core is one:
+    /// a socket pair, so there is no socket path for anyone else to race.
+    pub pass_fds: Vec<i32>,
     pub env: Vec<(String, String)>,
     pub sandbox: Sandbox,
     /// Decided by the node, never by the app. Carried on the plan so
@@ -931,6 +957,31 @@ impl LaunchPlan {
         working_dir: &Path,
         confinement: Confinement,
         env: &dyn Env,
+    ) -> Result<LaunchPlan, ConfinementError> {
+        let private_root = install_dir.join(CACHE_SUBDIR).join(APPS_SUBDIR);
+        LaunchPlan::build_in(
+            installed,
+            install_dir,
+            working_dir,
+            confinement,
+            env,
+            &private_root,
+        )
+    }
+
+    /// [`LaunchPlan::build`], with the app's private `HOME` and `TMPDIR`
+    /// under `private_root/<name>/` instead of `cache/apps/<name>/`.
+    ///
+    /// For a launcher whose names are not app names: a streamed native app
+    /// (`crate::stream`) called `notes` must not be handed the Notes app's
+    /// private, writable tree.
+    pub fn build_in(
+        installed: &Installed,
+        install_dir: &Path,
+        working_dir: &Path,
+        confinement: Confinement,
+        env: &dyn Env,
+        private_root: &Path,
     ) -> Result<LaunchPlan, ConfinementError> {
         let app = installed.manifest.app.name.clone();
         let needs = &installed.manifest.needs;
@@ -1119,7 +1170,7 @@ impl LaunchPlan {
         // bound. A missing path takes the whole ruleset down, so it is created
         // here rather than hoped for.
         let run = install_dir.join(RUN_SUBDIR);
-        let private = install_dir.join(CACHE_SUBDIR).join(APPS_SUBDIR).join(&app);
+        let private = private_root.join(&app);
         let home = private.join("home");
         let tmp = private.join("tmp");
         for dir in [&run, &home, &tmp] {
@@ -1168,6 +1219,7 @@ impl LaunchPlan {
             args: Vec::new(),
             cwd: working_dir.to_path_buf(),
             socket: socket.clone(),
+            pass_fds: Vec::new(),
             env: vec![
                 ("DECKJACK_APP".to_string(), app),
                 (

@@ -1,0 +1,122 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>stream decode spike</title>
+<canvas id="c"></canvas>
+<script>
+  // Spike S3 (docs/lanes/8-stream.md): decode deckjack-stream's H.264, as
+  // the stream socket carries it, with WebCodecs. The answer is left in
+  // window.result for the test to read.
+  async function run(sample) {
+    const out = { engine: navigator.userAgent, hasVideoDecoder: typeof VideoDecoder === "function" };
+    if (!out.hasVideoDecoder) return out;
+    const bytes = new Uint8Array(await (await fetch(sample)).arrayBuffer());
+    const pictures = [];
+    for (let at = 0; at < bytes.length; ) {
+      const len = new DataView(bytes.buffer, at, 4).getUint32(0, true);
+      pictures.push(bytes.subarray(at + 4, at + 4 + len));
+      at += 4 + len;
+    }
+    const first = pictures[0];
+    const view = new DataView(first.buffer, first.byteOffset);
+    const width = view.getUint16(1, true);
+    const height = view.getUint16(3, true);
+    // The codec string from the SPS: avc1.PPCCLL.
+    const sps = first.subarray(9 + 5, 9 + 8);
+    const hex = (n) => n.toString(16).padStart(2, "0");
+    const codec = `avc1.${hex(sps[0])}${hex(sps[1])}${hex(sps[2])}`;
+    out.codec = codec;
+    const config = { codec, codedWidth: width, codedHeight: height, optimizeForLatency: true };
+    // `?avc=1`: hand the decoder AVC format (an avcC description, NAL units
+    // prefixed by their length) instead of Annex B, to tell "this engine
+    // wants avcC" apart from "this engine cannot decode H.264 at all".
+    const avc = new URLSearchParams(location.search).get("avc") === "1";
+    const nals = (annexB) => {
+      const units = [];
+      let start = -1;
+      for (let i = 0; i + 3 < annexB.length; i++) {
+        if (annexB[i] === 0 && annexB[i + 1] === 0 && (annexB[i + 2] === 1 || (annexB[i + 2] === 0 && annexB[i + 3] === 1))) {
+          if (start >= 0) units.push(annexB.subarray(start, i));
+          i += annexB[i + 2] === 1 ? 2 : 3;
+          start = i + 1;
+        }
+      }
+      if (start >= 0) units.push(annexB.subarray(start));
+      return units;
+    };
+    const toAvc = (annexB) => {
+      const units = nals(annexB).filter((u) => ![7, 8].includes(u[0] & 0x1f));
+      const size = units.reduce((n, u) => n + 4 + u.length, 0);
+      const out = new Uint8Array(size);
+      let at = 0;
+      for (const u of units) {
+        new DataView(out.buffer).setUint32(at, u.length);
+        out.set(u, at + 4);
+        at += 4 + u.length;
+      }
+      return out;
+    };
+    if (avc) {
+      const units = nals(first.subarray(9));
+      const s = units.find((u) => (u[0] & 0x1f) === 7);
+      const p = units.find((u) => (u[0] & 0x1f) === 8);
+      const d = new Uint8Array(11 + s.length + p.length);
+      d.set([1, s[1], s[2], s[3], 0xff, 0xe1, s.length >> 8, s.length & 0xff]);
+      d.set(s, 8);
+      d.set([1, p.length >> 8, p.length & 0xff], 8 + s.length);
+      d.set(p, 11 + s.length);
+      config.description = d;
+    }
+    out.avc = avc;
+    try {
+      const support = await VideoDecoder.isConfigSupported(config);
+      out.supported = support.supported;
+    } catch (e) {
+      out.supported = false;
+      out.supportError = String(e);
+    }
+    if (!out.supported) return out;
+    const canvas = document.getElementById("c");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    const times = [];
+    const started = new Map();
+    let decoded = 0;
+    let errored = null;
+    const decoder = new VideoDecoder({
+      output(frame) {
+        const t0 = started.get(frame.timestamp);
+        if (t0 !== undefined) times.push(performance.now() - t0);
+        ctx.drawImage(frame, 0, 0);
+        out.frameSize = [frame.codedWidth, frame.codedHeight, frame.displayWidth, frame.displayHeight];
+        frame.close();
+        decoded++;
+      },
+      error(e) {
+        errored = String(e);
+      },
+    });
+    decoder.configure(config);
+    pictures.forEach((p, i) => {
+      const key = (p[0] & 1) === 1;
+      const ts = i * 16_000;
+      started.set(ts, performance.now());
+      const data = avc ? toAvc(p.subarray(9)) : p.subarray(9);
+      decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: ts, data }));
+    });
+    await decoder.flush().catch((e) => (errored = errored ?? String(e)));
+    out.decoded = decoded;
+    out.pictures = pictures.length;
+    out.error = errored;
+    times.sort((a, b) => a - b);
+    out.msMedian = times.length ? times[Math.floor(times.length / 2)] : null;
+    out.msMax = times.length ? times[times.length - 1] : null;
+    // Pixels: the background is light, the text rows dark, the last caret
+    // red (BGRA 0,0,255 is red).
+    const px = (x, y) => Array.from(ctx.getImageData(x, y, 1, 1).data.slice(0, 3));
+    out.background = px(width - 4, height - 4);
+    out.caret = px(20 + 9 * 8, 48);
+    return out;
+  }
+  window.result = run(new URLSearchParams(location.search).get("sample"));
+</script>

@@ -76,6 +76,11 @@ struct Harness {
     /// cannot cover, because an app invokes over its own socket and never
     /// reaches a router.
     bus: Arc<deckjack_core::command::Bus>,
+    /// The streamed apps, so a test can stand a fake compositor in.
+    streams: Arc<deckjack_core::stream::Streams>,
+    /// The auth state, so a test can sign in a second device: the code is
+    /// spent by the first.
+    auth: Arc<std::sync::Mutex<AuthState>>,
     /// Keeps the working directory alive for as long as the server runs.
     _dir: tempfile::TempDir,
 }
@@ -117,6 +122,17 @@ async fn start() -> Harness {
             .expect("the file commands");
     let windows =
         wiring::register_windows(&registry, node_id.clone()).expect("the window commands register");
+    // Streamed native apps, as main.rs builds them: their windows are in
+    // the window list, they follow the seat, and the kill switch stops them.
+    let streams = deckjack_core::stream::Streams::new(
+        dir.path().join("install"),
+        dir.path().to_path_buf(),
+        apps::Policy::default().confinement,
+        Arc::new(apps::OsEnv::new()),
+        Arc::clone(&windows) as _,
+    );
+    windows.attach_streams(Arc::clone(&streams) as _);
+    deckjack_core::stream::register(&registry, &streams).expect("the stream commands register");
     let host_token =
         HostToken::load_or_create(dir.path(), &lockdown::OsRandom).expect("the host unlock token");
     let host_token_text = host_token.reveal().to_string();
@@ -148,7 +164,10 @@ async fn start() -> Harness {
             Arc::clone(&terminals),
             node_id.clone(),
         )),
-        children: Box::new(wiring::TerminalChildren::new(Arc::clone(&terminals))),
+        children: Box::new(lockdown::AllChildren(vec![
+            Box::new(wiring::TerminalChildren::new(Arc::clone(&terminals))),
+            Box::new(Arc::clone(&streams)),
+        ])),
         signals: Box::new(lockdown::OsSignals::new()),
         outbound: approvals.outbound(),
         passkeys: Box::new(lockdown::PasskeysUnavailable),
@@ -206,7 +225,11 @@ async fn start() -> Harness {
     let seat = deckjack_core::seat::Seat::new(
         Arc::clone(&hub),
         Arc::new(ws::SystemClock),
-        vec![Arc::clone(&terminals) as _, Arc::clone(&windows) as _],
+        vec![
+            Arc::clone(&terminals) as _,
+            Arc::clone(&windows) as _,
+            Arc::clone(&streams) as _,
+        ],
     );
     let seat_reaper = Arc::clone(&seat);
     let reaper = Arc::clone(&terminals);
@@ -276,6 +299,12 @@ async fn start() -> Harness {
         Arc::clone(&agent_grants),
     ));
     wiring::register_apps(&registry, Arc::clone(&app_host)).expect("the app commands register");
+    // The UI protocol relay, as main.rs builds it: pushing through the hub,
+    // admitting what the seat admits, reaching apps through the host.
+    let ui_relay =
+        deckjack_core::uirelay::UiChannel::new(Arc::clone(&hub) as _, Arc::clone(&seat) as _);
+    app_host.attach_ui(Arc::clone(&ui_relay));
+    deckjack_core::uirelay::register(&registry, &ui_relay).expect("ui.snapshot registers");
     app_host.start().await;
 
     deckjack_core::seat::register(&registry, &seat).expect("the seat commands register");
@@ -293,6 +322,7 @@ async fn start() -> Harness {
         node::host_name(),
         ws::Settings::default(),
     );
+    ws_ctx.attach_ui(ui_relay);
 
     let passkeys = Arc::new(
         deckjack_core::passkeyhttp::PasskeyCtx::start(
@@ -315,6 +345,7 @@ async fn start() -> Harness {
         Some(Arc::clone(&app_host)),
         Some(passkeys),
         Arc::clone(&files),
+        Some(Arc::clone(&streams)),
     );
     let tcp = TcpListener::bind("127.0.0.1:0")
         .await
@@ -333,6 +364,8 @@ async fn start() -> Harness {
         recovery,
         store,
         bus,
+        streams,
+        auth: state,
         _dir: dir,
     }
 }
@@ -344,6 +377,24 @@ impl Harness {
 
     async fn post(&self, path: &str, headers: &[(&str, &str)], body: &str) -> Response {
         request(self.addr, "POST", path, headers, Some(body)).await
+    }
+
+    /// Another signed-in session, as a second device holds one, admitted
+    /// directly (the one-time code is spent by the first sign-in).
+    fn admit_another(&self) -> String {
+        let id = deckjack_core::auth::SessionId::generate().expect("a session id");
+        let mut events = Vec::new();
+        self.auth
+            .lock()
+            .expect("the auth state")
+            .admit(
+                "127.0.0.1".parse().unwrap(),
+                &id,
+                Now::current(),
+                &mut events,
+            )
+            .expect("the node admits another session");
+        format!("{COOKIE_NAME}={}", id.encode())
     }
 
     /// Sign in with the real code and return the cookie, as a browser holds it.
@@ -466,6 +517,7 @@ fn session_cookie(r: &Response) -> String {
 
 enum Frame {
     Text(String),
+    Binary(Vec<u8>),
     Close { code: u16, reason: String },
 }
 
@@ -482,11 +534,20 @@ impl Ws {
         cookie: Option<&str>,
         origin: Option<&str>,
     ) -> Result<Ws, u16> {
+        Ws::connect_to(addr, ws::PATH, cookie, origin).await
+    }
+
+    /// Open a socket at another path: a streamed window's.
+    async fn connect_to(
+        addr: SocketAddr,
+        path: &str,
+        cookie: Option<&str>,
+        origin: Option<&str>,
+    ) -> Result<Ws, u16> {
         let mut req = format!(
-            "GET {} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
              Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-             Sec-Fetch-Site: same-origin\r\n",
-            ws::PATH
+             Sec-Fetch-Site: same-origin\r\n"
         );
         if let Some(c) = cookie {
             req.push_str(&format!("Cookie: {c}\r\n"));
@@ -583,6 +644,7 @@ impl Ws {
             let payload = self.read_exact(len).await;
             match opcode {
                 0x1 => return Frame::Text(String::from_utf8_lossy(&payload).into_owned()),
+                0x2 => return Frame::Binary(payload),
                 0x8 => {
                     let code = if payload.len() >= 2 {
                         u16::from_be_bytes([payload[0], payload[1]])
@@ -605,6 +667,7 @@ impl Ws {
     async fn expect_json(&mut self) -> Value {
         match self.recv().await {
             Frame::Text(t) => serde_json::from_str(&t).expect("a JSON frame"),
+            Frame::Binary(b) => panic!("expected JSON, got {} binary bytes", b.len()),
             Frame::Close { code, reason } => {
                 panic!("the bus closed instead of answering: {code} {reason}")
             }
@@ -615,6 +678,7 @@ impl Ws {
         match self.recv().await {
             Frame::Close { code, reason } => (code, reason),
             Frame::Text(t) => panic!("expected a close, got a frame: {t}"),
+            Frame::Binary(b) => panic!("expected a close, got {} binary bytes", b.len()),
         }
     }
 
@@ -2284,5 +2348,487 @@ async fn every_namespace_the_core_registers_is_reserved_from_apps() {
             error.contains("namespace the core itself uses"),
             "{namespace}: refused for another reason: {error}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The UI protocol's channel, over the real socket
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_apps_window_cannot_read_another_window_through_ui_snapshot() {
+    let h = start().await;
+    let cookie = h.sign_in().await;
+    let mut ws = Ws::connect(h.addr, Some(&cookie), None)
+        .await
+        .expect("upgrade");
+    ws.hello().await;
+    let refused = ws
+        .invoke_as("filer", "u1", "ui.snapshot", json!({ "window": "w1" }))
+        .await;
+    refused_by_hard_deny(&refused);
+    // The control: the shell itself reaches the command, which answers that
+    // there is no such window rather than refusing who asked.
+    let asked = ws
+        .invoke("u2", "ui.snapshot", json!({ "window": "w1" }))
+        .await;
+    assert_eq!(error_code(&asked), "failed", "{asked}");
+    assert!(error_message(&asked).contains("no described UI"), "{asked}");
+}
+
+#[tokio::test]
+async fn a_ui_frame_reaches_the_relay_and_its_answer_comes_back_on_the_same_socket() {
+    // No app here describes its window, so the relay's answer is a refusal;
+    // what this proves is the path: a `ui` frame from the browser reaches the
+    // relay through `ws`, and the relay's frame reaches this one connection.
+    // And, through the real seat, that a socket which named no device (an
+    // app's own page) is refused before anything else is looked at.
+    let h = start().await;
+    let cookie = h.sign_in().await;
+    async fn ui_answer(ws: &mut Ws) -> Value {
+        ws.send_text(
+            &json!({ "type": "ui", "window": "w1", "body": { "op": "open", "app": "filer" } })
+                .to_string(),
+        )
+        .await;
+        // A deadline: a relay that never answers must fail this, not hang it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame = ws.expect_json().await;
+                if frame["type"] == "ui" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("no ui frame came back within 5 s")
+    }
+    let mut page = Ws::connect(h.addr, Some(&cookie), None)
+        .await
+        .expect("upgrade");
+    page.hello().await;
+    let frame = ui_answer(&mut page).await;
+    assert_eq!(frame["body"]["error"]["code"], "not_a_device", "{frame}");
+
+    let mut ws = Ws::connect(h.addr, Some(&cookie), None)
+        .await
+        .expect("upgrade");
+    ws.send_text(
+        &json!({ "type": "hello", "protocol": ws::PROTOCOL_VERSION, "device": "laptop" })
+            .to_string(),
+    )
+    .await;
+    ws.expect_json().await;
+    let frame = ui_answer(&mut ws).await;
+    assert_eq!(frame["window"], "w1");
+    assert_eq!(frame["body"]["error"]["code"], "not_described", "{frame}");
+    // And the socket is still good afterwards.
+    ok_value(&ws.invoke("u3", "system.status", json!({})).await);
+}
+
+// ---------------------------------------------------------------------------
+// Streamed native apps' sockets
+// ---------------------------------------------------------------------------
+
+/// A streamed window's socket (`/stream`) is admitted on the same terms as
+/// the bus (a session cookie, the page's own origin) and one more: the
+/// session must hold the single seat. Each refusal comes before the window
+/// is even looked up, so the last step, with every check passed, reaches
+/// "no such window" (there is no app running here).
+#[tokio::test]
+async fn a_stream_socket_needs_a_session_the_origin_and_the_seat() {
+    let h = start().await;
+    let path = "/stream?window=stream-9-9";
+    let origin = format!("http://{}", h.addr);
+
+    let status = Ws::connect_to(h.addr, path, None, None).await.err();
+    assert_eq!(status, Some(401), "a stream socket without a session");
+
+    let cookie = h.sign_in().await;
+    let status = Ws::connect_to(h.addr, path, Some(&cookie), Some("http://evil.example"))
+        .await
+        .err();
+    assert_eq!(status, Some(403), "a cross-origin stream socket");
+
+    // Signed in, but nobody holds the seat: no bus socket has joined.
+    let status = Ws::connect_to(h.addr, path, Some(&cookie), Some(&origin))
+        .await
+        .err();
+    assert_eq!(
+        status,
+        Some(409),
+        "a stream socket for a session without the seat"
+    );
+
+    // The session's shell connects and takes the vacant seat.
+    let mut bus = Ws::connect(h.addr, Some(&cookie), Some(&origin))
+        .await
+        .expect("the bus socket");
+    bus.hello().await;
+    let status = Ws::connect_to(h.addr, path, Some(&cookie), Some(&origin))
+        .await
+        .err();
+    assert_eq!(
+        status,
+        Some(404),
+        "with the seat held, only the window is missing"
+    );
+}
+
+/// The stream commands are on the bus with the risks the brief gives them,
+/// and asking for what is declared on a node with nothing declared is an
+/// empty answer, not an error.
+#[tokio::test]
+async fn the_stream_commands_are_on_the_bus() {
+    let h = start().await;
+    let cookie = h.sign_in().await;
+    let mut ws = Ws::connect(h.addr, Some(&cookie), None)
+        .await
+        .expect("upgrade");
+    ws.hello().await;
+    let apps = ws.invoke("s1", "stream.apps", json!({})).await;
+    assert_eq!(ok_value(&apps)["apps"], json!([]));
+    let list = ws.invoke("s2", "stream.list", json!({})).await;
+    assert_eq!(ok_value(&list), &json!([]));
+    let launch = ws
+        .invoke("s3", "stream.launch", json!({ "app": "gimp" }))
+        .await;
+    assert!(
+        error_message(&launch).contains("no native app \"gimp\""),
+        "{launch}"
+    );
+    let mut risks: Vec<(String, String)> = h
+        .bus
+        .list(None)
+        .iter()
+        .filter(|l| l.spec.id().namespace() == "stream")
+        .map(|l| (l.spec.id().to_string(), format!("{:?}", l.spec.risk())))
+        .collect();
+    risks.sort();
+    assert_eq!(
+        risks,
+        vec![
+            ("stream.apps".to_string(), "ReadOnly".to_string()),
+            ("stream.launch".to_string(), "Write".to_string()),
+            ("stream.list".to_string(), "ReadOnly".to_string()),
+            ("stream.stop".to_string(), "Destructive".to_string()),
+        ]
+    );
+}
+
+/// A compositor standing in for the real one: the core's end of its link is
+/// adopted the way `Streams::launch` adopts a spawned compositor's, and the
+/// test holds the other end. Its pid is a real child (`sleep`), so a stop or
+/// a lockdown signals something that exists.
+struct FakeCompositor {
+    instance: u64,
+    link: tokio::net::UnixStream,
+    process: std::process::Child,
+}
+
+impl FakeCompositor {
+    async fn start(h: &Harness) -> FakeCompositor {
+        let process = std::process::Command::new("/usr/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("a stand-in process");
+        let (core_end, link) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let instance = h.streams.adopt("fake", "Fake", process.id(), core_end);
+        let mut fake = FakeCompositor {
+            instance,
+            link,
+            process,
+        };
+        fake.event(&deckjack_protocol::stream::StreamEvent::Mapped {
+            surface: 1,
+            kind: deckjack_protocol::stream::SurfaceKind::Toplevel,
+            parent: None,
+            title: "Fake".into(),
+            width: 100,
+            height: 80,
+            x: 0,
+            y: 0,
+        })
+        .await;
+        let window = fake.window();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !h.streams.list().to_string().contains(&window) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the window never appeared"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        fake
+    }
+
+    fn window(&self) -> String {
+        deckjack_core::stream::window_id(self.instance, 1)
+    }
+
+    fn path(&self) -> String {
+        format!("/stream?window={}", self.window())
+    }
+
+    async fn event(&mut self, event: &deckjack_protocol::stream::StreamEvent) {
+        let json = serde_json::to_vec(event).unwrap();
+        self.link
+            .write_all(&deckjack_protocol::stream::link_frame(
+                deckjack_protocol::stream::KIND_CONTROL,
+                &json,
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn keyframe(&mut self) {
+        let picture = deckjack_protocol::stream::VideoHeader {
+            surface: 1,
+            flags: deckjack_protocol::stream::FLAG_KEYFRAME,
+            width: 100,
+            height: 80,
+            timestamp: 0,
+        }
+        .link_bytes(&[0, 0, 0, 1, 0x65]);
+        self.link
+            .write_all(&deckjack_protocol::stream::link_frame(
+                deckjack_protocol::stream::KIND_VIDEO,
+                &picture,
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// The next command from the core, or `None` after `wait`.
+    async fn command(
+        &mut self,
+        wait: Duration,
+    ) -> Option<deckjack_protocol::stream::StreamCommand> {
+        tokio::time::timeout(wait, async {
+            let mut len = [0u8; 4];
+            self.link.read_exact(&mut len).await.ok()?;
+            let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
+            self.link.read_exact(&mut body).await.ok()?;
+            assert_eq!(body[0], deckjack_protocol::stream::KIND_CONTROL);
+            Some(serde_json::from_slice(&body[1..]).expect("a stream command"))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Every command until `want` matches, within `wait`.
+    async fn until(
+        &mut self,
+        wait: Duration,
+        want: impl Fn(&deckjack_protocol::stream::StreamCommand) -> bool,
+    ) -> Vec<deckjack_protocol::stream::StreamCommand> {
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut seen = Vec::new();
+        while let Some(c) = self
+            .command(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await
+        {
+            let done = want(&c);
+            seen.push(c);
+            if done {
+                break;
+            }
+        }
+        seen
+    }
+}
+
+impl Drop for FakeCompositor {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+}
+
+impl Ws {
+    /// The close frame, stepping over pictures still arriving; `None` when
+    /// nothing closes the socket within `wait`.
+    async fn close_within(&mut self, wait: Duration) -> Option<u16> {
+        tokio::time::timeout(wait, async {
+            loop {
+                match self.recv().await {
+                    Frame::Close { code, .. } => return code,
+                    Frame::Binary(_) | Frame::Text(_) => {}
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+
+    async fn binary_within(&mut self, wait: Duration) -> Option<Vec<u8>> {
+        tokio::time::timeout(wait, async {
+            loop {
+                match self.recv().await {
+                    Frame::Binary(b) => return Some(b),
+                    Frame::Close { .. } => return None,
+                    Frame::Text(_) => {}
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
+
+/// Only the session holding the seat opens a streamed window's socket, and
+/// a takeover closes the old holder's open socket (4403), releases what it
+/// held in the app, and turns the old holder away from then on. Another
+/// signed-in session never gets in while it does not hold the seat.
+#[tokio::test]
+async fn a_streamed_window_follows_the_seat_and_nobody_else_gets_it() {
+    let h = start().await;
+    let origin = format!("http://{}", h.addr);
+    let mut fake = FakeCompositor::start(&h).await;
+    let path = fake.path();
+    let a = h.sign_in().await;
+    let b = h.admit_another();
+    let mut bus_a = Ws::connect(h.addr, Some(&a), Some(&origin))
+        .await
+        .expect("A's bus");
+    bus_a.hello().await;
+
+    // B is signed in and someone holds the seat; B is still not that someone.
+    assert_eq!(
+        Ws::connect_to(h.addr, &path, Some(&b), Some(&origin))
+            .await
+            .err(),
+        Some(409),
+        "a session that does not hold the seat opened a stream"
+    );
+
+    let mut stream_a = Ws::connect_to(h.addr, &path, Some(&a), Some(&origin))
+        .await
+        .expect("the holder's stream socket");
+    let asked = fake
+        .until(Duration::from_secs(5), |c| {
+            matches!(
+                c,
+                deckjack_protocol::stream::StreamCommand::Keyframe { surface: 1 }
+            )
+        })
+        .await;
+    assert!(!asked.is_empty(), "a new viewer did not ask for a keyframe");
+    fake.keyframe().await;
+    let picture = stream_a
+        .binary_within(Duration::from_secs(5))
+        .await
+        .expect("the holder's picture");
+    assert_eq!(picture[0], deckjack_protocol::stream::FLAG_KEYFRAME);
+
+    // B takes over.
+    let mut bus_b = Ws::connect(h.addr, Some(&b), Some(&origin))
+        .await
+        .expect("B's bus");
+    // A shell names its device; only a device can take the seat.
+    bus_b
+        .send_text(
+            &json!({ "type": "hello", "protocol": ws::PROTOCOL_VERSION, "device": "Phone" })
+                .to_string(),
+        )
+        .await;
+    bus_b.expect_json().await;
+    ok_value(&bus_b.invoke("take", "seat.take", json!({})).await);
+    assert_eq!(
+        stream_a.close_within(Duration::from_secs(5)).await,
+        Some(deckjack_core::stream::CLOSE_SEAT),
+        "the old holder's stream stayed open after a takeover"
+    );
+    let seen = fake
+        .until(Duration::from_secs(5), |c| {
+            matches!(c, deckjack_protocol::stream::StreamCommand::ReleaseAll)
+        })
+        .await;
+    assert!(
+        matches!(
+            seen.last(),
+            Some(deckjack_protocol::stream::StreamCommand::ReleaseAll)
+        ),
+        "the app was not told to release what the old device held: {seen:?}"
+    );
+    assert_eq!(
+        Ws::connect_to(h.addr, &path, Some(&a), Some(&origin))
+            .await
+            .err(),
+        Some(409),
+        "the old holder opened a stream after the takeover"
+    );
+    let _stream_b = Ws::connect_to(h.addr, &path, Some(&b), Some(&origin))
+        .await
+        .expect("the new holder's stream socket");
+}
+
+/// An open stream socket is checked again on every input message, not only
+/// at the upgrade: once its session has ended, its next input is refused
+/// (4403) and never reaches the app.
+#[tokio::test]
+async fn an_open_stream_socket_stops_forwarding_input_when_its_session_ends() {
+    let h = start().await;
+    let origin = format!("http://{}", h.addr);
+    let mut fake = FakeCompositor::start(&h).await;
+    let a = h.sign_in().await;
+    let mut bus_a = Ws::connect(h.addr, Some(&a), Some(&origin))
+        .await
+        .expect("A's bus");
+    bus_a.hello().await;
+    let mut stream_a = Ws::connect_to(h.addr, &fake.path(), Some(&a), Some(&origin))
+        .await
+        .expect("the holder's stream socket");
+    let key = json!({ "type": "input", "input": { "type": "key", "code": 30, "pressed": true } })
+        .to_string();
+    // Forwarded while the session is good.
+    stream_a.send_text(&key).await;
+    let seen = fake
+        .until(Duration::from_secs(5), |c| {
+            matches!(c, deckjack_protocol::stream::StreamCommand::Input { .. })
+        })
+        .await;
+    assert!(
+        matches!(
+            seen.last(),
+            Some(deckjack_protocol::stream::StreamCommand::Input { .. })
+        ),
+        "input from the holder was not forwarded: {seen:?}"
+    );
+
+    let out = h.post("/logout", &[("cookie", a.as_str())], "").await;
+    assert!(out.status < 400, "sign-out failed: {}", out.status);
+    stream_a.send_text(&key).await;
+    assert_eq!(
+        stream_a.close_within(Duration::from_secs(1)).await,
+        Some(deckjack_core::stream::CLOSE_SEAT),
+        "input after the session ended did not close the socket"
+    );
+    let after = fake.until(Duration::from_millis(300), |_| false).await;
+    assert!(
+        !after
+            .iter()
+            .any(|c| matches!(c, deckjack_protocol::stream::StreamCommand::Input { .. })),
+        "input from an ended session reached the app: {after:?}"
+    );
+}
+
+/// The kill switch stops streamed apps: their compositors are among the
+/// children it signals.
+#[tokio::test]
+async fn a_lockdown_stops_streamed_apps() {
+    let h = start().await;
+    let mut fake = FakeCompositor::start(&h).await;
+    let report = h.lockdown.engage(lockdown::Trigger::HostCommand);
+    assert!(report.children_seen >= 1, "{report:?}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while fake.process.try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a streamed app's compositor outlived the lockdown: {report:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }

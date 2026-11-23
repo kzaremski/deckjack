@@ -341,6 +341,22 @@ pub trait Children {
     fn running(&self) -> Vec<Child>;
 }
 
+impl<T: Children + ?Sized> Children for std::sync::Arc<T> {
+    fn running(&self) -> Vec<Child> {
+        (**self).running()
+    }
+}
+
+/// Several child tables as one: terminals and streamed apps today, each
+/// kept by its own registry.
+pub struct AllChildren(pub Vec<Box<dyn Children + Send + Sync>>);
+
+impl Children for AllChildren {
+    fn running(&self) -> Vec<Child> {
+        self.0.iter().flat_map(|c| c.running()).collect()
+    }
+}
+
 /// No process supervisor exists yet, so nothing is registered and nothing is
 /// killed. Honest rather than convenient: lockdown works today, and step 2
 /// reports zero instead of pretending.

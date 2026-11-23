@@ -350,6 +350,7 @@ async fn start_with(auto: lockdown::AutoPolicy) -> Node {
         Some(Arc::clone(&app_host)),
         Some(passkeys),
         files,
+        None,
     );
     let tcp = TcpListener::bind("127.0.0.1:0")
         .await

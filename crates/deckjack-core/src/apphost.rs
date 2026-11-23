@@ -107,6 +107,8 @@ enum Outgoing {
         call: u64,
         commands: Vec<AvailableCommand>,
     },
+    /// A UI protocol frame from the relay (`crate::uirelay`).
+    UiFrame(crate::uirelay::ToApp),
 }
 
 /// A connected app, as everything outside the pump sees it.
@@ -136,6 +138,10 @@ pub struct AppHost {
     /// that forgot to attach one. The missing wiring is then an app that
     /// cannot call anything, not an app calling with nobody checking.
     bridge: OnceLock<Arc<AgentBridge>>,
+    /// The UI protocol relay, for apps that describe their windows. Attached
+    /// like the bridge; without one, an app's patches are dropped and no
+    /// window it describes is ever drawn, which is the safe direction.
+    ui: OnceLock<Arc<crate::uirelay::UiChannel>>,
 }
 
 impl AppHost {
@@ -158,7 +164,20 @@ impl AppHost {
             install_dir,
             handshake,
             bridge: OnceLock::new(),
+            ui: OnceLock::new(),
         })
+    }
+
+    /// Relay UI protocol frames through this channel, and let it reach the
+    /// apps through this host. Once, at startup.
+    pub fn attach_ui(self: &Arc<AppHost>, channel: Arc<crate::uirelay::UiChannel>) {
+        let me: Arc<dyn crate::uirelay::UiApps> = Arc::clone(self) as _;
+        channel.attach_apps(Arc::downgrade(&me));
+        if self.ui.set(channel).is_err() {
+            tracing::warn!(
+                "a UI relay is already attached to this app host; the second was ignored"
+            );
+        }
     }
 
     /// Let apps invoke bus commands, through this bridge.
@@ -421,6 +440,21 @@ impl AppHost {
     }
 }
 
+impl crate::uirelay::UiApps for AppHost {
+    fn is_described(&self, app: &str) -> bool {
+        self.host().installed().any(|i| {
+            i.name == app && i.manifest.app.tier == Some(deckjack_protocol::TIER_UI_PROTOCOL)
+        })
+    }
+
+    fn send_ui(&self, app: &str, frame: crate::uirelay::ToApp) -> bool {
+        // Showing or using a window is use: an on-demand app is not stopped
+        // for idleness under an open window.
+        self.host().note_activity(app);
+        self.send(app, Outgoing::UiFrame(frame)).is_some()
+    }
+}
+
 /// Translate an app's registered command into what the bus registers.
 fn declaration(command: &RegisteredCommand) -> Result<Declaration, crate::command::IdError> {
     Ok(Declaration {
@@ -655,6 +689,13 @@ async fn attend(host: Arc<AppHost>, manifest: Manifest, listener: tokio::net::Un
                 let (out, rx) = mpsc::unbounded_channel();
                 host.links().insert(app.clone(), Link { out: out.clone() });
                 host.registered(&app, commands);
+                // Only an app that describes its window is ever sent a UI
+                // frame, so asking a page-serving app for nothing is right.
+                if manifest.app.tier == Some(deckjack_protocol::TIER_UI_PROTOCOL)
+                    && let Some(ui) = host.ui.get()
+                {
+                    ui.app_connected(&app);
+                }
 
                 let invocations = Invocations {
                     host: Arc::clone(&host),
@@ -664,6 +705,9 @@ async fn attend(host: Arc<AppHost>, manifest: Manifest, listener: tokio::net::Un
                 };
                 let reason = pump(conn, rx, invocations).await;
                 host.lost(&app, &reason);
+                if let Some(ui) = host.ui.get() {
+                    ui.app_lost(&app);
+                }
             }
             Err(e) => {
                 // Usually a timeout, and usually because the app is simply
@@ -731,6 +775,18 @@ async fn pump(
                     }
                     Outgoing::Available { call, commands } => {
                         if let Err(e) = conn.send(&CoreFrame::Available { call, commands }).await {
+                            return e.to_string();
+                        }
+                    }
+                    Outgoing::UiFrame(frame) => {
+                        let frame = match frame {
+                            crate::uirelay::ToApp::Open { window } => CoreFrame::UiOpen { window },
+                            crate::uirelay::ToApp::Event { window, event } => {
+                                CoreFrame::UiEvent { window, event }
+                            }
+                            crate::uirelay::ToApp::Close { window } => CoreFrame::UiClose { window },
+                        };
+                        if let Err(e) = conn.send(&frame).await {
                             return e.to_string();
                         }
                     }
@@ -809,6 +865,12 @@ async fn pump(
                     }
                     Ok(AppFrame::Commands { call }) => {
                         invocations.list(call);
+                    }
+                    Ok(AppFrame::UiPatch { window, rev, ack, patches }) => {
+                        match invocations.host.ui.get() {
+                            Some(ui) => ui.patched(&app, &window, rev, ack, patches),
+                            None => tracing::debug!(app = %app, "a UI patch with no relay attached"),
+                        }
                     }
                     // Registration happens once, inside the handshake. A
                     // second one is an app trying to change what it is after

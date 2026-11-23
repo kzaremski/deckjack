@@ -1,6 +1,7 @@
 import { computed, ref, type ComputedRef, type Ref } from "vue";
 
 import type { Size } from "../shell/geometry.ts";
+import { nativeAppId } from "../shell/stream.ts";
 
 /**
  * The app contract.
@@ -39,6 +40,50 @@ export interface AppContract {
   badge?: "inbox";
   /** Sorted after every other app in the dock. */
   last?: boolean;
+  /**
+   * A native Linux app streamed from the node (docs/lanes/8-stream.md),
+   * not a web UI: its id is `native:<name>`, the dock and its windows say
+   * "streamed", and opening it runs `stream.launch` instead of opening an
+   * empty window.
+   */
+  streamed?: string;
+}
+
+/** A native app as `stream.apps` reports it. */
+export interface NativeApp {
+  name: string;
+  title: string;
+  tag?: string;
+  x11: boolean;
+}
+
+/** Parse `stream.apps`. Anything malformed is dropped. */
+export function parseNative(result: unknown): NativeApp[] {
+  const list = (result as { apps?: unknown } | undefined)?.apps;
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((a): a is Record<string, unknown> => typeof a === "object" && a !== null)
+    .filter((a) => typeof a.name === "string" && a.name !== "")
+    .map((a) => ({
+      name: a.name as string,
+      title: typeof a.title === "string" && a.title !== "" ? a.title : (a.name as string),
+      tag: typeof a.tag === "string" && a.tag !== "" ? a.tag : undefined,
+      x11: a.x11 === true,
+    }));
+}
+
+function fromNative(app: NativeApp): AppContract {
+  return {
+    id: nativeAppId(app.name),
+    title: app.title,
+    tag: app.tag ?? tagFrom(app.title),
+    summary: `${app.title}, a native app streamed from this node`,
+    minSize: { w: 120, h: 80 },
+    defaultSize: { ...DEFAULT_SIZE },
+    compact: true,
+    wide: true,
+    streamed: app.name,
+  };
 }
 
 /** What a new window gets when nothing says otherwise. */
@@ -161,6 +206,11 @@ export interface InstalledApp {
   approval?: AppApproval;
   /** What it asks for, in the core's words, for the approval entry. */
   asks?: string;
+  /**
+   * How its window is drawn: absent, the app's own page in a frame; 1, a
+   * tree the app describes over the UI protocol, drawn by the shell.
+   */
+  tier?: number;
 }
 
 export type AppApproval = "not-needed" | "approved" | "required" | "stale" | "unknown";
@@ -201,6 +251,7 @@ export function parseInstalled(result: unknown): InstalledApp[] {
       // the operator for a state the core never reported.
       approval: APPROVALS.find((x) => x === a.approval) ?? "unknown",
       asks: str(a.asks),
+      tier: num(a.tier),
     }))
     .filter((a) => a.name !== "");
 }
@@ -238,6 +289,8 @@ function fromManifest(app: InstalledApp, base: AppContract | undefined): AppCont
 export interface AppTable {
   /** What `system.apps` last reported. */
   installed: Ref<InstalledApp[]>;
+  /** What `stream.apps` last reported: the native apps this node streams. */
+  native: Ref<NativeApp[]>;
   /** Every app the dock, the switcher and the palette offer, in dock order. */
   dock: ComputedRef<AppContract[]>;
   /** The contract for any app id, including one nothing knows: a window
@@ -247,6 +300,8 @@ export interface AppTable {
   isKnown(id: string): boolean;
   /** Installed on this node, so its window shows the app's own UI. */
   isInstalled(id: string): boolean;
+  /** Installed, and describes its window over the UI protocol (`tier = 1`). */
+  isDescribed(id: string): boolean;
   /**
    * Ask the core what is installed.
    *
@@ -261,12 +316,17 @@ export interface AppTable {
 
 export function createAppTable(): AppTable {
   const installed = ref<InstalledApp[]>([]);
+  const native = ref<NativeApp[]>([]);
   const builtinById = new Map(builtinApps.map((a) => [a.id, a]));
 
   const table = computed(() => {
     const byId = new Map<string, AppContract>(builtinById);
     for (const app of installed.value) {
       byId.set(app.name, fromManifest(app, builtinById.get(app.name)));
+    }
+    // `native:` ids cannot collide with an app's name, which has no colon.
+    for (const app of native.value) {
+      byId.set(nativeAppId(app.name), fromNative(app));
     }
     return byId;
   });
@@ -285,6 +345,7 @@ export function createAppTable(): AppTable {
 
   return {
     installed,
+    native,
     dock,
     contract(id) {
       return (
@@ -302,11 +363,19 @@ export function createAppTable(): AppTable {
     },
     isKnown: (id) => table.value.has(id),
     isInstalled: (id) => installed.value.some((a) => a.name === id),
+    isDescribed: (id) => installed.value.some((a) => a.name === id && a.tier === 1),
     async load(call) {
       try {
         installed.value = parseInstalled(await call("system.apps"));
       } catch {
         installed.value = [];
+      }
+      // Absent on a node with no stream registry, and then "none" is the
+      // honest answer, as for `system.apps`.
+      try {
+        native.value = parseNative(await call("stream.apps"));
+      } catch {
+        native.value = [];
       }
     },
   };

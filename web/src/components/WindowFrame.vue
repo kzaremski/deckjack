@@ -172,19 +172,28 @@ const style = computed(() => ({
   // `layer.window` is 10 and `layer.windowFocused` is 500 in the token set:
   // the focused window is lifted over the rest without leaving the band
   // below the dock and the palette.
-  zIndex: String((focused.value ? 500 : 10) + props.window.z),
+  // A streamed popup (a menu) sits over every window, its own parent
+  // included, whichever has focus; still below the snap hint and the dock.
+  zIndex: String((popup.value ? 520 : focused.value ? 500 : 10) + props.window.z),
 }));
+
+/** A native app's window, streamed from the node: marked so on its frame. */
+const streamed = computed(() => !!props.window.stream);
+/** A streamed popup has no chrome: it is the app's menu, placed by the app. */
+const popup = computed(() => props.window.stream?.kind === "popup");
 </script>
 
 <template>
   <section
     class="window"
-    :class="{ focused, dragging: drag !== null, tiled: tiling || offline }"
+    :class="{ focused, dragging: drag !== null, tiled: tiling || offline, popup }"
     :style="style"
-    :aria-label="`${props.window.title} window`"
-    @pointerdown="shell.windows.focus(props.window.id)"
+    :aria-label="popup ? `${props.window.stream?.appTitle ?? 'App'} menu` : `${props.window.title} window`"
+    :data-streamed="streamed ? '' : undefined"
+    @pointerdown="popup || shell.windows.focus(props.window.id)"
   >
     <header
+      v-if="!popup"
       class="bar"
       tabindex="0"
       role="toolbar"
@@ -200,6 +209,11 @@ const style = computed(() => ({
         {{ contract.tag }}
       </span>
       <span class="title">{{ props.window.title }}</span>
+      <span
+        v-if="streamed"
+        class="streamed"
+        title="A native app on the node; its pixels are streamed here"
+      >Streamed</span>
       <span v-if="props.window.snap" class="snapped">{{ props.window.snap }}</span>
       <button
         type="button"
@@ -242,7 +256,7 @@ const style = computed(() => ({
       grip that shows a resize cursor and then does nothing is worse than no
       grip, because it says the window can be resized when it cannot.
     -->
-    <template v-if="!tiling && !offline">
+    <template v-if="!tiling && !offline && !popup">
       <div
         v-for="handle in handles"
         :key="handle"
@@ -357,6 +371,21 @@ const style = computed(() => ({
   font-family: var(--dj-font-mono);
   font-size: var(--dj-type-micro-size);
   color: var(--dj-color-text-dim);
+}
+
+/* "Streamed": these pixels are a native app's, not Deckjack's own UI. */
+.streamed {
+  flex: none;
+  padding-inline: 6px;
+  border: 1px solid var(--dj-color-border);
+  border-radius: 999px;
+  font-size: var(--dj-type-micro-size);
+  color: var(--dj-color-text-dim);
+}
+
+/* A streamed popup: the app's own menu, no Deckjack chrome around it. */
+.window.popup {
+  border-radius: 0;
 }
 
 /*

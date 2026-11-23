@@ -319,10 +319,11 @@ pub fn verdict(method: &Method, path: &str, headers: &HeaderMap) -> Result<(), R
                 } else {
                     Err(Refusal::NoFetchMetadata)
                 }
-            } else if under(path, crate::ws::PATH) {
+            } else if under(path, crate::ws::PATH) || under(path, crate::stream::WS_PATH) {
                 // Rule 4: Chromium sends no Fetch Metadata on a handshake,
                 // so a same-host `Origin` stands in for it. See the module
-                // doc for the measurement.
+                // doc for the measurement. A streamed window's socket is a
+                // socket like the bus's, and held to the same rule.
                 if origin_matches_host(headers) {
                     Ok(())
                 } else {
@@ -609,6 +610,16 @@ mod tests {
         assert_eq!(
             v("/ws", &h(&[("origin", "https://evil.example")])),
             Err(Refusal::NoFetchMetadata)
+        );
+        // A streamed window's socket, the same.
+        assert_eq!(v("/stream", &h(&[])), Err(Refusal::NoFetchMetadata));
+        assert_eq!(
+            v("/stream", &h(&[("origin", "https://evil.example")])),
+            Err(Refusal::NoFetchMetadata)
+        );
+        assert_eq!(
+            v("/stream", &h(&[("origin", "http://node.example")])),
+            Ok(())
         );
         // Same host, another port is another origin: some other local
         // service's page, which Chromium lets open a socket with no

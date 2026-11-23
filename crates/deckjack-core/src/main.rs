@@ -245,6 +245,20 @@ fn main() -> anyhow::Result<()> {
     // like any other rather than something the browser does to itself.
     let windows = wiring::register_windows(&registry, node_id.clone())
         .context("cannot register the window commands")?;
+    // Native apps streamed into the workspace (docs/lanes/8-stream.md):
+    // declared under `<install>/native/`, each run under the compositor,
+    // which is spawned confined like any app. Their windows are server
+    // windows, and the streams follow the seat.
+    let streams = deckjack_core::stream::Streams::new(
+        install.clone(),
+        working_dir.clone(),
+        apps::Policy::default().confinement,
+        Arc::new(apps::OsEnv::new()),
+        Arc::clone(&windows) as _,
+    );
+    windows.attach_streams(Arc::clone(&streams) as _);
+    deckjack_core::stream::register(&registry, &streams)
+        .context("cannot register the stream commands")?;
     // Named rather than discarded: the HTTP file routes, WebDAV, previews and
     // downloads must all cross this same boundary. Opening a second Root for
     // them is exactly how the predecessor's configured root became decorative.
@@ -277,7 +291,12 @@ fn main() -> anyhow::Result<()> {
             Arc::clone(&terminals),
             node_id.clone(),
         )),
-        children: Box::new(wiring::TerminalChildren::new(Arc::clone(&terminals))),
+        // Terminals, and every streamed app's compositor, which ends its app
+        // and everything the app started when it is told to stop.
+        children: Box::new(lockdown::AllChildren(vec![
+            Box::new(wiring::TerminalChildren::new(Arc::clone(&terminals))),
+            Box::new(Arc::clone(&streams)),
+        ])),
         signals: Box::new(lockdown::OsSignals::new()),
         // The Inbox is real now, so step 3 freezes something: `outbound`
         // marks it frozen and counts what was waiting. Mail and scheduled
@@ -424,7 +443,11 @@ fn main() -> anyhow::Result<()> {
     let seat = deckjack_core::seat::Seat::new(
         Arc::clone(&hub),
         Arc::new(ws::SystemClock),
-        vec![Arc::clone(&terminals) as _, Arc::clone(&windows) as _],
+        vec![
+            Arc::clone(&terminals) as _,
+            Arc::clone(&windows) as _,
+            Arc::clone(&streams) as _,
+        ],
     );
     let seat_reaper = Arc::clone(&seat);
     let reaper = Arc::clone(&terminals);
@@ -599,6 +622,16 @@ fn main() -> anyhow::Result<()> {
 
     deckjack_core::seat::register(&registry, &seat).context("cannot register the seat commands")?;
 
+    // The UI protocol: windows an app describes rather than serves as a page.
+    // Its relay pushes to the connections showing a window (through the hub)
+    // and admits only what the seat admits, so it is built from both, and it
+    // reaches apps through the app host.
+    let ui_relay =
+        deckjack_core::uirelay::UiChannel::new(Arc::clone(&hub) as _, Arc::clone(&seat) as _);
+    app_host.attach_ui(Arc::clone(&ui_relay));
+    deckjack_core::uirelay::register(&registry, &ui_relay)
+        .context("cannot register the UI protocol's commands")?;
+
     let ws_ctx = ws::WsCtx::new(
         Arc::clone(&ctx),
         BusDispatch::new(
@@ -613,6 +646,7 @@ fn main() -> anyhow::Result<()> {
         node::host_name(),
         ws::Settings::default(),
     );
+    ws_ctx.attach_ui(ui_relay);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -630,6 +664,7 @@ fn main() -> anyhow::Result<()> {
         Arc::clone(&app_host),
         passkeys.clone(),
         Arc::clone(&files),
+        Arc::clone(&streams),
         AgentDoors {
             install: install.clone(),
             working_dir: working_dir.clone(),
@@ -683,6 +718,7 @@ async fn serve(
     app_host: Arc<AppHost>,
     passkeys: Option<Arc<deckjack_core::passkeyhttp::PasskeyCtx>>,
     files: Arc<deckjack_core::files::Namespace>,
+    streams: Arc<deckjack_core::stream::Streams>,
     doors: AgentDoors,
     env: &OsEnv,
     held: &mut lock::Lock,
@@ -776,6 +812,7 @@ async fn serve(
         Some(Arc::clone(&app_host)),
         passkeys,
         files,
+        Some(streams),
     );
 
     // The same router on the proxy socket, marked so that only requests

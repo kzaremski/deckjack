@@ -867,7 +867,19 @@ pub struct Windows {
     /// was pushed before the new holder held the seat) or is refused — never
     /// after the snapshot, unseen by the device that took over.
     op: std::sync::Mutex<()>,
+    /// Streamed windows (`crate::stream`), by client id, with what the
+    /// shell needs to draw one: its app, the picture's size and, for a
+    /// popup, its parent and offset. Carried in the list as `stream`.
+    streamed: std::sync::Mutex<std::collections::HashMap<String, Value>>,
+    /// Where a close of a streamed window goes: to the app, which may ask
+    /// to save first. The window goes when the app unmaps it.
+    stream_close: std::sync::OnceLock<Arc<dyn crate::stream::StreamClose>>,
 }
+
+/// The shell's title bar, in CSS pixels, so a streamed window opened by the
+/// server is tall enough for its picture. Advisory, as every server-side
+/// frame is: the shell sizes it for real.
+const STREAM_TITLEBAR: u32 = 34;
 
 /// The topic window changes and snapshots go out under. The shell's bus
 /// already maps it onto its window store (`web/src/stores/bus.ts`).
@@ -885,7 +897,21 @@ impl Windows {
             hub: std::sync::OnceLock::new(),
             seat: std::sync::OnceLock::new(),
             op: std::sync::Mutex::new(()),
+            streamed: std::sync::Mutex::new(std::collections::HashMap::new()),
+            stream_close: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Give the window commands the stream registry, so closing a streamed
+    /// window asks its app. Set once.
+    pub fn attach_streams(&self, streams: Arc<dyn crate::stream::StreamClose>) {
+        let _ = self.stream_close.set(streams);
+    }
+
+    fn streamed(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Value>> {
+        self.streamed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Every open window, as the shell's `WireWindow`, back to front.
@@ -901,6 +927,7 @@ impl Windows {
             .iter()
             .map(|(client, server)| (client.clone(), *server))
             .collect();
+        let streamed = self.streamed().clone();
         let set = self.set();
         let stacking = set.desktop().stacking();
         let mut rows: Vec<(usize, Value)> = ids
@@ -909,9 +936,7 @@ impl Windows {
                 let w = set.window(server)?;
                 let place = set.desktop().placement(server)?;
                 let z = stacking.iter().position(|s| *s == server).unwrap_or(0);
-                Some((
-                    z,
-                    serde_json::json!({
+                let mut row = serde_json::json!({
                         "id": client,
                         "app": w.app.app,
                         "title": w.title,
@@ -926,8 +951,11 @@ impl Windows {
                             "minimized": place.minimized,
                             "maximized": place.snap == window::Snap::Maximized,
                         },
-                    }),
-                ))
+                });
+                if let Some(meta) = streamed.get(&client) {
+                    row["stream"] = meta.clone();
+                }
+                Some((z, row))
             })
             .collect();
         rows.sort_by_key(|(z, _)| *z);
@@ -1105,6 +1133,20 @@ impl Windows {
 
     fn do_close(&self, p: WindowRef) -> Result<Value, CommandError> {
         let id = self.resolve(&p.id)?;
+        // A streamed window is the app's: closing it asks the app, which may
+        // ask to save first, and the window goes when the app unmaps it.
+        // Only a window whose stream is gone (the app died without saying)
+        // is removed here.
+        if self.streamed().contains_key(&p.id) {
+            if self
+                .stream_close
+                .get()
+                .is_some_and(|streams| streams.close_requested(&p.id))
+            {
+                return Ok(Value::Null);
+            }
+            self.streamed().remove(&p.id);
+        }
         self.set().close(id).map_err(|e| failed(e.to_string()))?;
         self.ids
             .lock()
@@ -1376,6 +1418,105 @@ window_command!(
     NoParams,
     |w, _p| w.do_unsplit()
 );
+
+/// Windows the server opens: a streamed app mapped a toplevel or a popup.
+///
+/// Under [`Windows::op`] like every change, and announced the same way, but
+/// with no seat check: nobody's call made them, the app did. The shell that
+/// holds the seat does not adopt the server's echo of its own window
+/// changes, so it takes these from the `stream` field instead
+/// (`web/src/stores/windows.ts`, `syncStreamed`).
+impl crate::stream::StreamWindows for Windows {
+    fn open_streamed(
+        &self,
+        window: &str,
+        title: &str,
+        size: (u32, u32),
+        parent: Option<(&str, (i32, i32))>,
+        meta: Value,
+    ) {
+        let _op = self
+            .op
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let popup = parent.is_some();
+        let height = if popup {
+            size.1
+        } else {
+            size.1 + STREAM_TITLEBAR
+        };
+        let spec = window::OpenSpec {
+            app: window::AppInstance::new(crate::stream::WINDOW_APP, window),
+            title: title.to_string(),
+            node_id: self.node_id.clone(),
+            min_width: 0,
+            size: window::Size {
+                width: size.0.max(1),
+                height: height.max(1),
+            },
+        };
+        let id = self
+            .set()
+            .open(spec, assumed_work_area(), self.clock.as_ref());
+        self.ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(window.to_string(), id);
+        // A popup goes where the app put it: its parent's picture's corner
+        // plus the offset. The shell places it again from the same numbers
+        // against the parent as it is drawn.
+        if let Some((parent, (x, y))) = parent {
+            let frame = self
+                .resolve(parent)
+                .ok()
+                .and_then(|p| self.set().placement_of(p).ok())
+                .map(|p| p.frame);
+            if let Some(frame) = frame {
+                let rect = window::Rect::new(
+                    frame.x + x,
+                    frame.y + STREAM_TITLEBAR as i32 + y,
+                    size.0.max(1),
+                    size.1.max(1),
+                );
+                let _ = self.set().place(id, rect, assumed_work_area());
+            }
+        }
+        self.streamed().insert(window.to_string(), meta);
+        self.changed();
+    }
+
+    fn update_streamed(&self, window: &str, title: &str, meta: Value) {
+        let _op = self
+            .op
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Ok(id) = self.resolve(window) else { return };
+        let _ = self.set().set_title(id, title);
+        if let (Some(Value::Object(old)), Value::Object(new)) =
+            (self.streamed().get_mut(window), meta)
+        {
+            for (key, value) in new {
+                old.insert(key, value);
+            }
+        }
+        self.changed();
+    }
+
+    fn close_streamed(&self, window: &str) {
+        let _op = self
+            .op
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.streamed().remove(window);
+        let Ok(id) = self.resolve(window) else { return };
+        let _ = self.set().close(id);
+        self.ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(window);
+        self.changed();
+    }
+}
 
 impl crate::seat::Workspace for Windows {
     fn attach(&self, hub: &Arc<ws::Hub>, seat: &std::sync::Weak<crate::seat::Seat>) {
@@ -1970,6 +2111,8 @@ impl crate::command::Halt for LockdownHalt {
 /// is, and "did anyone remember to mount it" is exactly the question that was
 /// answered wrong for as long as the kill switch existed and could not fire.
 /// A function can be called from a test; `main` cannot.
+// One argument per part of the node it routes to, as `serve` in main.rs has.
+#[allow(clippy::too_many_arguments)]
 pub fn app(
     ctx: Arc<crate::http::Ctx>,
     ws_ctx: Arc<ws::WsCtx>,
@@ -1987,6 +2130,11 @@ pub fn app(
     // the working-directory containment rules to drift, which is how the
     // predecessor project ended up with a root that was decorative.
     files: Arc<crate::files::Namespace>,
+    // The streamed native apps (`crate::stream`), whose windows' pictures
+    // and input go over their own socket. Here, inside the lockdown gate and
+    // the cookie-route gate like every other route; `None` where a harness
+    // has no install directory to find native apps in.
+    streams: Option<Arc<crate::stream::Streams>>,
 ) -> axum::Router {
     // Here, in the one assembly `main` and the test harnesses share, so a
     // node cannot be built that forgets to reap expired sessions.
@@ -2044,8 +2192,18 @@ pub fn app(
         )
     };
 
+    let stream = match streams {
+        Some(streams) => crate::stream::router(Arc::new(crate::stream::StreamCtx {
+            auth: Arc::clone(&ctx),
+            streams,
+            clock: Arc::new(ws::SystemClock),
+        })),
+        None => axum::Router::new(),
+    };
+
     crate::http::router(Arc::clone(&ctx))
         .merge(ws::router(ws_ctx))
+        .merge(stream)
         .merge(health)
         // Bytes out of the working directory, for the previews and downloads
         // that `files.read` cannot carry: it answers inside a JSON command
@@ -2140,6 +2298,9 @@ impl Command for ListApps {
                     "default_height": info.default_height,
                     "compact": info.compact,
                     "wide": info.wide,
+                    // How the shell draws its window: absent frames the
+                    // app's own page, 1 renders the tree it describes.
+                    "tier": info.tier,
                     "status": match status {
                         crate::apps::WindowStatus::Live => "live",
                         crate::apps::WindowStatus::Reconnecting => "reconnecting",

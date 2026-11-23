@@ -315,7 +315,12 @@ export function createSeat(deps: { bus: Bus; ui: UiStore; device: DeviceLabel })
  */
 export function followWindows(deps: { bus: Bus; windows: WindowsStore; seat: SeatStore }): () => void {
   return deps.bus.on((event) => {
-    if (event.kind === "windows" && !deps.seat.held.value) deps.windows.adopt(event.windows);
+    if (event.kind !== "windows") return;
+    // Streamed windows are the exception: the node opens and closes them
+    // when a native app maps and unmaps them, so the holder takes those
+    // from every list (`syncStreamed`), and nothing else.
+    if (deps.seat.held.value) deps.windows.syncStreamed(event.windows);
+    else deps.windows.adopt(event.windows);
   });
 }
 

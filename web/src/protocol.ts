@@ -45,6 +45,12 @@ export interface Invoke {
   id: CorrelationId;
   command: string;
   params?: unknown;
+  /**
+   * The call is made for this installed app's window, and the node holds it
+   * to that app's scope (docs/APP-UI-ISOLATION.md §4.6). Sent by the UI
+   * protocol's renderer for a widget's bound command.
+   */
+  as_app?: string;
 }
 
 /**
@@ -59,6 +65,8 @@ export interface Confirm {
   ticket: string;
   command: string;
   params?: unknown;
+  /** The same `as_app` the invoke carried: the ticket is bound to it. */
+  as_app?: string;
 }
 
 /**
@@ -85,7 +93,17 @@ export interface Ping {
   token?: string;
 }
 
-export type ClientFrame = Hello | Invoke | Confirm | Cancel | Ping;
+/**
+ * The UI protocol's per-window channel: open a window an app describes, send
+ * it an event, close it. See `src/uiproto/`.
+ */
+export interface UiUp {
+  type: "ui";
+  window: string;
+  body: unknown;
+}
+
+export type ClientFrame = Hello | Invoke | Confirm | Cancel | Ping | UiUp;
 
 // --- server -> client -------------------------------------------------------
 
@@ -148,7 +166,18 @@ export interface PongFrame {
   token?: string;
 }
 
-export type ServerFrame = Welcome | ProgressFrame | ResponseFrame | EventFrame | PongFrame;
+/** The UI protocol's per-window channel, node to this connection only. */
+export interface UiDown {
+  type: "ui";
+  window: string;
+  body: unknown;
+}
+
+export type ServerFrame = Welcome | ProgressFrame | ResponseFrame | EventFrame | PongFrame | UiDown;
+
+export function isUi(f: ServerFrame): f is UiDown {
+  return f.type === "ui";
+}
 
 export function isWelcome(f: ServerFrame): f is Welcome {
   return f.type === "welcome";
@@ -216,6 +245,12 @@ export interface WireWindow {
     minimized: boolean;
     maximized: boolean;
   };
+  /**
+   * Present on a streamed native app's window (`crates/deckjack-core/src/
+   * stream.rs`): which app, the picture's size and, for a popup, its parent
+   * and offset. Parsed by `parseStreamMeta` in `shell/stream.ts`.
+   */
+  stream?: unknown;
 }
 
 // --- client-side normalizations --------------------------------------------
@@ -285,5 +320,7 @@ export type ServerEvent =
   | { kind: "node"; name: string; generation: number }
   | { kind: "lockdown"; active: boolean }
   | { kind: "seat"; seat: SeatStatus }
+  /** A UI protocol frame for one window. */
+  | { kind: "ui"; window: string; body: unknown }
   /** Anything the shell does not yet model, kept so nothing is silently lost. */
   | { kind: "other"; topic: string; payload: unknown };

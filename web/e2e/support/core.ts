@@ -1,5 +1,7 @@
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import {
+  chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -40,6 +42,12 @@ export interface Core {
   cookie: { name: string; value: string };
   /** What `seed` put in the working directory. */
   files: Seeded;
+  /**
+   * Whether a native app is declared for streaming (`native/zenity.toml`
+   * beside the compositor): false on a host without zenity or without the
+   * compositor build, where the streaming test skips and says so.
+   */
+  native: boolean;
   /** Everything the node has logged so far. */
   log(): string;
   /** Stop the node and every process it started, then remove its directory. */
@@ -84,6 +92,7 @@ export async function startCore(port: number): Promise<Core> {
     rmSync(dir, { recursive: true, force: true });
     throw error;
   }
+  const native = installNative(home);
   const files = seed(work);
 
   let output = "";
@@ -112,6 +121,7 @@ export async function startCore(port: number): Promise<Core> {
       work,
       cookie,
       files,
+      native,
       log: () => output,
       stop,
     };
@@ -119,6 +129,54 @@ export async function startCore(port: number): Promise<Core> {
     await stop();
     throw error;
   }
+}
+
+/**
+ * Declare one native app for streaming (docs/lanes/8-stream.md): zenity's
+ * entry dialog, a GTK 4 app small enough to start in well under a second.
+ * The compositor is copied, not linked, because Landlock checks a link's
+ * target and the build directory is granted to nothing.
+ */
+function installNative(home: string): boolean {
+  const compositor = join(BIN, "deckjack-stream");
+  if (!existsSync(compositor) || !existsSync("/usr/bin/zenity")) return false;
+  const dir = join(home, "native");
+  mkdirSync(dir, { recursive: true });
+  copyFileSync(compositor, join(dir, "deckjack-stream"));
+  chmodSync(join(dir, "deckjack-stream"), 0o755);
+  writeFileSync(
+    join(dir, "zenity.toml"),
+    [
+      "[app]",
+      'name = "zenity"',
+      'version = "4"',
+      "protocol = 1",
+      'title = "Zenity"',
+      'tag = "Ze"',
+      "",
+      "[native]",
+      'exec = ["/usr/bin/zenity", "--entry", "--text=Name"]',
+      "",
+    ].join("\n"),
+  );
+  // A second one, whose answer is marked, so a test can tell which of two
+  // streamed windows the keys went to.
+  writeFileSync(
+    join(dir, "zenity2.toml"),
+    [
+      "[app]",
+      'name = "zenity2"',
+      'version = "4"',
+      "protocol = 1",
+      'title = "Zenity Two"',
+      'tag = "Z2"',
+      "",
+      "[native]",
+      'exec = ["/usr/bin/sh", "-c", "/usr/bin/zenity --entry --title=Second --text=Name | /usr/bin/sed s/^/second:/"]',
+      "",
+    ].join("\n"),
+  );
+  return true;
 }
 
 /** Wait for the cookie file and a healthy `/healthz`, or for the node to die. */
